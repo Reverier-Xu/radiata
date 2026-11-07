@@ -976,18 +976,20 @@ fn session_packet_context(
     std::sync::Arc::new(crate::time::HostWallClock),
     dependencies.entropy.clone(),
     dependencies.events.clone(),
-    route_policy,
     dependencies.sessions.clone(),
-    dependencies.routes.clone(),
-    Some(trace_sink),
-    // One configured bound for both in-memory route populations: the
-    // forwarding table and the terminal route records share the trace
-    // metadata budget the route table derives its capacity from.
-    trace_metadata_active,
-    trace_metadata_active,
+    crate::session::stream::RoutingPlaneContext::new(
+      route_policy,
+      dependencies.routes.clone(),
+      Some(trace_sink),
+      // One configured bound for both in-memory route populations: the
+      // forwarding table and the terminal route records share the trace
+      // metadata budget the route table derives its capacity from.
+      trace_metadata_active,
+      trace_metadata_active,
+      dependencies.config.relay_hop_deadline(),
+    ),
     Arc::clone(&dependencies.connection_tasks),
     crate::protocol::CONTROL_CBOR_LIMITS,
-    dependencies.config.relay_hop_deadline(),
     authorization,
   ))
 }

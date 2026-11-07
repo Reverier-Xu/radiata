@@ -240,19 +240,14 @@ impl AuthorizationBoundary {
   }
 }
 
-pub(crate) struct SessionPacketContext {
-  pub(super) local: NodeId,
-  pub(super) registry: Arc<ExtensionRegistry>,
-  pub(super) policy: SessionPolicy,
-  pub(super) runtime: crate::runtime::RuntimeClient,
-  pub(super) clock: Arc<dyn crate::time::WallClock>,
-  /// Injected entropy for per-session identifiers.
-  pub(super) entropy: Arc<dyn crate::api::Entropy>,
-  /// The typed event hub: session and route transitions emit through it.
-  pub(super) events: Arc<crate::node::EventHub>,
+/// The routing-plane collaborators of one node's packet context: the
+/// forwarding table, the next-hop policy, the terminal route records and
+/// their budgets, the durable trace sink, and the relay hop deadline.
+/// Held as one field of [`SessionPacketContext`] so the session plane
+/// carries the routing plane without fusing their fields.
+pub(crate) struct RoutingPlaneContext {
   pub(super) forwarding: crate::routing::forward::ForwardingTable,
   pub(super) route_policy: QualifiedTag,
-  pub(super) sessions: SessionTable,
   pub(super) routes: RouteTable,
   /// The node's durable trace sink: the origin pump's terminal facts and
   /// the read loop's late-failure revisions persist through the one
@@ -265,6 +260,72 @@ pub(crate) struct SessionPacketContext {
   /// The node's configured bound on in-memory terminal route records;
   /// admission rejections must respect it like every other writer.
   pub(super) route_capacity: usize,
+  /// The acknowledgment budget one forwarded-open hop gets (see
+  /// `NodeConfig::with_relay_hop_deadline`).
+  pub(super) relay_hop_deadline: Duration,
+}
+
+impl RoutingPlaneContext {
+  pub(crate) fn new(
+    route_policy: QualifiedTag, routes: RouteTable,
+    trace: Option<crate::routing::trace::TraceSink>, forwarding_capacity: usize,
+    route_capacity: usize, relay_hop_deadline: Duration,
+  ) -> Self {
+    Self {
+      forwarding: crate::routing::forward::new_table(),
+      route_policy,
+      routes,
+      trace,
+      forwarding_capacity,
+      route_capacity,
+      relay_hop_deadline,
+    }
+  }
+
+  /// The node's effective next-hop routing policy tag (the caller
+  /// selection, or the built-in default policy's tag).
+  pub(crate) const fn route_policy(&self) -> &QualifiedTag {
+    &self.route_policy
+  }
+
+  /// The node's configured bound on concurrently forwarded routes.
+  pub(crate) const fn forwarding_capacity(&self) -> usize {
+    self.forwarding_capacity
+  }
+
+  /// The caller-selected bound on in-memory terminal route records.
+  pub(crate) const fn route_capacity(&self) -> usize {
+    self.route_capacity
+  }
+
+  /// The node's durable trace sink (None only in unit-test contexts
+  /// without a store): the read loop's late-failure revisions share the
+  /// one bounded instance the origin pump's terminal facts use.
+  pub(crate) fn trace_sink(&self) -> Option<&crate::routing::trace::TraceSink> {
+    self.trace.as_ref()
+  }
+
+  /// The acknowledgment budget one forwarded-open hop gets.
+  pub(crate) const fn relay_hop_deadline(&self) -> Duration {
+    self.relay_hop_deadline
+  }
+}
+
+pub(crate) struct SessionPacketContext {
+  pub(super) local: NodeId,
+  pub(super) registry: Arc<ExtensionRegistry>,
+  pub(super) policy: SessionPolicy,
+  pub(super) runtime: crate::runtime::RuntimeClient,
+  pub(super) clock: Arc<dyn crate::time::WallClock>,
+  /// Injected entropy for per-session identifiers.
+  pub(super) entropy: Arc<dyn crate::api::Entropy>,
+  /// The typed event hub: session and route transitions emit through it.
+  pub(super) events: Arc<crate::node::EventHub>,
+  pub(super) sessions: SessionTable,
+  /// The node's routing plane (see [`RoutingPlaneContext`]): the
+  /// forwarding table, route records, trace sink, and relay budget the
+  /// read loop's routing calls attach to.
+  pub(super) routing: RoutingPlaneContext,
   /// The node-scoped tracked task vec: session-exit consumer drains join
   /// it so a teardown cannot abort an in-flight apply unnoticed.
   pub(super) task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -274,9 +335,6 @@ pub(crate) struct SessionPacketContext {
   /// replacement — still occupies its slot.
   pub(super) live_consumers: ConsumerBudget,
   pub(super) parser_limits: crate::protocol::CborLimits,
-  /// The acknowledgment budget one forwarded-open hop gets (see
-  /// `NodeConfig::with_relay_hop_deadline`).
-  pub(super) relay_hop_deadline: Duration,
   /// The node-level local-delivery plane (see [`LocalDelivery`]): the
   /// shared admitted-stream table and pending-admission map every local
   /// delivery leg of this node pumps through — the local counterpart of
@@ -291,18 +349,17 @@ pub(crate) struct SessionPacketContext {
 }
 
 impl SessionPacketContext {
-  /// The argument list mirrors the context's node-shared collaborators; no
-  /// subset forms a meaningful grouping.
+  /// The argument list mirrors the context's session-plane collaborators
+  /// plus the routing plane as one struct; no finer subset forms a
+  /// meaningful grouping.
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     local: NodeId, registry: Arc<ExtensionRegistry>, policy: SessionPolicy,
     runtime: crate::runtime::RuntimeClient, clock: Arc<dyn crate::time::WallClock>,
     entropy: Arc<dyn crate::api::Entropy>, events: Arc<crate::node::EventHub>,
-    route_policy: QualifiedTag, sessions: SessionTable, routes_clone: RouteTable,
-    trace: Option<crate::routing::trace::TraceSink>, forwarding_capacity: usize,
-    route_capacity: usize, task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    parser_limits: crate::protocol::CborLimits, relay_hop_deadline: Duration,
-    authorization: AuthorizationBoundary,
+    sessions: SessionTable, routing: RoutingPlaneContext,
+    task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    parser_limits: crate::protocol::CborLimits, authorization: AuthorizationBoundary,
   ) -> Self {
     Self {
       local,
@@ -312,17 +369,11 @@ impl SessionPacketContext {
       clock,
       entropy,
       events,
-      forwarding: crate::routing::forward::new_table(),
-      route_policy,
       sessions,
-      routes: routes_clone,
-      trace,
-      forwarding_capacity,
-      route_capacity,
+      routing,
       task_drains,
       live_consumers: ConsumerBudget::new(MAX_LIVE_CONSUMERS),
       parser_limits,
-      relay_hop_deadline,
       local_delivery: Arc::new(super::inbound::LocalDelivery::new(
         policy.pending_admissions,
       )),
@@ -346,31 +397,8 @@ impl SessionPacketContext {
     self
   }
 
-  /// The node's effective next-hop routing policy tag (the caller
-  /// selection, or the built-in default policy's tag).
-  pub(crate) const fn route_policy(&self) -> &QualifiedTag {
-    &self.route_policy
-  }
-
   pub(crate) const fn local(&self) -> &NodeId {
     &self.local
-  }
-
-  /// The node's configured bound on concurrently forwarded routes.
-  pub(crate) const fn forwarding_capacity(&self) -> usize {
-    self.forwarding_capacity
-  }
-
-  /// The caller-selected bound on in-memory terminal route records.
-  pub(crate) const fn route_capacity(&self) -> usize {
-    self.route_capacity
-  }
-
-  /// The node's durable trace sink (None only in unit-test contexts
-  /// without a store): the read loop's late-failure revisions share the
-  /// one bounded instance the origin pump's terminal facts use.
-  pub(crate) fn trace_sink(&self) -> Option<&crate::routing::trace::TraceSink> {
-    self.trace.as_ref()
   }
 
   /// The caller-selected packet parser limits.
@@ -378,9 +406,9 @@ impl SessionPacketContext {
     self.parser_limits
   }
 
-  /// The acknowledgment budget one forwarded-open hop gets.
-  pub(crate) const fn relay_hop_deadline(&self) -> Duration {
-    self.relay_hop_deadline
+  /// The node's durable trace sink (see [`RoutingPlaneContext::trace_sink`]).
+  pub(crate) fn trace_sink(&self) -> Option<&crate::routing::trace::TraceSink> {
+    self.routing.trace_sink()
   }
 }
 
@@ -421,6 +449,37 @@ pub(crate) fn keep_connection(local: &NodeId, peer: &NodeId, direction: DialDire
   match direction {
     DialDirection::Outgoing => local < peer,
     DialDirection::Incoming => local > peer,
+  }
+}
+
+/// The replacement decision one new session resolves against the entry
+/// already registered for the same peer, under the session-table lock:
+/// no entry or a dead one is always replaced, and two live entries
+/// compete under the crossed-dial ownership rule (see
+/// [`keep_connection`]).
+fn resolves_replacement(
+  previous: Option<&SessionEntry>, local: &NodeId, peer: &NodeId, direction: DialDirection,
+) -> bool {
+  match previous {
+    None => true,
+    Some(previous) => {
+      // A dead entry must never block reconnection: only a live previous
+      // session competes under the crossed-dial ownership rule.
+      if !previous.alive() {
+        return true;
+      }
+      let keep_existing = keep_connection(local, peer, previous.direction);
+      let keep_new = keep_connection(local, peer, direction);
+      // Crossed dial: the deterministic rule prefers exactly one of the
+      // two directions; keep that one and drop the other. Same
+      // direction (reconnect, restart) always replaces with the newest
+      // entry.
+      if keep_existing != keep_new {
+        keep_new
+      } else {
+        true
+      }
+    }
   }
 }
 
@@ -602,28 +661,7 @@ pub(crate) async fn run_session(
         return;
       }
     };
-    let replace = match guard.get(&peer) {
-      None => true,
-      Some(previous) => {
-        // A dead entry must never block reconnection: only a live previous
-        // session competes under the crossed-dial ownership rule.
-        if !previous.alive() {
-          true
-        } else {
-          let keep_existing = keep_connection(&local, &peer, previous.direction);
-          let keep_new = keep_connection(&local, &peer, direction);
-          // Crossed dial: the deterministic rule prefers exactly one of the
-          // two directions; keep that one and drop the other. Same
-          // direction (reconnect, restart) always replaces with the newest
-          // entry.
-          if keep_existing != keep_new {
-            keep_new
-          } else {
-            true
-          }
-        }
-      }
-    };
+    let replace = resolves_replacement(guard.get(&peer), &local, &peer, direction);
     if replace {
       let generation = guard
         .get(&peer)
@@ -700,15 +738,37 @@ pub(crate) async fn run_session(
     }
   }
 
+  teardown_ended_session(
+    &context,
+    &table,
+    &peer,
+    &identity,
+    &alive,
+    &pending_acks,
+    writer_task,
+  )
+  .await;
+}
+
+/// Tears one ended session down: marks it dead, removes its
+/// still-registered table entry (so a dead entry cannot block a later
+/// reconnection from either direction), aborts the writer, fails the
+/// session's pending admissions, and closes the forwarding hops this
+/// exact incarnation registered.
+async fn teardown_ended_session(
+  context: &SessionPacketContext, table: &SessionTable, peer: &NodeId,
+  identity: &forward::SessionIdentity, alive: &AtomicBool, pending_acks: &PendingAdmissions,
+  writer_task: tokio::task::JoinHandle<()>,
+) {
   alive.store(false, Ordering::SeqCst);
   // Remove this session's entry when it is still the registered one, so a
   // dead entry cannot block a later reconnection from either direction.
   let mut removed = false;
   if let Ok(mut sessions) = table.lock()
-    && let Some(current) = sessions.get(&peer)
+    && let Some(current) = sessions.get(peer)
     && !current.alive()
   {
-    sessions.remove(&peer);
+    sessions.remove(peer);
     removed = true;
   }
   if removed {
@@ -724,7 +784,7 @@ pub(crate) async fn run_session(
   // session incarnation terminates downstream explicitly — the winner's
   // routes registered by a replacement session for the same peer are a
   // different identity and stay untouched.
-  let (interrupted, relays) = fail_pending_waits(&pending_acks);
+  let (interrupted, relays) = fail_pending_waits(pending_acks);
   if interrupted > 0 {
     debug!(interrupted, "session closed pending admissions");
   }
@@ -733,7 +793,7 @@ pub(crate) async fn run_session(
       .send_status(&trace_id, crate::packet::wire::AckStatus::Failed)
       .await;
   }
-  forward::close_for_session(&context.forwarding, &identity).await;
+  forward::close_for_session(&context.routing.forwarding, identity).await;
 }
 
 /// Resolves when the runtime signals or drops the shutdown channel.
