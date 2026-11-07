@@ -1,9 +1,14 @@
 # Remediation Roadmap — post-audit decision record
 
-Status: fully decided 2026-11-08. Companion documents:
+Status: **Track 0 dispatched and fully merged (2026-11-08)** — all eleven
+items plus the quick-fix pool landed via the merge queue (main at
+`1895bf8`; 1159 tests, 0 failures, clippy clean). `radiata-cadence`
+delivered as a workspace crate. Remaining: Phase A-E below (direction
+approved, dispatch pending), Wave 2 leftovers (route_policy consumer-side
+completion, redaction-stance doc sweep in error.rs/guide.rs/audit.rs),
+and the deferred specialist tracks. Companion documents:
 `docs/code-quality-audit.md` (findings), `docs/work-item-radiata-cadence.md`
-(syntax-library work item). Delivery has no deadline; sequencing below is
-the dispatch plan.
+(syntax-library work item). Delivery has no deadline.
 
 ## Decided scope stances (binding)
 
@@ -51,6 +56,14 @@ the dispatch plan.
     carry offending names/values; first sites = transport scheme / protocol
     tag / task-kind resolution seams; incremental migration of old sites;
     secret hygiene untouched.
+10b. Log-redaction teardown (owner decision: the redaction requirement in
+    tests/observability.rs was invented, never a real one): delete the
+    contextual-value non-leakage assertions (storage paths, labels,
+    selectors, packet bodies, non-secret ids); KEEP the secret-material
+    hygiene assertions (seed/key bytes never in output, zeroize, Debug
+    masking); restore the storage-path field in the seed-permission warns
+    (done in the storage lane); sweep error.rs/guide.rs/audit.rs for
+    redaction-stance doc claims and update them.
 11. Quick-fix pool (~24 mechanical items from the audit P3 list, categories
     A/B/C in the audit discussion): same-family micro-convergences, test-
     helper collapses, renames/moves (e.g. `inbound.rs` test modules out of
