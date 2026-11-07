@@ -732,11 +732,17 @@ impl LocalLeg {
       .map_err(|_| ErrorKind::StreamInterrupted)
   }
 
-  /// The local leg's typed terminal: the reserved terminal slot carries
-  /// it into a live consumer's channel, and the table entry leaves the
-  /// shared table — the local counterpart of the read loop's end handler.
-  /// `false` means the terminal did not reach a consumer.
-  fn deliver_end(&self, reason: EndReason) -> bool {
+  /// The local leg's typed terminal: awaits the consumer's window like a
+  /// chunk — the pump feeds one stream, so the window is plain
+  /// backpressure — and removes the table entry. `false` means the
+  /// terminal did not reach a consumer: the consumer is gone.
+  ///
+  /// The terminal cannot rely on the reserved terminal slot the session
+  /// read loop keeps: the session reader bounds its own chunk sends to
+  /// the window, while this pump's chunk sends only respect the channel's
+  /// full capacity, so every slot can be holding a chunk when the end
+  /// arrives.
+  async fn deliver_end(&self, reason: EndReason) -> bool {
     let terminal = match reason {
       EndReason::Completed => StreamItem::End,
       EndReason::Interrupted => StreamItem::Interrupted,
@@ -747,9 +753,10 @@ impl LocalLeg {
       .lock()
       .ok()
       .and_then(|mut incoming| incoming.remove(&self.trace_id));
-    admitted
-      .map(|admitted| admitted.stream.try_send(terminal).is_ok())
-      .unwrap_or(false)
+    match admitted {
+      Some(admitted) => admitted.stream.send(terminal).await.is_ok(),
+      None => false,
+    }
   }
 }
 
@@ -981,8 +988,9 @@ impl DeliveryLeg {
   /// reached the leg: the session leg encodes it and waits for queue
   /// capacity — the terminal is the last frame the stream contributes, so
   /// the writer either drains it or the connection dies and the queue
-  /// closes; the local leg's reserved terminal slot guarantees it for a
-  /// live consumer.
+  /// closes; the local leg likewise awaits the consumer's window, because
+  /// its pump's chunk sends fill the channel's full capacity and no
+  /// terminal slot stays reserved.
   pub(crate) async fn deliver_end(&self, trace_id: &TraceId, reason: EndReason) -> bool {
     match self {
       Self::Session(entry) => {
@@ -998,7 +1006,7 @@ impl DeliveryLeg {
           .await
           .is_ok()
       }
-      Self::Local(leg) => leg.deliver_end(reason),
+      Self::Local(leg) => leg.deliver_end(reason).await,
     }
   }
 
@@ -2287,7 +2295,10 @@ mod slow_consumer_tests {
   use futures_util::{StreamExt as _, future::BoxFuture};
   use minicbor::bytes::ByteVec;
 
-  use super::{FrameSource, INCOMING_STREAM_CHUNKS, SessionGrant, read_loop};
+  use super::{
+    FrameSource, INCOMING_STREAM_CHUNKS, INCOMING_STREAM_TERMINAL_SLOTS, LocalLeg, SessionGrant,
+    read_loop,
+  };
   use crate::{
     ExtensionRegistry, FeatureTag, IncomingStream, ProtocolTag, TraceId,
     extension_registry::{PacketConsumer, ProtocolDefinition},
@@ -2559,6 +2570,64 @@ mod slow_consumer_tests {
       Duration::from_secs(5),
       crate::session::stream::AuthorizationBoundary::default(),
     )
+  }
+
+  /// Regression: the local leg's terminal must reach a consumer whose
+  /// body channel is completely full. The pump is the channel's only
+  /// sender and its chunk sends respect the channel's full capacity
+  /// (`INCOMING_STREAM_CHUNKS` plus the terminal slot), so every slot can
+  /// hold a chunk when the end arrives — a `try_send` terminal would race
+  /// the consumer's drain and drop the completion, surfacing a delivered
+  /// body as a typed interruption (the failure the Windows runner caught
+  /// on a ten-chunk body). The terminal therefore awaits the window like
+  /// a chunk.
+  #[tokio::test]
+  async fn the_local_terminal_reaches_a_consumer_with_a_full_window() {
+    let consumer = Arc::new(DrainingConsumer::new(None));
+    let context = Arc::new(session_for(Arc::clone(&consumer)));
+    let seed = 21_u32;
+    let mut leg = LocalLeg::new(&context, trace(seed));
+
+    // Admit the stream through the local leg, then fill the body channel
+    // to its full capacity before the consumer task ever runs: on a
+    // single-threaded test runtime the chunk sends into a non-full channel
+    // complete without yielding, so the terminal faces a genuinely full
+    // window.
+    leg
+      .deliver_open(OpenFrame {
+        trace_id: trace(seed),
+        source: node(2),
+        destination: node(1),
+        protocol: ProtocolTag::parse(PROTOCOL).unwrap(),
+        metadata: crate::StreamMetadata::new(),
+        route: None,
+      })
+      .await
+      .unwrap();
+    let chunk_bytes = 64_u32;
+    let chunks = (INCOMING_STREAM_CHUNKS + INCOMING_STREAM_TERMINAL_SLOTS) as u64;
+    for sequence in 0..chunks {
+      leg
+        .deliver_chunk(ChunkFrame {
+          trace_id: trace(seed),
+          sequence,
+          bytes: ByteVec::from(vec![7_u8; chunk_bytes as usize]),
+        })
+        .await
+        .unwrap();
+    }
+
+    // The terminal waits for the consumer to free a slot and reaches it:
+    // the consumer observes the full body and a clean end, never a
+    // truncation.
+    assert!(
+      leg
+        .deliver_end(crate::packet::wire::EndReason::Completed)
+        .await
+    );
+    let (body, terminal) = consumer.body_of(&trace(seed)).await;
+    assert_eq!(terminal, None, "the completed end must reach the consumer");
+    assert_eq!(body.len(), chunks as usize * chunk_bytes as usize);
   }
 
   /// Regression: a consumer that never drains its bounded
