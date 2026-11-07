@@ -17,25 +17,57 @@ use crate::{
   Error, IncomingStream, NodeId, ProtocolTag, Result,
   api::{BoxFuture, Entropy},
   extension_registry::{PacketConsumer, ProtocolDefinition},
-  identity::{lifecycle::LocalIdentityContext, trust::store as trust_store},
+  identity::lifecycle::LocalIdentityContext,
   runtime::RuntimeClient,
 };
 
 /// The canonical protocol tag of the membership sync stream.
-pub(crate) const MEMBERSHIP_SYNC_PROTOCOL: &str = "radiata.woooo.tech/protocols/membership-sync";
+pub(crate) const MEMBERSHIP_SYNC_PROTOCOL: &str = "radiata.woooo.tech/protocols/v1/membership-sync";
 
 /// The wire schema of one sync payload.
-const SYNC_PAYLOAD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/membership-sync-payload";
+pub(crate) const SYNC_PAYLOAD_SCHEMA: &str =
+  "radiata.woooo.tech/schemas/v1/membership-sync-payload";
 
-/// Payload kinds: this protocol carries the interactive leave plane
-/// only — the owner-signed leave announcement and its applied receipt.
-/// Every anti-entropy lane (descriptors, trust, resources, tombstones)
-/// rides the reconciliation plane (`crate::reconcile::plane`).
-pub(crate) const SYNC_KIND_LEAVE: u8 = 3;
-/// A leave-applied receipt: the applying peer confirms one leave record
-/// persisted. Additive (post-0.1 peers only): peers that never send it
-/// leave the announcement on its documented bounded-degradation path.
-pub(crate) const SYNC_KIND_LEAVE_APPLIED: u8 = 7;
+/// The closed set of membership sync payload kinds: this protocol
+/// carries the interactive leave plane only — the owner-signed leave
+/// announcement and its applied receipt. Every anti-entropy lane
+/// (descriptors, trust, resources, tombstones) rides the reconciliation
+/// plane (`crate::reconcile::plane`).
+///
+/// The codes are frozen wire contract. The typed kind keeps them in this
+/// protocol's own namespace: the same numbers mean unrelated record
+/// families in the tombstone lane's row keys.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SyncKind {
+  /// An encoded owner-signed leave announcement
+  /// ([`crate::identity::leave::LeaveRecordV1`]).
+  Leave,
+  /// A leave-applied receipt: the applying peer confirms one leave
+  /// record persisted. Additive (post-0.1 peers only): peers that never
+  /// send it leave the announcement on its documented
+  /// bounded-degradation path.
+  LeaveApplied,
+}
+
+impl SyncKind {
+  /// The immutable wire code of the kind.
+  pub(crate) const fn code(self) -> u8 {
+    match self {
+      Self::Leave => 3,
+      Self::LeaveApplied => 7,
+    }
+  }
+
+  /// Resolves a wire code to a kind; unknown codes are `None` and fail
+  /// closed at the decode boundary.
+  pub(crate) const fn from_code(code: u8) -> Option<Self> {
+    match code {
+      3 => Some(Self::Leave),
+      7 => Some(Self::LeaveApplied),
+      _ => None,
+    }
+  }
+}
 
 /// One sync payload: one encoded signed removal tombstone, or the
 /// leave-applied receipt.
@@ -52,13 +84,13 @@ pub(crate) enum SyncPayload {
 impl SyncPayload {
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     let (kind, payload) = match self {
-      Self::Leave(encoded) => (SYNC_KIND_LEAVE, encoded.clone()),
+      Self::Leave(encoded) => (SyncKind::Leave, encoded.clone()),
       Self::LeaveApplied { node } => (
-        SYNC_KIND_LEAVE_APPLIED,
+        SyncKind::LeaveApplied,
         ByteVec::from(node.as_str().as_bytes().to_vec()),
       ),
     };
-    crate::sync_common::encode_sync_envelope(SYNC_PAYLOAD_SCHEMA, Some(kind), payload)
+    crate::sync_common::encode_sync_envelope(SYNC_PAYLOAD_SCHEMA, Some(kind.code()), payload)
   }
 
   /// Decodes one payload, rejecting unknown schemas and kinds and any
@@ -70,15 +102,16 @@ impl SyncPayload {
       "membership sync payload canonical form",
       "membership sync payload schema",
     )?;
+    let kind = SyncKind::from_code(kind)
+      .ok_or_else(|| Error::invalid_input("membership sync payload kind"))?;
     match kind {
-      SYNC_KIND_LEAVE => Ok(Self::Leave(payload)),
-      SYNC_KIND_LEAVE_APPLIED => Ok(Self::LeaveApplied {
+      SyncKind::Leave => Ok(Self::Leave(payload)),
+      SyncKind::LeaveApplied => Ok(Self::LeaveApplied {
         node: NodeId::parse(
           std::str::from_utf8(payload.as_ref())
             .map_err(|_| Error::invalid_input("membership sync payload kind"))?,
         )?,
       }),
-      _ => Err(Error::invalid_input("membership sync payload kind")),
     }
   }
 }
@@ -399,7 +432,7 @@ pub(crate) async fn ensure_local_descriptor(
   // ([`crate::membership::apply_metadata_patch`], which preserves them),
   // so an endpoint-set rewrite must not clear them. A rewrite that
   // dropped labels would publish an empty set at a higher revision and
-  // propagate the loss to every peer (audit 2026-10-09, item 10).
+  // propagate the loss to every peer.
   //
   // Endpoint-set semantics: the bound listeners' published endpoints
   // are the descriptor's endpoint truth. An endpoint patched in without
@@ -416,7 +449,6 @@ pub(crate) async fn ensure_local_descriptor(
     public_key,
     endpoints,
     descriptor_revision,
-    false,
     1,
   )
   .with_labels(labels);
@@ -427,13 +459,25 @@ pub(crate) async fn ensure_local_descriptor(
     // the read and the commit (every public operation ensures the local
     // descriptor first). The ensure is idempotent: the conflict is
     // acceptable only when the descriptor now exists at revision >= ours
-    // for this exact node and key.
-    let installed = crate::membership::store::read_descriptor_ctx(store, &node)
-      .await?
-      .map(|current| current.revision() >= descriptor_revision)
-      .unwrap_or(false);
-    if !installed {
+    // for this exact node and key — another writer won the race, and the
+    // next maintenance tick rewrites the endpoint set.
+    let Some(current) = crate::membership::store::read_descriptor_ctx(store, &node).await? else {
       return Err(error);
+    };
+    if current.revision() < descriptor_revision {
+      return Err(error);
+    }
+    // The paired notification belongs to this call's own write only: the
+    // stored record must be exactly the descriptor attempted here. A
+    // concurrent writer's different record (endpoint set, labels, or a
+    // higher revision from another flow) already fired its own
+    // notification, so notifying from the losing call would bump the
+    // member revision twice for one install. An identical record written
+    // concurrently is indistinguishable from this call's own landed write,
+    // and its content is exactly what this call wanted, so that bump
+    // stands.
+    if current != descriptor {
+      return Ok(());
     }
   }
   // The member set genuinely changed (the local descriptor was installed
@@ -443,40 +487,34 @@ pub(crate) async fn ensure_local_descriptor(
   Ok(())
 }
 
-/// One membership maintenance tick: publish the local descriptor and run
-/// the checkpoint GC. The anti-entropy itself rides the reconciliation
-/// plane (every lane — descriptors, trust, resources, tombstones); this
-/// tick is only the local store maintenance whose writes then drive the
-/// plane's epoch-rescan triggers.
+/// One membership maintenance tick: publish the local descriptor. The
+/// anti-entropy itself rides the reconciliation plane (every lane —
+/// descriptors, trust, resources, tombstones); this tick is only the local
+/// store maintenance whose writes then drive the plane's epoch-rescan
+/// triggers. The identity-tombstone GC is not membership work: it rides
+/// the recovery worker's retention sweeps (`runtime/retention.rs`), gated
+/// on the cleanup checkpoint instead of on the trust lane.
 ///
-/// The same quiescence contract the old sync tick held: before any
-/// member is admitted the node's store writes are quiescent (the listen
+/// The quiescence contract: before any member is admitted the node's
+/// store writes are quiescent (the listen
 /// effect publishes the local descriptor eagerly at the listener bind,
 /// and a member query only SCHEDULES the listenerless node's lazy
-/// publication off the supervisor's select loop — remaining items
-/// 2026-10-10, P2-9), keeping the admission commit sequence deterministic
-/// for fault-injecting providers — nothing here runs before membership
-/// exists.
+/// publication off the supervisor's select loop), keeping the admission
+/// commit sequence deterministic for fault-injecting providers — nothing
+/// here runs before membership exists.
 pub(crate) async fn membership_maintenance_tick(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
   local_endpoints: &[crate::Endpoint], events: &Arc<crate::node::EventHub>,
   revision: &crate::node::MemberRevisionSignal,
 ) -> Result<()> {
-  let store = context.store();
   // Nothing to advertise at startup: the listen effect publishes the
   // local descriptor (with endpoints) when the first listener binds,
   // and a member query schedules the listenerless node's publication
-  // off the supervisor's select loop (remaining items 2026-10-10,
-  // P2-9), so the maintenance loop never races a transient empty
-  // endpoint set into a revision bump.
+  // off the supervisor's select loop, so the maintenance loop never races a
+  // transient empty endpoint set into a revision bump.
   if !local_endpoints.is_empty() {
     ensure_local_descriptor(context, entropy, local_endpoints.to_vec(), events, revision).await?;
   }
-  if !trust_store::has_more_than_bindings(store, 1).await? {
-    // No membership yet: nothing to maintain.
-    return Ok(());
-  }
-  crate::membership::tombstone::gc_collected_tombstones(store, entropy).await;
   Ok(())
 }
 
@@ -498,6 +536,33 @@ mod tests {
       let encoded = payload.encode().unwrap();
       assert_eq!(SyncPayload::decode(&encoded).unwrap(), payload);
     }
+  }
+
+  /// The payload kind codes are frozen wire contract: the leave
+  /// announcement and its applied receipt keep their original codes, and
+  /// every other byte is not a kind — the decode boundary fails closed
+  /// instead of guessing.
+  #[test]
+  fn sync_kind_codes_are_frozen_and_unknown_codes_fail_closed() {
+    assert_eq!(SyncKind::Leave.code(), 3);
+    assert_eq!(SyncKind::LeaveApplied.code(), 7);
+    for kind in [SyncKind::Leave, SyncKind::LeaveApplied] {
+      assert_eq!(SyncKind::from_code(kind.code()), Some(kind));
+    }
+    for code in [0, 1, 2, 4, 5, 6, 8, u8::MAX] {
+      assert_eq!(SyncKind::from_code(code), None);
+    }
+
+    // The same unknown code inside a well-formed envelope is a typed
+    // invalid-input rejection, never a silently dropped payload.
+    let envelope = crate::sync_common::encode_sync_envelope(
+      SYNC_PAYLOAD_SCHEMA,
+      Some(4),
+      ByteVec::from(node(1).as_str().as_bytes().to_vec()),
+    )
+    .unwrap();
+    let error = SyncPayload::decode(&envelope).unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
   }
 
   fn node(seed: u8) -> NodeId {
@@ -536,11 +601,11 @@ mod tests {
     );
   }
 
-  /// Regression (audit 2026-10-09, item 10): the local descriptor's
+  /// Regression: the local descriptor's
   /// endpoint rewrite must carry the descriptor's existing capability
-  /// labels. The rewrite used to rebuild the descriptor without them,
-  /// publishing an empty label set at a higher revision — and that loss
-  /// then propagated to every peer through sync. Both drift directions
+  /// labels. A rewrite that rebuilds the descriptor without them
+  /// publishes an empty label set at a higher revision — and that loss
+  /// then propagates to every peer through sync. Both drift directions
   /// (a listener added, a listener removed) are pinned; the documented
   /// rollback of a patched-but-unlistened endpoint is pinned by the
   /// integration test in `tests/membership_sync.rs`.
@@ -624,11 +689,123 @@ mod tests {
     assert_eq!(shrunk.labels().get(&tier), Some(&gold));
   }
 
-  /// Regression: a receiver-side leave persist failure used to surface
-  /// nowhere — the `?` propagated a silent error while the sender kept
-  /// forwarding, so an audit stall (leaver still Active everywhere) could
-  /// not be attributed from the log. The apply site now logs the typed
-  /// failure and propagates it; this lane pins both halves: the payload
+  /// Regression: the tolerated-conflict path must not notify the member
+  /// set. A concurrent writer's different record — here the same revision
+  /// carrying a label set over the unchanged endpoint set, injected
+  /// between this call's read and its commit — wins the register, so the
+  /// losing ensure neither bumps the member revision nor emits the paired
+  /// event: one install, one bump.
+  #[tokio::test]
+  async fn tolerated_conflict_with_a_different_record_does_not_bump_the_member_revision() {
+    use crate::{
+      identity::{
+        lifecycle,
+        testing::{FaultingFactory, ScriptedKeys, SequenceEntropy, inject_entry},
+      },
+      storage::contract::{ReferenceFactory, required_capabilities},
+    };
+
+    let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
+    let faulting = FaultingFactory::new(&reference, Vec::new());
+    let factory: Arc<dyn crate::provider::StorageFactory> = faulting.as_factory();
+    let keys = ScriptedKeys::full_at(9_700);
+    let entropy: Arc<dyn Entropy> = Arc::new(SequenceEntropy::default());
+    let context = Arc::new(
+      lifecycle::open_local_identity(
+        &factory,
+        Some(&keys.as_provider()),
+        entropy.as_ref(),
+        std::time::Duration::from_secs(10),
+      )
+      .await
+      .unwrap(),
+    );
+    let events = Arc::new(crate::node::EventHub::new());
+    let mut member_events = events.subscribe::<crate::MemberChanged>(crate::EventOptions::new());
+    let (revision_tx, revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let one = crate::Endpoint::parse("wss://one.example:9000").unwrap();
+    let two = crate::Endpoint::parse("wss://two.example:9000").unwrap();
+
+    // First publication: revision 1 over one endpoint, one bump.
+    ensure_local_descriptor(&context, &entropy, vec![one.clone()], &events, &revision)
+      .await
+      .unwrap();
+    assert_eq!(*revision_rx.borrow(), 1);
+    assert!(matches!(
+      member_events.try_recv().unwrap(),
+      crate::EventReceive::Item(_)
+    ));
+
+    // The concurrent winner: revision 2 carrying a label set over the
+    // unchanged endpoint set (the owner patch path), landing between this
+    // call's read and its commit.
+    let concurrent = crate::membership::NodeDescriptorV1::new(
+      context.identity().node().clone(),
+      context.identity().public_key().clone(),
+      vec![one.clone()],
+      2,
+      1,
+    )
+    .with_labels(
+      crate::LabelSet::new()
+        .insert(
+          crate::LabelKey::parse("example.org/labels/tier").unwrap(),
+          crate::LabelValue::parse("gold").unwrap(),
+        )
+        .unwrap(),
+    );
+    let descriptor_namespace = crate::membership::descriptor_namespace().unwrap();
+    let descriptor_key = {
+      let state = reference.state.lock().unwrap();
+      state
+        .entries
+        .keys()
+        .find(|(namespace, _)| namespace == &descriptor_namespace)
+        .map(|(_, key)| key.clone())
+        .expect("the installed local descriptor row")
+    };
+    let encoded = concurrent.encode().unwrap();
+    faulting.push_hook(Box::new(move || {
+      inject_entry(&reference, (descriptor_namespace, descriptor_key), encoded);
+    }));
+
+    // The endpoint rewrite conflicts at the same revision. The conflict
+    // stays tolerated (a current descriptor exists), but the losing call
+    // must not notify: the winner already did.
+    ensure_local_descriptor(
+      &context,
+      &entropy,
+      vec![one.clone(), two.clone()],
+      &events,
+      &revision,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      *revision_rx.borrow(),
+      1,
+      "the losing call must not bump the member revision"
+    );
+    assert!(
+      matches!(
+        member_events.try_recv().unwrap(),
+        crate::EventReceive::Empty
+      ),
+      "the losing call must not emit the paired member event"
+    );
+    let stored =
+      crate::membership::store::read_descriptor_ctx(context.store(), context.identity().node())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, concurrent, "the concurrent record stays installed");
+  }
+
+  /// The leave-apply lane reports its failures honestly: the apply site
+  /// logs the typed failure and propagates it instead of swallowing it,
+  /// so a stalled leave (the leaver still Active everywhere) is
+  /// attributable from the log. This lane pins both halves: the payload
   /// errors, and the store stays without the leave record.
   #[tokio::test]
   async fn leave_persist_failure_is_logged_and_propagated_at_the_apply_site() {
@@ -1021,7 +1198,7 @@ mod tests {
   /// traffic is its bounded confirmation refresh, and a real catalog
   /// change pushes exactly one row on the next tick, alone — one
   /// changed row costs one row on the wire, never a catalog-sized
-  /// re-send (the 2026-10 audit's cascade amplifier stays removed).
+  /// re-send.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_converged_mesh_emits_nothing_until_a_real_change() {
     use std::sync::atomic::Ordering;
@@ -1101,7 +1278,6 @@ mod tests {
       key_at(1),
       vec![crate::Endpoint::parse("wss://127.0.0.1:0").unwrap()],
       1,
-      false,
       1,
     );
     crate::membership::store::store_descriptor_ctx(

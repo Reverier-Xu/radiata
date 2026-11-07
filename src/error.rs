@@ -96,13 +96,7 @@ pub enum ProviderErrorContext {
   TransportSend,
   TransportReceive,
   TransportClose,
-  /// Reserved projection vocabulary for a discovery extension surface;
-  /// the registry is test-only today, so core code does not originate it.
-  Discovery,
   PacketConsumer,
-  /// Reserved projection vocabulary retained from the retired
-  /// deterministic neighbor planner; no core path originates it today.
-  NeighborPolicy,
   LoadBalancingPolicy,
   RoutingPolicy,
 }
@@ -356,9 +350,7 @@ const fn provider_error_context(context: ProviderErrorContext) -> &'static str {
     ProviderErrorContext::TransportSend => "transport send",
     ProviderErrorContext::TransportReceive => "transport receive",
     ProviderErrorContext::TransportClose => "transport close",
-    ProviderErrorContext::Discovery => "discovery",
     ProviderErrorContext::PacketConsumer => "packet consumer",
-    ProviderErrorContext::NeighborPolicy => "neighbor policy",
     ProviderErrorContext::LoadBalancingPolicy => "load balancing policy",
     ProviderErrorContext::RoutingPolicy => "routing policy",
   }

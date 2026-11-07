@@ -15,6 +15,14 @@ use crate::{Endpoint, Error, Result};
 pub(super) const ACCEPT_BACKOFF_STEP: std::time::Duration = std::time::Duration::from_millis(100);
 pub(super) const ACCEPT_BACKOFF_MAX_STEPS: u32 = 5;
 
+/// The delay after the `failures`-th consecutive failed accept: the
+/// first failure does not sleep (a single bad upgrade must not delay the
+/// next accept), and every further failure adds one step up to the cap.
+pub(super) fn accept_backoff(failures: u32) -> std::time::Duration {
+  let steps = failures.saturating_sub(1).min(ACCEPT_BACKOFF_MAX_STEPS);
+  ACCEPT_BACKOFF_STEP.saturating_mul(steps)
+}
+
 /// Tears one bound listener down: removes the registry entry, wakes and
 /// aborts the accept loop, and unpublishes the advertised endpoint.
 /// Shared by the stop-listener effect and the leave effect's network
@@ -41,6 +49,30 @@ pub(super) async fn stop_listener(
     endpoints.retain(|candidate| candidate != &endpoint);
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod accept_backoff_tests {
+  use super::{ACCEPT_BACKOFF_MAX_STEPS, ACCEPT_BACKOFF_STEP, accept_backoff};
+
+  /// The first failed accept does not sleep; the second sleeps one step
+  /// and every further failure adds one step until the cap.
+  #[test]
+  fn the_first_failure_does_not_sleep_and_later_failures_grow_to_the_cap() {
+    assert_eq!(accept_backoff(0), std::time::Duration::ZERO);
+    assert_eq!(accept_backoff(1), std::time::Duration::ZERO);
+    assert_eq!(accept_backoff(2), ACCEPT_BACKOFF_STEP);
+    assert_eq!(accept_backoff(3), ACCEPT_BACKOFF_STEP * 2);
+    assert_eq!(
+      accept_backoff(ACCEPT_BACKOFF_MAX_STEPS + 1),
+      ACCEPT_BACKOFF_STEP * ACCEPT_BACKOFF_MAX_STEPS
+    );
+    assert_eq!(
+      accept_backoff(u32::MAX),
+      ACCEPT_BACKOFF_STEP * ACCEPT_BACKOFF_MAX_STEPS,
+      "the saturated failure count still caps"
+    );
+  }
 }
 
 #[cfg(test)]

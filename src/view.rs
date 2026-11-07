@@ -1,8 +1,38 @@
-pub use crate::storage::receipt::ReceiptRetentionReport;
 use crate::{
   Endpoint, Error, ErrorKind, NodeId, PublicKey, QualifiedTag, Result,
   identity::{ListenerId, SessionId},
 };
+
+/// The outcome of one receipt-retention pass: how many anchored receipts
+/// the pass forgot and whether it stopped at one of its internal bounds
+/// with eligible receipts left.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiptRetentionReport {
+  forgotten: u64,
+  remaining: bool,
+}
+
+impl ReceiptRetentionReport {
+  /// Anchored receipts whose retention deadline had elapsed and whose
+  /// forget transaction committed.
+  pub const fn forgotten(&self) -> u64 {
+    self.forgotten
+  }
+
+  /// The pass stopped at one of its internal bounds with anchored
+  /// receipts or retention candidates left; issue the command again to
+  /// continue.
+  pub const fn remaining(&self) -> bool {
+    self.remaining
+  }
+
+  pub(crate) const fn new(forgotten: u64, remaining: bool) -> Self {
+    Self {
+      forgotten,
+      remaining,
+    }
+  }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -370,6 +400,7 @@ pub struct MemberView {
 /// verification evidence, so the status — not the page membership — is the
 /// authoritative liveness signal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum MemberStatus {
   /// No terminal removal record exists for the node.
   Active,
@@ -876,11 +907,17 @@ impl TrustPage {
   }
 }
 
-/// One admitted operation's observation: the task's identity, kind, and
-/// phase, its attempt count, and its terminal error and payload.
+/// One admitted operation's observation: the task's identity, kind tag,
+/// and phase, its attempt count, and its terminal error and payload.
+///
+/// The payload is the kind tag plus the opaque bytes the task
+/// terminalized with: a core verb's result in the crate's canonical CBOR
+/// encoding, or a caller-defined kind's own bytes. The typed form of a
+/// core result comes from [`Task::wait`](crate::Task::wait); this
+/// repeatedly readable surface carries the encoded payload.
 ///
 /// The credential kinds' payloads carry the issued generation's expiry
-/// only: the secret itself is handed to the first
+/// observation only: the secret itself is handed to the first
 /// [`Task::wait`](crate::Task::wait) caller and never enters this
 /// repeatedly readable surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -902,7 +939,8 @@ impl TaskView {
     &self.id
   }
 
-  /// The admitted kind, including caller-registered extension kinds.
+  /// The admitted kind: a core verb's [`TaskKind`](crate::TaskKind)
+  /// constant, or a caller-registered tag.
   pub const fn kind(&self) -> &crate::TaskKind {
     &self.kind
   }
@@ -939,9 +977,9 @@ impl TaskView {
     self.error
   }
 
-  /// The verb payload of a succeeded task. For the credential kinds this
-  /// is the issued generation's expiry observation only — see
-  /// [`TaskView`].
+  /// The succeeded task's output: the payload bytes. For the credential
+  /// kinds the payload is the issued generation's expiry observation
+  /// only — see [`TaskView`].
   pub const fn output(&self) -> Option<&crate::TaskOutput> {
     self.output.as_ref()
   }

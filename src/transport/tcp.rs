@@ -6,6 +6,8 @@
 //! interaction would stall every burst by the delayed-ACK window), and
 //! the wildcard-bind rule below for named listen endpoints.
 
+use std::fmt;
+
 use tokio::net::TcpListener;
 
 use super::endpoint::{Endpoint, TransportScheme};
@@ -105,6 +107,71 @@ pub(crate) async fn bind(
 
 fn bind_error(_: std::io::Error) -> Error {
   Error::provider(ProviderErrorKind::Io, ProviderErrorContext::TransportBind)
+}
+
+/// The shared TCP listener base: the bound socket, the real bound
+/// endpoint, and the close signal. Every TCP-class transport listener
+/// composes it and adds only its own wire layer, so the accept/close
+/// semantics exist exactly once: a pending accept races the close signal
+/// and returns the shutdown error, while the socket stays bound until the
+/// owner drops the listener, which is what releases the address for a
+/// rebind.
+pub(crate) struct TcpListenerBase {
+  listener: TcpListener,
+  shutdown_tx: tokio::sync::watch::Sender<()>,
+  shutdown: tokio::sync::watch::Receiver<()>,
+  bound: Endpoint,
+}
+
+impl TcpListenerBase {
+  /// Binds at `endpoint` on `scheme` with the shared socket policy; see
+  /// [`bind`] for the wildcard and dual-stack semantics of named hosts.
+  pub(crate) async fn bind(endpoint: &Endpoint, scheme: TransportScheme) -> Result<Self> {
+    let (listener, bound) = bind(endpoint, scheme).await?;
+    Ok(Self::from_listener(listener, bound))
+  }
+
+  /// Wraps an already-bound listener with the shared close signal.
+  pub(crate) fn from_listener(listener: TcpListener, bound: Endpoint) -> Self {
+    let (shutdown_tx, shutdown) = tokio::sync::watch::channel(());
+    Self {
+      listener,
+      shutdown_tx,
+      shutdown,
+      bound,
+    }
+  }
+
+  /// The real bound endpoint: port zero resolved to the OS-assigned port.
+  pub(crate) fn local_endpoint(&self) -> Endpoint {
+    self.bound.clone()
+  }
+
+  /// Accepts one inbound TCP stream under the shared socket policy,
+  /// racing the close signal.
+  pub(crate) async fn accept_tcp(&self) -> Result<tokio::net::TcpStream> {
+    accept(
+      &self.listener,
+      &mut self.shutdown.clone(),
+      ProviderErrorContext::TransportAccept,
+    )
+    .await
+  }
+
+  /// Signals close: a pending accept returns the shutdown error; the
+  /// socket stays bound until the owner drops the listener.
+  pub(crate) fn close(&self) {
+    let _ = self.shutdown_tx.send(());
+  }
+}
+
+impl fmt::Debug for TcpListenerBase {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("TcpListenerBase")
+      .field("bound", &self.bound)
+      .finish_non_exhaustive()
+  }
 }
 
 fn low_latency(

@@ -1,10 +1,7 @@
 //! The reconciliation plane.
 //!
-//! Scope, evidence, and the phased plan live in
-//! `docs/research/06-architecture-proposal.md` (the research cycle's
-//! architecture decision record). The plane replaced the push watermark
-//! anti-entropy with receiver-evidenced range reconciliation: lanes
-//! exchange
+//! The plane replaced the push watermark anti-entropy with
+//! receiver-evidenced range reconciliation: lanes exchange
 //! `(count, xor)` range fingerprints over their item-digest space, and
 //! row bytes only cross a session for ranges whose fingerprints prove
 //! the receiving side lacks them.
@@ -34,6 +31,9 @@ pub(crate) mod engine;
 // probes are read only by tests.
 #[allow(dead_code)]
 pub(crate) mod fingerprint;
+// The lane seam: one policy per reconciled key space, implemented next
+// to the module that owns the rows.
+pub(crate) mod lane;
 pub(crate) mod plane;
 pub(crate) mod wire;
 

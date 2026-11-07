@@ -33,7 +33,10 @@ use crate::{
   BoxFuture, Error, ErrorKind, IssuedMergeCredential, NodeConfig, NodeId, Result, TaskId, TaskKind,
   TaskOutput, TaskPhase,
   api::Entropy,
-  task::{CredentialIssued, SlotClass, TaskError, TaskObserver, TaskTable},
+  task::{
+    CoreTaskKind, SlotClass, TaskError, TaskObserver, TaskReconcilePolicy, TaskTable,
+    output::encode_credential,
+  },
   time::WallClock,
 };
 
@@ -45,36 +48,27 @@ pub(crate) const TASK_CHANNEL_CAPACITY: usize = 32;
 /// [`crate::task::SlotClass`]). A join or connect dial can hold its
 /// slot for a whole dial deadline, so the dials draw from their own
 /// semaphore while every core local kind keeps its own budget: four
-/// wedged dials must never queue a resource write (the starvation
-/// incident behind the split). The caller-registered extension kinds
-/// draw from their own channel for the mirror reason: an extension
-/// reconciler routinely awaits other admitted tasks through its public
-/// handle, so it must never occupy the core local capacity its own
-/// child operations need. The local and network budgets come from
+/// wedged dials must never queue a resource write. The caller-registered
+/// extension kinds draw from their own channel for the mirror reason: an
+/// extension reconciler routinely awaits other admitted tasks through its
+/// public handle, so it must never occupy the core local capacity its own
+/// child operations need. All three budgets come from
 /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots)
-/// and default to two slots per channel — the historical four-permit
-/// total, one channel per core class; the extension budget is the
-/// manager's own constant below.
+/// and
+/// [`NodeConfig::with_task_reconcile_extension_slots`](crate::NodeConfig::with_task_reconcile_extension_slots)
+/// and default to two slots per channel.
 struct ReconcileChannels {
   local: Arc<Semaphore>,
   network: Arc<Semaphore>,
   extension: Arc<Semaphore>,
 }
 
-/// The extension channel's budget: an independent, deliberately fixed
-/// bound. The two configured budgets govern the core's per-verb
-/// concurrency; extension workflows are caller code over the public
-/// surface, so their channel keeps its own two-lane default — enough
-/// concurrent workflows to overlap IO while bounding how many wedged
-/// reconcilers can park waiting workflows behind them.
-const TASK_EXTENSION_RECONCILE_SLOTS: usize = 2;
-
 impl ReconcileChannels {
-  fn new(local: usize, network: usize) -> Self {
+  fn new(local: usize, network: usize, extension: usize) -> Self {
     Self {
       local: Arc::new(Semaphore::new(local)),
       network: Arc::new(Semaphore::new(network)),
-      extension: Arc::new(Semaphore::new(TASK_EXTENSION_RECONCILE_SLOTS)),
+      extension: Arc::new(Semaphore::new(extension)),
     }
   }
 
@@ -120,9 +114,10 @@ const RETRY_TIMER_IDLE: Duration = Duration::from_secs(86_400 * 365);
 pub(crate) enum RetryClass {
   /// Join/connect dials: convergence and transport transients retry.
   Network,
-  /// Caller-registered custom kinds: the reconciler owns the semantics,
-  /// so every error retries within the bounded budget (the reconciler's
-  /// own `Retry` decision rides the same schedule as a typed overload).
+  /// Caller-registered custom kinds: a returned `Err` never re-arms the
+  /// schedule (the reconciler's explicit `Retry` decision is the only
+  /// re-arm path — see [`EffectOutcome::Retry`]), so the class itself
+  /// treats every error as terminal.
   Extension,
   /// Everything else: one attempt, no retry.
   Once,
@@ -140,8 +135,7 @@ impl RetryClass {
           | ErrorKind::RouteUnavailable
           | ErrorKind::StreamInterrupted
       ),
-      RetryClass::Extension => true,
-      RetryClass::Once => false,
+      RetryClass::Extension | RetryClass::Once => false,
     }
   }
 }
@@ -187,9 +181,11 @@ const ONCE: RetryPolicy = RetryPolicy {
   class: RetryClass::Once,
 };
 
-/// Caller-registered custom kinds: the reconciler's errors and explicit
-/// `Retry` decisions re-arm the same bounded schedule the network dials
-/// use (the reconciler owns the semantics; the manager owns the bound).
+/// Caller-registered custom kinds: only the reconciler's explicit
+/// `Retry` decision re-arms this bounded schedule (the reconciler owns
+/// the semantics; the manager owns the bound). A returned `Err` or an
+/// explicit `Failed` decision terminalizes the task instead — business
+/// retry belongs to the caller's logic, not the schedule.
 const EXTENSION_RETRY: RetryPolicy = RetryPolicy {
   max_attempts: 4,
   initial: Duration::from_millis(100),
@@ -197,12 +193,14 @@ const EXTENSION_RETRY: RetryPolicy = RetryPolicy {
   class: RetryClass::Extension,
 };
 
-/// The kind's retry policy (single classification site).
+/// The kind's retry policy (single classification site). A tag outside
+/// the core set is a caller-defined kind: its reconciler owns the
+/// semantics, so it rides the extension policy.
 pub(crate) fn retry_policy(kind: &TaskKind) -> &'static RetryPolicy {
-  match kind {
-    TaskKind::Join | TaskKind::Connect => &NETWORK_RETRY,
-    TaskKind::Extension(_) => &EXTENSION_RETRY,
-    _ => &ONCE,
+  match CoreTaskKind::from_tag(kind) {
+    Some(CoreTaskKind::Join | CoreTaskKind::Connect) => &NETWORK_RETRY,
+    Some(_) => &ONCE,
+    None => &EXTENSION_RETRY,
   }
 }
 
@@ -210,20 +208,30 @@ pub(crate) fn retry_policy(kind: &TaskKind) -> &'static RetryPolicy {
 /// watch, or is awaited to its terminal phase by the shutdown drain.
 /// `Leave` and `ResolveFrozenJournal` are journaled/store-atomic
 /// operations whose outcome must settle before teardown completes.
-pub(crate) fn cancellable(kind: &TaskKind) -> bool {
-  !kind.drains_on_shutdown()
+pub(crate) fn cancellable(policy: &TaskReconcilePolicy) -> bool {
+  !policy.drains_on_shutdown
 }
 
-/// One reconcile attempt's terminal payload: the public output plus,
-/// for the credential kinds, the consumed-once secret slot.
-pub(crate) struct EffectOutcome {
-  pub(crate) output: TaskOutput,
-  pub(crate) secret: Option<IssuedMergeCredential>,
+/// One attempt's terminal payload: either the public output plus, for
+/// the credential kinds, the consumed-once secret slot, or an explicit
+/// re-arm request carrying the error the next attempt's context reads.
+pub(crate) enum EffectOutcome {
+  /// The attempt succeeded; the task terminalizes with the payloads.
+  Done {
+    output: TaskOutput,
+    secret: Option<IssuedMergeCredential>,
+  },
+  /// The attempt made no progress and explicitly asked for a re-arm:
+  /// the manager re-runs the effect after the policy's backoff while
+  /// the attempt budget lasts, then terminalizes with this error. A
+  /// returned `Err` never re-arms; this variant is the only re-arm
+  /// path an effect controls.
+  Retry(Error),
 }
 
 impl EffectOutcome {
   pub(crate) fn new(output: TaskOutput) -> Self {
-    Self {
+    Self::Done {
       output,
       secret: None,
     }
@@ -231,20 +239,20 @@ impl EffectOutcome {
 
   /// The issue-credential effect's outcome: the observation carries the
   /// generation's expiry; the secret rides the consumed-once slot.
-  pub(crate) fn credential_issued(issued: IssuedMergeCredential) -> Self {
-    Self {
-      output: TaskOutput::IssueCredential(CredentialIssued::new(issued.expires_at())),
+  pub(crate) fn credential_issued(issued: IssuedMergeCredential) -> Result<Self> {
+    Ok(Self::Done {
+      output: encode_credential(issued.expires_at())?,
       secret: Some(issued),
-    }
+    })
   }
 
   /// The rotate-credential effect's outcome (the same consumed-once
   /// rule).
-  pub(crate) fn credential_rotated(issued: IssuedMergeCredential) -> Self {
-    Self {
-      output: TaskOutput::RotateCredential(CredentialIssued::new(issued.expires_at())),
+  pub(crate) fn credential_rotated(issued: IssuedMergeCredential) -> Result<Self> {
+    Ok(Self::Done {
+      output: encode_credential(issued.expires_at())?,
       secret: Some(issued),
-    }
+    })
   }
 }
 
@@ -326,11 +334,12 @@ impl TaskSpec {
   /// (only crate-internal wiring builds specs, so a miss is the typed
   /// internal invariant, never caller data).
   pub(crate) fn check_shape(&self) -> Result<()> {
-    let requires_dial = matches!(self.kind, TaskKind::Connect);
-    let requires_revoke = matches!(self.kind, TaskKind::Revoke);
+    let core = CoreTaskKind::from_tag(&self.kind);
+    let requires_dial = core == Some(CoreTaskKind::Connect);
+    let requires_revoke = core == Some(CoreTaskKind::Revoke);
     let requires_subject = matches!(
-      self.kind,
-      TaskKind::Disconnect | TaskKind::PurgeRevocation | TaskKind::Cleanup,
+      core,
+      Some(CoreTaskKind::Disconnect | CoreTaskKind::PurgeRevocation | CoreTaskKind::Cleanup),
     );
     if requires_dial && !matches!(self.payload, TaskPayload::PeerDial { .. }) {
       return Err(Error::internal("task coalescing subject"));
@@ -346,21 +355,24 @@ impl TaskSpec {
 
   /// The coalescing subject, when the kind coalesces.
   pub(crate) fn coalesce_key(&self) -> Option<NodeId> {
-    match &self.kind {
-      TaskKind::Connect => match &self.payload {
+    match CoreTaskKind::from_tag(&self.kind) {
+      Some(CoreTaskKind::Connect) => match &self.payload {
         TaskPayload::PeerDial { peer, .. } => Some(peer.clone()),
         TaskPayload::Peer(subject) => Some(subject.clone()),
         TaskPayload::Revoke { .. } | TaskPayload::None => None,
       },
-      TaskKind::Disconnect | TaskKind::Revoke | TaskKind::PurgeRevocation | TaskKind::Cleanup => {
-        match &self.payload {
-          TaskPayload::Peer(subject) => Some(subject.clone()),
-          TaskPayload::Revoke { subject, .. } | TaskPayload::PeerDial { peer: subject, .. } => {
-            Some(subject.clone())
-          }
-          TaskPayload::None => None,
+      Some(
+        CoreTaskKind::Disconnect
+        | CoreTaskKind::Revoke
+        | CoreTaskKind::PurgeRevocation
+        | CoreTaskKind::Cleanup,
+      ) => match &self.payload {
+        TaskPayload::Peer(subject) => Some(subject.clone()),
+        TaskPayload::Revoke { subject, .. } | TaskPayload::PeerDial { peer: subject, .. } => {
+          Some(subject.clone())
         }
-      }
+        TaskPayload::None => None,
+      },
       _ => None,
     }
   }
@@ -372,6 +384,21 @@ pub(crate) struct Submission {
   pub(crate) spec: TaskSpec,
   pub(crate) effect: TaskEffect,
   pub(crate) reply: oneshot::Sender<Result<TaskId>>,
+  /// The slot class of the effect this submission was made from, when
+  /// any: the attempt body scopes the running effect's class onto its
+  /// tokio task (see `RUNNING_EFFECT_CLASS`), and the admission refuses
+  /// a submission into that same class — the nested-submit refusal that
+  /// turns the same-class recursive-waiting deadlock into a typed
+  /// caller error.
+  pub(crate) from_class: Option<SlotClass>,
+}
+
+// The slot class of the reconcile effect running on the current tokio
+// task, set by the attempt body around the effect invocation. A
+// submission read off a task without this scope (a verb call from
+// ordinary caller code) carries no class and is never refused.
+tokio::task_local! {
+  static RUNNING_EFFECT_CLASS: SlotClass;
 }
 
 /// The caller's submission half over the manager: the bounded admission
@@ -395,9 +422,9 @@ impl std::fmt::Debug for TaskClient {
 impl TaskClient {
   /// Submits one task and awaits its admission: pure validation and
   /// hooks have already run caller-side; this is id composition, the
-  /// dedup/coalescing check, the per-class backlog bound, the `Pending`
-  /// publication, and the first reconcile spawn. No IO ever runs on
-  /// this path.
+  /// nested-submit refusal, the dedup/coalescing check, the per-class
+  /// backlog bound, the `Pending` publication, and the first reconcile
+  /// spawn. No IO ever runs on this path.
   pub(crate) async fn submit(&self, spec: TaskSpec, effect: TaskEffect) -> Result<TaskId> {
     let (reply, response) = oneshot::channel();
     self
@@ -406,6 +433,7 @@ impl TaskClient {
         spec,
         effect,
         reply,
+        from_class: RUNNING_EFFECT_CLASS.try_with(|class| *class).ok(),
       })
       .await
       .map_err(|_| Error::shutting_down("task admission"))?;
@@ -450,11 +478,12 @@ pub(crate) struct TaskManagerDeps {
   /// the submit half, so holding a handle never keeps the metadata store
   /// locked past shutdown).
   pub(crate) operations: Arc<super::task_effects::OperationDeps>,
-  /// The leave reconciler's completion signal to the supervisor
+  /// The leave plane's signal to the supervisor
   /// ([`super::supervisor::spawn_runtime`] owns the receiving end). The
-  /// manager sends it once the leave task's terminal publication landed,
-  /// which is what starts the `ActiveLeave` shutdown.
-  pub(crate) leave_complete: mpsc::Sender<()>,
+  /// manager sends the success once the leave task's terminal publication
+  /// landed, which is what starts the `ActiveLeave` shutdown; the leave
+  /// effect sends the fatal failure of a teardown that already began.
+  pub(crate) leave_signal: mpsc::Sender<super::lifecycle::LeaveSignal>,
 }
 
 /// The per-incarnation state shared with every worker future.
@@ -463,10 +492,10 @@ struct ManagerShared {
   clock: Arc<dyn WallClock>,
   /// The node-shared operation handles every effect reads.
   operations: Arc<super::task_effects::OperationDeps>,
-  /// The leave completion signal, sent once the leave task terminalized
+  /// The leave plane's signal, sent once the leave task terminalized
   /// with success (the supervisor owns the receiver and answers with the
   /// active-leave shutdown).
-  leave_complete: mpsc::Sender<()>,
+  leave_signal: mpsc::Sender<super::lifecycle::LeaveSignal>,
   /// The two execution-slot channels, one per slot class: the worker's
   /// permit draw is class-routed so local work never queues behind a
   /// dial.
@@ -649,13 +678,14 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
   // The execution-slot budgets ride the node configuration carried by
   // the operation planes; the unit-test double (no planes) reads the
   // same defaults the configuration ships.
-  let (local_slots, network_slots) = deps
+  let (local_slots, network_slots, extension_slots) = deps
     .operations
     .planes()
     .map(|planes| {
       (
         planes.config.task_reconcile_local_slots(),
         planes.config.task_reconcile_network_slots(),
+        planes.config.task_reconcile_extension_slots(),
       )
     })
     .unwrap_or_else(|_| {
@@ -663,14 +693,15 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
       (
         defaults.task_reconcile_local_slots(),
         defaults.task_reconcile_network_slots(),
+        defaults.task_reconcile_extension_slots(),
       )
     });
   let shared = Arc::new(ManagerShared {
     table,
     clock: deps.clock,
     operations: Arc::clone(&deps.operations),
-    leave_complete: deps.leave_complete,
-    slots: ReconcileChannels::new(local_slots, network_slots),
+    leave_signal: deps.leave_signal,
+    slots: ReconcileChannels::new(local_slots, network_slots, extension_slots),
     observations: crate::task::ObservationLanes::new(),
   });
   // The bounded observation lanes' scheduling half joins the operation
@@ -702,6 +733,7 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
 struct RetryTicket {
   id: TaskId,
   kind: TaskKind,
+  policy: TaskReconcilePolicy,
   effect: TaskEffect,
   attempt: u32,
   last_error: Option<TaskError>,
@@ -722,6 +754,7 @@ enum WorkerReport {
   Retry {
     id: TaskId,
     kind: TaskKind,
+    policy: TaskReconcilePolicy,
     effect: TaskEffect,
     attempt: u32,
     last_error: Option<TaskError>,
@@ -834,6 +867,7 @@ async fn run_manager(
               &mut outstanding,
               ticket.id,
               ticket.kind,
+              ticket.policy,
               ticket.effect,
               ticket.attempt,
               ticket.last_error,
@@ -850,32 +884,31 @@ async fn run_manager(
             // task's observations by id, so the terminal publication's
             // observation — already scheduled — is the task's last, and
             // nothing outlives the task on the manager's side.
+            //
+            // The leave exclusivity slot clears with the leave task's
+            // terminal report, success or failure: a failed leave is the
+            // caller's to re-admit.
             if leave_task.as_ref() == Some(&id) {
               leave_task = None;
-              // The table's terminal phase is the single truth, driven
-              // straight off the terminal publication: the action-hook
-              // observations run on the observation lanes off this
-              // path, so a wedged or panicking hook can never delay the
-              // active-leave shutdown behind the task's own success.
-              let succeeded = shared
-                .table
-                .status(&id)
-                .is_some_and(|(_, status)| status.phase() == TaskPhase::Succeeded);
-              if succeeded {
-                // The supervisor's active-leave shutdown starts here. The
-                // terminal publication already landed inside the attempt
-                // body, so every `wait` caller observed the outcome before
-                // any teardown begins. The channel is capacity-one and a
-                // leave is once-per-incarnation, so a refused send only
-                // means the supervisor is already shutting down.
-                let _ = shared.leave_complete.try_send(());
-              }
+            }
+            // The active-leave signal is read off the table's own
+            // (kind, phase) — never off id equality with the slot above:
+            // the terminal publication already landed inside the attempt
+            // body, so every `wait` caller observed the outcome before
+            // any teardown begins, and no other task's report can steal
+            // or suppress the leave's signal.
+            if let Some(signal) = leave_signal_for(&shared.table, &id) {
+              // The channel is capacity-one and a leave is
+              // once-per-incarnation, so a refused send only means the
+              // supervisor is already shutting down.
+              let _ = shared.leave_signal.try_send(signal);
             }
             shared.table.retain_terminal_history(TASK_TERMINAL_HISTORY);
           }
           WorkerReport::Retry {
             id,
             kind,
+            policy,
             effect,
             attempt,
             last_error,
@@ -891,6 +924,7 @@ async fn run_manager(
                 .push(RetryTicket {
                   id,
                   kind,
+                  policy,
                   effect,
                   attempt,
                   last_error,
@@ -933,6 +967,7 @@ fn admit(
     spec,
     effect,
     reply,
+    from_class,
   } = submission;
   let result = admit_inner(
     shared,
@@ -943,6 +978,7 @@ fn admit(
     base,
     &spec,
     effect,
+    from_class,
     reports,
     outstanding,
   );
@@ -954,14 +990,30 @@ fn admit_inner(
   shared: &Arc<ManagerShared>, counter: &mut u64,
   coalescing: &mut BTreeMap<(TaskKind, NodeId), (TaskId, TaskSpec)>,
   leave_task: &mut Option<TaskId>, cancel_watch: &watch::Receiver<bool>, base: u128,
-  spec: &TaskSpec, effect: TaskEffect, reports: &mpsc::UnboundedSender<WorkerReport>,
-  outstanding: &mut usize,
+  spec: &TaskSpec, effect: TaskEffect, from_class: Option<SlotClass>,
+  reports: &mpsc::UnboundedSender<WorkerReport>, outstanding: &mut usize,
 ) -> Result<TaskId> {
   if *cancel_watch.borrow() {
     return Err(Error::shutting_down("task admission"));
   }
   spec.check_shape()?;
   let kind = spec.kind().clone();
+  // The execution policy rides the kind's registration (the core verbs
+  // declare theirs in `register_default`, a caller kind at its own
+  // registration). A kind without one cannot be admitted: the public
+  // submit refuses unregistered kinds and the node builder always runs
+  // `register_default`, so a miss here is an internal invariant.
+  let policy = shared
+    .extensions()
+    .task_reconciler_policy(&kind)
+    .ok_or_else(|| Error::internal("task policy"))?;
+  // The nested-submit refusal: a submission made from inside an effect
+  // of the same slot class would await a task of its own bounded
+  // channel — the one recursive wait that can self-deadlock on the
+  // class's budget — so it is refused typed instead of admitted.
+  if from_class == Some(policy.slot_class) {
+    return Err(Error::conflict("nested task submit"));
+  }
   // Coalescing: kind + subject, accepted only when the whole spec
   // equals the in-flight one. A task's terminal publication (which
   // wakes every `wait`) lands inside its attempt body, before this
@@ -990,18 +1042,21 @@ fn admit_inner(
       coalescing.remove(&key);
     }
   }
-  if matches!(kind, TaskKind::Leave)
-    && let Some(existing) = leave_task.clone()
-    && in_flight(&existing)
-  {
-    return Err(Error::conflict("task in flight"));
+  // Leave exclusivity: the first admitted leave owns the active-leave
+  // signal until its terminal report, so a second leave — concurrent, or
+  // a retry inside the window between the first leave's terminal
+  // publication and that report — is refused instead of replacing the
+  // first. The slot clears on the first leave's terminal report, so a
+  // failed leave is still re-admittable.
+  if CoreTaskKind::from_tag(&kind) == Some(CoreTaskKind::Leave) && leave_task.is_some() {
+    return Err(Error::conflict("leave in progress"));
   }
   // The per-class backlog bound: admission itself is refused once the
   // class holds its budget of non-terminal entries, so slow effects
   // plus a stream of distinct intents can never accumulate unbounded
   // admitted work. The bound is per class — a stalled dial backlog
   // never consumes the local write budget.
-  if shared.table.non_terminal_count(kind.slot_class()) >= TASK_RECONCILE_BACKLOG {
+  if shared.table.non_terminal_count(policy.slot_class) >= TASK_RECONCILE_BACKLOG {
     return Err(Error::overloaded("task admission"));
   }
   let next = *counter;
@@ -1011,7 +1066,7 @@ fn admit_inner(
   let id = TaskId::compose(base, next)?;
   if !shared
     .table
-    .insert_pending(&id, kind.clone(), shared.clock.now())
+    .insert_pending(&id, kind.clone(), policy, shared.clock.now())
   {
     return Err(Error::internal("task admission"));
   }
@@ -1026,7 +1081,7 @@ fn admit_inner(
   if let Some(subject) = spec.coalesce_key() {
     coalescing.insert((kind.clone(), subject), (id.clone(), spec.clone()));
   }
-  if matches!(kind, TaskKind::Leave) {
+  if CoreTaskKind::from_tag(&kind) == Some(CoreTaskKind::Leave) {
     *leave_task = Some(id.clone());
   }
   spawn_worker(
@@ -1036,6 +1091,7 @@ fn admit_inner(
     outstanding,
     id.clone(),
     kind,
+    policy,
     effect,
     1,
     None,
@@ -1051,6 +1107,10 @@ struct Worker {
   reports: mpsc::UnboundedSender<WorkerReport>,
   id: TaskId,
   kind: TaskKind,
+  /// The execution policy admission resolved from the kind's
+  /// registration: the slot channel this worker draws from and whether
+  /// the shutdown drain awaits the effect.
+  policy: TaskReconcilePolicy,
   effect: TaskEffect,
   attempt: u32,
   /// The previous attempt's typed error, handed to the effect from the
@@ -1069,14 +1129,14 @@ impl Worker {
   }
 
   async fn run_attempt(mut self) -> WorkerReport {
-    let cancellable = cancellable(&self.kind);
+    let cancellable = cancellable(&self.policy);
     if cancellable && *self.cancel.borrow() {
       return WorkerReport::Cancelled;
     }
-    // The permit gate, drawn from the kind's slot channel: a
+    // The permit gate, drawn from the kind's registered slot channel: a
     // cancellable kind releases its queue slot on shutdown instead of
     // waiting out the concurrency bound.
-    let slots = self.shared.slots.for_class(self.kind.slot_class());
+    let slots = self.shared.slots.for_class(self.policy.slot_class);
     let permit = if cancellable {
       tokio::select! {
         permit = slots.acquire() => permit,
@@ -1112,6 +1172,7 @@ impl Worker {
         shared: Arc::clone(&self.shared),
         id: self.id.clone(),
         kind: self.kind.clone(),
+        policy: self.policy,
         effect: self.effect.clone(),
         attempt: AttemptContext {
           attempt: self.attempt,
@@ -1143,6 +1204,7 @@ impl Worker {
       Ok(AttemptOutcome::Retry { delay, last_error }) => WorkerReport::Retry {
         id: self.id,
         kind: self.kind,
+        policy: self.policy,
         effect: self.effect,
         // The wake runs the next attempt: the ticket carries the
         // incremented index, so the budget is spent monotonically and
@@ -1183,6 +1245,7 @@ struct Attempt {
   shared: Arc<ManagerShared>,
   id: TaskId,
   kind: TaskKind,
+  policy: TaskReconcilePolicy,
   effect: TaskEffect,
   attempt: AttemptContext,
 }
@@ -1197,14 +1260,43 @@ impl Attempt {
       // poisoned: there is no state left to publish onto.
       return AttemptOutcome::Terminal;
     }
-    match (self.effect)(Arc::clone(&self.shared.operations), self.attempt).await {
-      Ok(EffectOutcome { output, secret }) => {
+    // The running effect's slot class is scoped onto this task so a
+    // nested submission reads it and the admission can refuse a
+    // same-class recursive wait (the nested-submit refusal).
+    let class = self.policy.slot_class;
+    let outcome = RUNNING_EFFECT_CLASS
+      .scope(
+        class,
+        (self.effect)(Arc::clone(&self.shared.operations), self.attempt),
+      )
+      .await;
+    match outcome {
+      Ok(EffectOutcome::Done { output, secret }) => {
         self
           .shared
           .publish_success(&self.id, &self.kind, output, secret);
         AttemptOutcome::Terminal
       }
+      Ok(EffectOutcome::Retry(error)) => {
+        // The explicit re-arm decision: the schedule's budget bounds it,
+        // and the carried error rides the next attempt's context. The
+        // error's kind is not classified here — the decision itself is
+        // the re-arm request.
+        let policy = retry_policy(&self.kind);
+        if self.attempt.attempt < policy.max_attempts {
+          AttemptOutcome::Retry {
+            delay: policy.backoff(self.attempt.attempt),
+            last_error: Some(TaskError::from_error(error)),
+          }
+        } else {
+          self.shared.publish_failure(&self.id, &self.kind, error);
+          AttemptOutcome::Terminal
+        }
+      }
       Err(error) => {
+        // A returned error is terminal unless the kind's own policy
+        // classifies it retryable (the network dials' convergence
+        // transients); the extension kinds never retry an `Err`.
         let policy = retry_policy(&self.kind);
         if self.attempt.attempt < policy.max_attempts && policy.class.retryable(error.kind()) {
           AttemptOutcome::Retry {
@@ -1224,7 +1316,8 @@ impl Attempt {
 fn spawn_worker(
   shared: &Arc<ManagerShared>, cancel_watch: &watch::Receiver<bool>,
   reports: &mpsc::UnboundedSender<WorkerReport>, outstanding: &mut usize, id: TaskId,
-  kind: TaskKind, effect: TaskEffect, attempt: u32, last_error: Option<TaskError>,
+  kind: TaskKind, policy: TaskReconcilePolicy, effect: TaskEffect, attempt: u32,
+  last_error: Option<TaskError>,
 ) {
   *outstanding += 1;
   let worker = Worker {
@@ -1232,6 +1325,7 @@ fn spawn_worker(
     reports: reports.clone(),
     id,
     kind,
+    policy,
     effect,
     attempt,
     last_error,
@@ -1247,6 +1341,18 @@ fn rearm_retry_timer(timer: &mut Pin<Box<Sleep>>, retries: &BTreeMap<Instant, Ve
     Some(deadline) => timer.as_mut().reset(*deadline),
     None => timer.as_mut().reset(Instant::now() + RETRY_TIMER_IDLE),
   }
+}
+
+/// The leave plane's signal for one terminal report, read off the table's
+/// own (kind, phase): only a succeeded leave drives the active-leave
+/// shutdown. A failed leave is the caller's to retry and leaves the node
+/// running — a failure that landed after the leave's own network teardown
+/// began reports the fatal shutdown from the effect instead.
+fn leave_signal_for(table: &TaskTable, id: &TaskId) -> Option<super::lifecycle::LeaveSignal> {
+  let (kind, status) = table.status(id)?;
+  (CoreTaskKind::from_tag(&kind) == Some(CoreTaskKind::Leave)
+    && status.phase() == TaskPhase::Succeeded)
+    .then_some(super::lifecycle::LeaveSignal::Complete)
 }
 
 #[cfg(test)]
@@ -1276,11 +1382,15 @@ mod tests {
   };
 
   fn deps_with(
-    events: Arc<crate::node::EventHub>, extensions: ExtensionRegistry,
+    events: Arc<crate::node::EventHub>, mut extensions: ExtensionRegistry,
   ) -> TaskManagerDeps {
+    // The core verbs' execution policies come from `register_default`,
+    // exactly like the node builder's startup path: the manager tests
+    // admit core kinds (sync rounds, leaves) and need them declared.
+    extensions.register_default().expect("core task policies");
     // The leave signal's receiver is the supervisor's in production; the
     // manager tests never admit a leave effect that sends it.
-    let (leave_complete, _leave_signals) = mpsc::channel(1);
+    let (leave_signal, _leave_signals) = mpsc::channel(1);
     TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
@@ -1288,7 +1398,7 @@ mod tests {
         events,
         Arc::new(extensions),
       )),
-      leave_complete,
+      leave_signal,
     }
   }
 
@@ -1321,7 +1431,8 @@ mod tests {
         Arc::new(PanicOnSucceededHook),
       )
       .expect("registration");
-    let (leave_complete, mut leave_signals) = mpsc::channel(1);
+    let (leave_signal, mut leave_signals) = mpsc::channel(1);
+    extensions.register_default().expect("core task policies");
     let deps = TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
@@ -1329,16 +1440,16 @@ mod tests {
         Arc::new(crate::node::EventHub::new()),
         Arc::new(extensions),
       )),
-      leave_complete,
+      leave_signal,
     };
     let (client, _manager) = spawn_task_manager(deps).expect("manager");
     let id = client
       .submit(
-        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
-        ok_effect(TaskOutput::Leave(crate::LeaveOutcome::new(
-          node('a'),
-          node('b'),
-        ))),
+        TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
+        ok_effect(
+          crate::task::output::encode_leave(&crate::LeaveOutcome::new(node('a'), node('b')))
+            .expect("leave output"),
+        ),
       )
       .await
       .expect("admission");
@@ -1348,14 +1459,16 @@ mod tests {
     // table's terminal phase — the single truth — drives the
     // active-leave signal: the node must not hang on shutdown waiting
     // for a leave that already succeeded.
-    handle::<crate::LeaveOutcome>(&client, &id, TaskKind::Leave)
+    handle::<crate::LeaveOutcome>(&client, &id, TaskKind::LEAVE)
       .wait()
       .await
       .expect("the terminal success stands");
-    tokio::time::timeout(Duration::from_secs(5), leave_signals.recv())
-      .await
-      .expect("the leave signal fires")
-      .expect("receiver live");
+    assert_eq!(
+      tokio::time::timeout(Duration::from_secs(5), leave_signals.recv())
+        .await
+        .expect("the leave signal fires"),
+      Some(super::super::lifecycle::LeaveSignal::Complete)
+    );
   }
 
   /// An action hook that never settles while holding a guard whose
@@ -1386,10 +1499,10 @@ mod tests {
     }
   }
 
-  /// The P2-1 shutdown regression: under the detached-spawn design a
-  /// wedged action hook survived the whole incarnation — its spawned
-  /// observation task was dropped from the manager's bookkeeping at
-  /// the terminal report and nothing ever cancelled it. The bounded
+  /// The shutdown regression: under a detached-spawn design a
+  /// wedged action hook would survive the whole incarnation — its spawned
+  /// observation task dropped from the manager's bookkeeping at
+  /// the terminal report with nothing ever cancelling it. The bounded
   /// observation lanes are the manager's own state: the shutdown drain
   /// drops them, which aborts the parked runner and with it the
   /// wedged observation.
@@ -1414,12 +1527,12 @@ mod tests {
     .expect("manager");
     let id = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        ok_effect(TaskOutput::SyncRound(())),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
+        ok_effect(unit_output()),
       )
       .await
       .expect("admission");
-    handle::<()>(&client, &id, TaskKind::SyncRound)
+    handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
       .wait()
       .await
       .expect("the wedged hook never delays the task");
@@ -1473,12 +1586,12 @@ mod tests {
     }
   }
 
-  /// The P2-1 ordering contract on the lane design: one task's
+  /// The ordering contract on the lane design: one task's
   /// observations are pinned to one lane's FIFO, so a slow `Running`
   /// observation is always followed — never overtaken — by the task's
   /// own terminal observation. Per-observation lane choice would let
-  /// the instant terminal observation overtake the slow one; the old
-  /// predecessor chains preserved order but accumulated unbounded
+  /// the instant terminal observation overtake the slow one; predecessor
+  /// chains preserve order but accumulate unbounded
   /// detached work behind a wedged hook.
   #[tokio::test]
   async fn one_tasks_transition_observations_stay_in_order_on_their_lane() {
@@ -1502,12 +1615,12 @@ mod tests {
     for _ in 0..count {
       let id = client
         .submit(
-          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-          ok_effect(TaskOutput::SyncRound(())),
+          TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
+          ok_effect(unit_output()),
         )
         .await
         .expect("admission");
-      handle::<()>(&client, &id, TaskKind::SyncRound)
+      handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
         .wait()
         .await
         .expect("terminal");
@@ -1543,23 +1656,35 @@ mod tests {
     }
   }
 
-  /// The P1-6 regression: an extension reconciler is the one effect
-  /// class that routinely awaits other admitted tasks through its
-  /// public handle. Under the old two-channel split it drew from the
-  /// local channel, so with one local slot already held it took the
-  /// last remaining slot and its child write could never start — the
-  /// workflow deadlocked on the very capacity its own child needed.
-  /// The extension channel breaks the cycle: the workflow draws its
-  /// own class, and the child takes the local slot the workflow no
-  /// longer occupies.
+  /// The extension-reconciler regression: an extension reconciler is the one
+  /// effect class that routinely awaits other admitted tasks through its
+  /// public handle. A two-channel split (local plus extension) would
+  /// draw from the local channel, so with one local slot already held it
+  /// would take the last remaining slot and its child write could never
+  /// start — the workflow would deadlock on the very capacity its own
+  /// child needed. The extension channel breaks the cycle: the workflow
+  /// draws its own class, and the child takes the local slot the workflow
+  /// no longer occupies.
   #[tokio::test]
   async fn an_extension_workflow_never_occupies_the_local_channel_its_children_need() {
-    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    // The workflow kind needs a registration so admission resolves its
+    // extension policy; the test drives the effect directly, so the
+    // registered reconciler never runs.
+    let kind_tag = QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag");
+    let mut extensions = ExtensionRegistry::new();
+    extensions
+      .register_task_reconciler(kind_tag.clone(), RecordingReconciler::new(Vec::new()))
+      .expect("registration");
+    let (client, _manager) = spawn_task_manager(deps_with(
+      Arc::new(crate::node::EventHub::new()),
+      extensions,
+    ))
+    .expect("manager");
     // One wedged core local task pins one of the local channel's two
     // default slots: exactly one slot remains for the workflow's child.
     let wedged = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -1587,18 +1712,17 @@ mod tests {
       Box::pin(async move {
         let child = client
           .submit(
-            TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-            ok_effect(TaskOutput::SyncRound(())),
+            TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
+            ok_effect(unit_output()),
           )
           .await?;
-        Task::<()>::from_parts(child, TaskKind::SyncRound, client.observer.clone())
+        Task::<()>::from_parts(child, TaskKind::SYNC_ROUND, client.observer.clone())
           .wait()
           .await?;
-        Ok(EffectOutcome::new(TaskOutput::Extension(())))
+        Ok(EffectOutcome::new(custom_output()))
       })
     });
-    let kind =
-      TaskKind::Extension(QualifiedTag::parse("example.com/tasks/v1/child-write").expect("tag"));
+    let kind = TaskKind::from(kind_tag);
     let id = client
       .submit(TaskSpec::new(kind.clone(), TaskPayload::None), effect)
       .await
@@ -1612,11 +1736,11 @@ mod tests {
     .expect("terminal");
   }
 
-  /// The P2-2 regression: the manager admitted unboundedly — the
-  /// submission channel bounded only in-flight messages, and each
-  /// admission inserted a `Pending` entry and spawned a worker before
-  /// that worker ever drew an execution slot, so a slow effect plus a
-  /// stream of distinct intents accumulated non-terminal work without
+  /// The admission-bounding regression: a manager that admits unboundedly
+  /// — the submission channel bounding only in-flight messages, with each
+  /// admission inserting a `Pending` entry and spawning a worker before
+  /// that worker ever draws an execution slot — lets a slow effect plus a
+  /// stream of distinct intents accumulate non-terminal work without
   /// bound. The per-class backlog bound refuses typed once a class
   /// holds its budget, and the budgets are isolated: a saturated local
   /// backlog never consumes the network budget.
@@ -1629,7 +1753,7 @@ mod tests {
     for _ in 0..super::TASK_RECONCILE_BACKLOG {
       client
         .submit(
-          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+          TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
           wedged_effect(),
         )
         .await
@@ -1637,7 +1761,7 @@ mod tests {
     }
     let refused = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -1665,12 +1789,12 @@ mod tests {
     // its terminal phase while the local backlog is saturated.
     let dial = client
       .submit(
-        TaskSpec::new(TaskKind::Join, TaskPayload::None),
-        ok_effect(TaskOutput::Join(merge_view())),
+        TaskSpec::new(TaskKind::JOIN, TaskPayload::None),
+        ok_effect(crate::task::output::encode_join(&merge_view()).expect("join output")),
       )
       .await
       .expect("the network backlog is a separate budget");
-    handle::<MergeView>(&client, &dial, TaskKind::Join)
+    handle::<MergeView>(&client, &dial, TaskKind::JOIN)
       .wait()
       .await
       .expect("dial terminal");
@@ -1685,7 +1809,7 @@ mod tests {
     for _ in 0..super::TASK_RECONCILE_BACKLOG {
       client
         .submit(
-          TaskSpec::new(TaskKind::Join, TaskPayload::None),
+          TaskSpec::new(TaskKind::JOIN, TaskPayload::None),
           wedged_effect(),
         )
         .await
@@ -1693,7 +1817,7 @@ mod tests {
     }
     let refused = client
       .submit(
-        TaskSpec::new(TaskKind::Join, TaskPayload::None),
+        TaskSpec::new(TaskKind::JOIN, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -1703,12 +1827,12 @@ mod tests {
     // saturated backlog budget never consumes another's.
     let local = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
-        ok_effect(TaskOutput::SyncRound(())),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
+        ok_effect(unit_output()),
       )
       .await
       .expect("local admission");
-    handle::<()>(&client, &local, TaskKind::SyncRound)
+    handle::<()>(&client, &local, TaskKind::SYNC_ROUND)
       .wait()
       .await
       .expect("local terminal");
@@ -1720,6 +1844,19 @@ mod tests {
 
   fn merge_view() -> MergeView {
     MergeView::new(node('a'), node('b'))
+  }
+
+  /// Publishes one phase onto a table entry: the same mutation the
+  /// manager's own publication helpers perform.
+  fn publish_phase(table: &crate::task::TaskTable, id: &TaskId, phase: TaskPhase) {
+    table
+      .update(id, |entry| {
+        let mut record = entry.status.borrow().clone();
+        record.phase = phase;
+        entry.status.send_replace(record);
+      })
+      .expect("table update")
+      .expect("live entry");
   }
 
   fn handle<T: crate::task::TaskResult>(
@@ -1734,6 +1871,17 @@ mod tests {
       let output = output.clone();
       Box::pin(async move { Ok(EffectOutcome::new(output)) })
     })
+  }
+
+  /// One unit kind's success payload: the kind's canonical empty result.
+  fn unit_output() -> TaskOutput {
+    crate::task::output::encode_unit().expect("unit output")
+  }
+
+  /// One caller-defined kind's success payload: the reconciler's own
+  /// bytes, which the crate never encodes.
+  fn custom_output() -> TaskOutput {
+    TaskOutput::new(Arc::from([]))
   }
 
   /// An effect that never settles (a wedged effect under test).
@@ -1774,7 +1922,7 @@ mod tests {
             .push(context.attempt);
           let mut steps = scripted.steps.lock().expect("steps");
           let step = match steps.len() {
-            0 => Step::Ok(TaskOutput::SyncRound(())),
+            0 => Step::Ok(unit_output()),
             1 => match &steps[0] {
               Step::Ok(output) => Step::Ok(output.clone()),
               Step::Fail(kind, context) => Step::Fail(*kind, context),
@@ -1803,17 +1951,19 @@ mod tests {
     )]);
     let id = client
       .submit(
-        TaskSpec::new(TaskKind::Join, TaskPayload::None),
+        TaskSpec::new(TaskKind::JOIN, TaskPayload::None),
         scripted.effect(),
       )
       .await
       .expect("admission");
-    let error = handle::<MergeView>(&client, &id, TaskKind::Join)
+    let error = handle::<MergeView>(&client, &id, TaskKind::JOIN)
       .wait()
       .await
       .expect_err("terminal dial contract");
     assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
-    let status = handle::<MergeView>(&client, &id, TaskKind::Join).status();
+    let status = handle::<MergeView>(&client, &id, TaskKind::JOIN)
+      .status()
+      .expect("live task status");
     assert_eq!(status.attempts(), 1);
     assert_eq!(scripted.attempts(), vec![1]);
   }
@@ -1824,12 +1974,12 @@ mod tests {
     let scripted = Scripted::new(vec![Step::Fail(ErrorKind::NotFound, "anything")]);
     let id = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
         scripted.effect(),
       )
       .await
       .expect("admission");
-    let error = handle::<()>(&client, &id, TaskKind::SyncRound)
+    let error = handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
       .wait()
       .await
       .expect_err("once policy");
@@ -1847,25 +1997,26 @@ mod tests {
     let scripted = Scripted::new(vec![Step::Fail(ErrorKind::Conflict, "resource version")]);
     let id = client
       .submit(
-        TaskSpec::new(TaskKind::PutResource, TaskPayload::None),
+        TaskSpec::new(TaskKind::PUT_RESOURCE, TaskPayload::None),
         scripted.effect(),
       )
       .await
       .expect("admission");
-    let error = handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PutResource)
+    let error = handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PUT_RESOURCE)
       .wait()
       .await
       .expect_err("final CAS conflict");
     assert_eq!(error.kind(), ErrorKind::Conflict);
     assert_eq!(error.context(), "resource version");
-    let status =
-      handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PutResource).status();
+    let status = handle::<crate::ResourceMutationView>(&client, &id, TaskKind::PUT_RESOURCE)
+      .status()
+      .expect("live task status");
     assert_eq!(status.attempts(), 1, "never retried at the manager level");
     assert_eq!(scripted.attempts(), vec![1]);
   }
 
   /// The revoke payload carries the pinned expected key, so coalescing
-  /// compares it (audit A05): two revokes for the same subject with
+  /// compares it: two revokes for the same subject with
   /// different keys are different intents — the second must conflict,
   /// never join the in-flight task whose effect checks only the first
   /// caller's comparand. An identical retry still joins and resolves
@@ -1878,7 +2029,7 @@ mod tests {
       subject: subject.clone(),
       expected_key: crate::PublicKey::from_bytes([key; 32]),
     };
-    let spec = TaskSpec::new(TaskKind::Revoke, revoke(0x11));
+    let spec = TaskSpec::new(TaskKind::REVOKE, revoke(0x11));
     let first = client
       .submit(spec.clone(), wedged_effect())
       .await
@@ -1895,7 +2046,7 @@ mod tests {
     // precondition would never check its comparand.
     let smuggled = client
       .submit(
-        TaskSpec::new(TaskKind::Revoke, revoke(0x22)),
+        TaskSpec::new(TaskKind::REVOKE, revoke(0x22)),
         wedged_effect(),
       )
       .await
@@ -1924,25 +2075,27 @@ mod tests {
     let gate = release.clone();
     let first = client
       .submit(
-        TaskSpec::new(TaskKind::Revoke, payload.clone()),
+        TaskSpec::new(TaskKind::REVOKE, payload.clone()),
         Arc::new(move |_deps, _attempt| {
           let gate = gate.clone();
           let outcome = outcome.clone();
           Box::pin(async move {
             gate.notified().await;
-            Ok(EffectOutcome::new(TaskOutput::Revoke(outcome)))
+            Ok(EffectOutcome::new(
+              crate::task::output::encode_revoke(&outcome).expect("revoke output"),
+            ))
           })
         }),
       )
       .await
       .expect("admission");
     let joined = client
-      .submit(TaskSpec::new(TaskKind::Revoke, payload), wedged_effect())
+      .submit(TaskSpec::new(TaskKind::REVOKE, payload), wedged_effect())
       .await
       .expect("coalesced admission");
     assert_eq!(first, joined);
     release.notify_one();
-    let observed = handle::<crate::RevokeOutcome>(&client, &joined, TaskKind::Revoke)
+    let observed = handle::<crate::RevokeOutcome>(&client, &joined, TaskKind::REVOKE)
       .wait()
       .await
       .expect("the joined retry resolves the first task's terminal");
@@ -1959,7 +2112,7 @@ mod tests {
     let gate = release.clone();
     let first = client
       .submit(
-        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
         Arc::new(move |_deps, _attempt| {
           let gate = gate.clone();
           Box::pin(async move {
@@ -1975,32 +2128,152 @@ mod tests {
       .expect("admission");
     let conflict = client
       .submit(
-        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
         wedged_effect(),
       )
       .await
       .expect_err("leave exclusivity");
     assert_eq!(conflict.kind(), ErrorKind::Conflict);
-    assert_eq!(conflict.context(), "task in flight");
+    assert_eq!(conflict.context(), "leave in progress");
     // Release the gated leave to its typed failure (the `ONCE` policy
-    // never retries it): the exclusivity window closes with
-    // terminality — the table's phase is the single truth, so the
-    // re-issue never waits on the manager's report processing. A
-    // successful leave shuts the node down, so only the failed leave
-    // has a re-issue path at all.
+    // never retries it): the exclusivity slot clears with the manager's
+    // terminal report — not with the table's terminal publication, which
+    // lands inside the attempt body — so the re-issue is admitted once
+    // that report landed. A successful leave shuts the node down, so only
+    // the failed leave has a re-issue path at all.
     release.notify_one();
-    handle::<crate::LeaveOutcome>(&client, &first, TaskKind::Leave)
+    handle::<crate::LeaveOutcome>(&client, &first, TaskKind::LEAVE)
       .wait()
       .await
       .expect_err("scripted leave failure");
-    let reissued = client
+    let reissued = tokio::time::timeout(Duration::from_secs(5), async {
+      loop {
+        match client
+          .submit(
+            TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
+            wedged_effect(),
+          )
+          .await
+        {
+          Ok(id) => return id,
+          Err(error) => {
+            assert_eq!(error.kind(), ErrorKind::Conflict);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+          }
+        }
+      }
+    })
+    .await
+    .expect("the exclusivity slot clears with the terminal report");
+    assert_ne!(first, reissued);
+  }
+
+  /// The leave-signal regression: a second leave admitted in the window
+  /// before the first leave's terminal report is refused instead of
+  /// replacing the first, and the first leave's own success still reaches
+  /// the supervisor's active-leave signal. The id-equality gate let the
+  /// replacement steal the slot, so the first success never signalled and
+  /// the node stayed `Running`.
+  #[tokio::test]
+  async fn a_second_leave_before_the_first_terminal_report_is_refused_and_the_first_still_signals()
+  {
+    let (leave_signal, mut leave_signals) = mpsc::channel(1);
+    let mut extensions = ExtensionRegistry::new();
+    extensions.register_default().expect("core task policies");
+    let deps = TaskManagerDeps {
+      entropy: Arc::new(SequenceEntropy::default()),
+      clock: Arc::new(HostWallClock),
+      operations: Arc::new(super::super::task_effects::OperationDeps::test_double(
+        Arc::new(crate::node::EventHub::new()),
+        Arc::new(extensions),
+      )),
+      leave_signal,
+    };
+    let (client, _manager) = spawn_task_manager(deps).expect("manager");
+    // A gated leave: it holds the exclusivity slot until released, so the
+    // window before its terminal report is deterministic.
+    let release = Arc::new(Notify::new());
+    let gate = release.clone();
+    let first = client
       .submit(
-        TaskSpec::new(TaskKind::Leave, TaskPayload::None),
+        TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
+        Arc::new(move |_deps, _attempt| {
+          let gate = gate.clone();
+          Box::pin(async move {
+            gate.notified().await;
+            Ok(EffectOutcome::new(
+              crate::task::output::encode_leave(&crate::LeaveOutcome::new(node('a'), node('b')))
+                .expect("leave output"),
+            ))
+          })
+        }),
+      )
+      .await
+      .expect("admission");
+    let refused = client
+      .submit(
+        TaskSpec::new(TaskKind::LEAVE, TaskPayload::None),
         wedged_effect(),
       )
       .await
-      .expect("re-issue after a failed leave");
-    assert_ne!(first, reissued);
+      .expect_err("a second leave is refused while one is in flight");
+    assert_eq!(refused.kind(), ErrorKind::Conflict);
+    assert_eq!(refused.context(), "leave in progress");
+    // The first leave's success still signals the active-leave shutdown:
+    // the signal is the table's own (kind, phase), never the slot's id.
+    release.notify_one();
+    handle::<crate::LeaveOutcome>(&client, &first, TaskKind::LEAVE)
+      .wait()
+      .await
+      .expect("the first leave succeeds");
+    assert_eq!(
+      tokio::time::timeout(Duration::from_secs(5), leave_signals.recv())
+        .await
+        .expect("the leave signal fires"),
+      Some(super::super::lifecycle::LeaveSignal::Complete)
+    );
+  }
+
+  /// The signal decision reads the table's own (kind, phase) and nothing
+  /// else: a leave that published `Succeeded` signals, and no other
+  /// kind's success ever does. The exclusivity slot is not consulted —
+  /// the slot's id holds no signal authority, so a raced second
+  /// admission cannot change what the table reports.
+  #[test]
+  fn the_leave_signal_is_read_off_the_table_not_the_exclusivity_slot() {
+    let table = crate::task::TaskTable::new();
+    let leave = TaskId::compose(0, 0).expect("id");
+    let other = TaskId::compose(0, 1).expect("id");
+    table.insert_pending(
+      &leave,
+      TaskKind::LEAVE,
+      crate::task::TaskReconcilePolicy::EXTENSION,
+      std::time::SystemTime::now(),
+    );
+    table.insert_pending(
+      &other,
+      TaskKind::SYNC_ROUND,
+      crate::task::TaskReconcilePolicy::EXTENSION,
+      std::time::SystemTime::now(),
+    );
+    assert_eq!(
+      super::leave_signal_for(&table, &leave),
+      None,
+      "a pending leave never signals"
+    );
+    publish_phase(&table, &other, TaskPhase::Succeeded);
+    assert_eq!(
+      super::leave_signal_for(&table, &other),
+      None,
+      "no other kind's success signals the leave shutdown"
+    );
+    publish_phase(&table, &leave, TaskPhase::Succeeded);
+    assert_eq!(
+      super::leave_signal_for(&table, &leave),
+      Some(super::super::lifecycle::LeaveSignal::Complete)
+    );
+    let unknown = TaskId::compose(0, 99).expect("id");
+    assert_eq!(super::leave_signal_for(&table, &unknown), None);
   }
 
   #[tokio::test]
@@ -2009,7 +2282,7 @@ mod tests {
     // A cancellable kind wedged mid-effect.
     let wedged = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -2021,12 +2294,12 @@ mod tests {
       let gate = gate.clone();
       Box::pin(async move {
         gate.notified().await;
-        Ok(EffectOutcome::new(TaskOutput::ResolveFrozenJournal(())))
+        Ok(EffectOutcome::new(unit_output()))
       })
     });
     let journaled = client
       .submit(
-        TaskSpec::new(TaskKind::ResolveFrozenJournal, TaskPayload::None),
+        TaskSpec::new(TaskKind::RESOLVE_FROZEN_JOURNAL, TaskPayload::None),
         journaled_effect,
       )
       .await
@@ -2035,14 +2308,15 @@ mod tests {
     manager.begin_shutdown();
     // The cancellable task's wait resolves ShuttingDown without the
     // effect ever settling, and the task stays non-terminal.
-    let error = handle::<()>(&client, &wedged, TaskKind::SyncRound)
+    let error = handle::<()>(&client, &wedged, TaskKind::SYNC_ROUND)
       .wait()
       .await
       .expect_err("cancelled");
     assert_eq!(error.kind(), ErrorKind::ShuttingDown);
     assert_eq!(
-      handle::<()>(&client, &wedged, TaskKind::SyncRound)
+      handle::<()>(&client, &wedged, TaskKind::SYNC_ROUND)
         .status()
+        .expect("live task status")
         .phase(),
       TaskPhase::Running
     );
@@ -2057,7 +2331,7 @@ mod tests {
       .await
       .expect_err("the drain must wait for the journaled kind");
     release.notify_waiters();
-    handle::<()>(&client, &journaled, TaskKind::ResolveFrozenJournal)
+    handle::<()>(&client, &journaled, TaskKind::RESOLVE_FROZEN_JOURNAL)
       .wait()
       .await
       .expect("journaled terminal");
@@ -2065,6 +2339,30 @@ mod tests {
       .await
       .expect("drain completes")
       .expect("drain join");
+  }
+
+  #[test]
+  fn reconcile_channels_carry_the_configured_extension_budget() {
+    let channels = super::ReconcileChannels::new(1, 2, 3);
+    assert_eq!(
+      channels
+        .for_class(super::SlotClass::Local)
+        .available_permits(),
+      1
+    );
+    assert_eq!(
+      channels
+        .for_class(super::SlotClass::Network)
+        .available_permits(),
+      2
+    );
+    assert_eq!(
+      channels
+        .for_class(super::SlotClass::Extension)
+        .available_permits(),
+      3,
+      "the extension channel carries its configured budget"
+    );
   }
 
   #[tokio::test]
@@ -2084,12 +2382,12 @@ mod tests {
           peak.fetch_max(now, Ordering::SeqCst);
           tokio::time::sleep(Duration::from_millis(20)).await;
           live.fetch_sub(1, Ordering::SeqCst);
-          Ok(EffectOutcome::new(TaskOutput::SyncRound(())))
+          Ok(EffectOutcome::new(unit_output()))
         })
       });
       let id = client
         .submit(
-          TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+          TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
           effect,
         )
         .await
@@ -2097,11 +2395,13 @@ mod tests {
       ids.push((id, index));
     }
     for (id, _index) in ids {
-      handle::<()>(&client, &id, TaskKind::SyncRound)
+      handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
         .wait()
         .await
         .expect("terminal");
-      let status = handle::<()>(&client, &id, TaskKind::SyncRound).status();
+      let status = handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
+        .status()
+        .expect("live task status");
       assert_eq!(status.phase(), TaskPhase::Succeeded);
     }
     // SyncRound draws from the local channel, whose default budget is
@@ -2118,7 +2418,7 @@ mod tests {
     let (client, manager) = spawn_task_manager(deps()).expect("manager");
     let wedged = client
       .submit(
-        TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
         wedged_effect(),
       )
       .await
@@ -2134,7 +2434,7 @@ mod tests {
       .expect("cancel signal")
       .expect("stop watch live");
     assert!(*stopped.borrow());
-    let error = Task::<()>::from_parts(wedged, TaskKind::SyncRound, observer)
+    let error = Task::<()>::from_parts(wedged, TaskKind::SYNC_ROUND, observer)
       .wait()
       .await
       .expect_err("stopped manager");
@@ -2144,7 +2444,7 @@ mod tests {
 
   #[test]
   fn the_retry_policies_are_bounded_and_exponential() {
-    let network = super::retry_policy(&TaskKind::Join);
+    let network = super::retry_policy(&TaskKind::JOIN);
     assert_eq!(network.max_attempts, 4);
     assert_eq!(network.backoff(1), Duration::from_millis(100));
     assert_eq!(network.backoff(2), Duration::from_millis(400));
@@ -2154,14 +2454,48 @@ mod tests {
     // Resource writes share the once policy: the commit-race retry
     // lives inside the effects, and a final lost-CAS Conflict never
     // re-runs at the manager level.
-    assert_eq!(super::retry_policy(&TaskKind::PutResource).max_attempts, 1);
+    assert_eq!(super::retry_policy(&TaskKind::PUT_RESOURCE).max_attempts, 1);
     assert_eq!(
-      super::retry_policy(&TaskKind::DeleteResource).max_attempts,
+      super::retry_policy(&TaskKind::DELETE_RESOURCE).max_attempts,
       1
     );
-    let once = super::retry_policy(&TaskKind::Leave);
+    let once = super::retry_policy(&TaskKind::LEAVE);
     assert_eq!(once.max_attempts, 1);
     assert_eq!(once.backoff(1), Duration::ZERO);
+    // A caller-defined kind takes the extension policy: the reconciler
+    // owns the semantics, the manager owns the bound.
+    let caller = TaskKind::parse("example.com/tasks/v1/probe").expect("tag");
+    assert_eq!(super::retry_policy(&caller).max_attempts, 4);
+  }
+
+  /// The handle's expected kind is checked against the stored payload's
+  /// kind: a drift between the two is the typed internal error, never a
+  /// caller-visible decode of the wrong shape.
+  #[tokio::test]
+  async fn a_handle_of_the_wrong_kind_is_the_typed_internal_error() {
+    let (client, _manager) = spawn_task_manager(deps()).expect("manager");
+    let id = client
+      .submit(
+        TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
+        ok_effect(unit_output()),
+      )
+      .await
+      .expect("admission");
+    // The task succeeded as a sync round; a handle admitted for a join
+    // decodes the stored bytes under the join verb's payload shape, and
+    // the mismatch surfaces as the typed internal decode failure.
+    let error = handle::<MergeView>(&client, &id, TaskKind::JOIN)
+      .wait()
+      .await
+      .expect_err("kind mismatch");
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(error.context(), "task output decode");
+    // The contract holds for the right handle: the mismatch never
+    // poisoned the entry.
+    handle::<()>(&client, &id, TaskKind::SYNC_ROUND)
+      .wait()
+      .await
+      .expect("the matching handle resolves");
   }
 
   /// One recorded reconciler call: the attempt index plus the previous
@@ -2191,20 +2525,17 @@ mod tests {
     ) -> BoxFuture<'a, Result<ReconcileDecision>> {
       Box::pin(async move {
         self.calls.lock().expect("reconciler calls").push((
-          context.attempt,
-          context.last_error.map(|error| error.kind()),
+          context.attempt(),
+          context.last_error().map(|error| error.kind()),
         ));
         let mut decisions = self.decisions.lock().expect("decisions");
         let decision = decisions
           .pop_front()
           .unwrap_or(ReconcileDecision::Succeeded);
-        match decision {
-          ReconcileDecision::Succeeded => Ok(ReconcileDecision::Succeeded),
-          ReconcileDecision::Retry => Err(Error::from_parts(
-            ErrorKind::Overloaded,
-            "custom task retry",
-          )),
-        }
+        // The scripted decision is returned verbatim: the decision
+        // semantics live in the submit effect, which this test drives
+        // through the real `tasks().submit` surface.
+        Ok(decision)
       })
     }
   }
@@ -2215,9 +2546,13 @@ mod tests {
   /// registry instance serves both the handle (the reconciler lookup)
   /// and the manager (the hook source).
   fn handle_over_manager(
-    extensions: std::sync::Arc<ExtensionRegistry>, events: Arc<crate::node::EventHub>,
+    mut extensions: ExtensionRegistry, events: Arc<crate::node::EventHub>,
   ) -> (crate::NodeHandle, crate::Tasks) {
-    let (leave_complete, _leave_signals) = mpsc::channel(1);
+    // The core verbs' execution policies come from `register_default`,
+    // exactly like the node builder's startup path.
+    extensions.register_default().expect("core task policies");
+    let extensions = std::sync::Arc::new(extensions);
+    let (leave_signal, _leave_signals) = mpsc::channel(1);
     let deps = TaskManagerDeps {
       entropy: Arc::new(SequenceEntropy::default()),
       clock: Arc::new(HostWallClock),
@@ -2225,7 +2560,7 @@ mod tests {
         events,
         extensions.clone(),
       )),
-      leave_complete,
+      leave_signal,
     };
     let (client, _manager) = spawn_task_manager(deps).expect("manager");
     let (control_tx, _control_rx) = mpsc::channel(32);
@@ -2266,8 +2601,7 @@ mod tests {
     extensions
       .register_task_reconciler(kind.clone(), RecordingReconciler::new(Vec::new()))
       .expect("registration");
-    let (_handle, tasks) =
-      handle_over_manager(Arc::new(extensions), Arc::new(crate::node::EventHub::new()));
+    let (_handle, tasks) = handle_over_manager(extensions, Arc::new(crate::node::EventHub::new()));
 
     // The builtin domain is reserved and an unregistered kind is
     // unsupported: both refuse at admission, typed.
@@ -2301,12 +2635,12 @@ mod tests {
     // the terminal view still resolves immediately.
     let spec = crate::CustomTaskSpec::new(kind.clone(), custom_labels());
     let task = tasks.submit(spec).await.expect("custom admission");
-    assert_eq!(task.kind(), &TaskKind::Extension(kind.clone()));
+    assert_eq!(task.kind(), &TaskKind::from(kind.clone()));
     let id = task.id().clone();
     task.wait().await.expect("custom terminal");
     let view = tasks.wait(id.clone()).await.expect("terminal view");
     assert_eq!(view.phase(), TaskPhase::Succeeded);
-    assert_eq!(view.kind(), &TaskKind::Extension(kind));
+    assert_eq!(view.kind(), &TaskKind::from(kind));
     assert_eq!(view.attempts(), 1);
     let got = tasks
       .get(id.clone())

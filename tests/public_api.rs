@@ -23,11 +23,11 @@ use radiata::{
   DeclareInterruptedTransactionUncommitted, DeliveryAck, Digest, Endpoint, EventOptions,
   EventReceive, EventSubscription, ExtensionRegistry, FeatureDefinition, FeatureTag,
   IncomingStream, IssuedMergeCredential, KeyCapabilities, KeyCreateState, KeyDeleteState,
-  KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveOutcome, LoadBalancingPolicy,
-  LocalNodeView, MemberChanged, MemberView, MergeCredential, MergeView, NodeBuilder, NodeConfig,
-  NodeHandle, NodeId, NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot,
-  OutboundStream, PacketConsumer, PageCursor, PageSpec, ProtocolDefinition, ProtocolTag,
-  QualifiedTag, ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView,
+  KeyHandle, KeyOperationId, LabelKey, LabelSet, LabelValue, LeaveOutcome, LocalNodeView,
+  MemberChanged, MemberView, MergeCredential, MergeView, NodeBuilder, NodeConfig, NodeHandle,
+  NodeId, NodeMetadataPatch, NodeRevoked, NodeStatus, ObservabilitySnapshot, OutboundStream,
+  PacketConsumer, PageCursor, PageSpec, ProtocolDefinition, ProtocolTag, QualifiedTag,
+  ReceiptRetentionReport, RecoveryChanged, RecoveryConfig, RecoveryView,
   ReplaceIdentityAndDeleteOldCoreMetadata, ResourceChanged, ResourceLabels, ResourceMutationView,
   ResourceName, ResourceOrigin, ResourcePage, ResourceUri, ResourceVersion, ResourceWrite, Result,
   RouteChanged, RouteHandle, RouteNextHop, RouteState, RoutingPolicy, Selector, SessionChanged,
@@ -137,7 +137,7 @@ fn boundary_values_construct_parse_and_round_trip() {
 fn page_specs_and_cursors() {
   let spec = PageSpec::first(8).unwrap();
   let cursor_bytes: Arc<[u8]> = Arc::from(b"cursor-bytes".to_vec());
-  let cursor = PageCursor::from_provider_bytes(cursor_bytes.clone()).unwrap();
+  let cursor = PageCursor::new(cursor_bytes.clone()).unwrap();
   assert_eq!(cursor.as_bytes(), cursor_bytes.as_ref());
   let _after = PageSpec::after(cursor, 8).unwrap();
   let _first_again = spec;
@@ -523,41 +523,25 @@ impl PacketConsumer for PubConsumer {
 }
 
 #[derive(Debug)]
-struct PubLoadBalancer;
-
-impl LoadBalancingPolicy for PubLoadBalancer {
-  fn select<'a>(
-    &'a self, _selector: &'a Selector, candidates: &'a dyn radiata::CandidateNodeReader,
-  ) -> BoxFuture<'a, Result<NodeId>> {
-    Box::pin(async move {
-      let page = candidates.next_matching_nodes(_selector, None, 1).await?;
-      page
-        .items()
-        .first()
-        .map(|member| member.node_id().clone())
-        .ok_or_else(|| {
-          radiata::Error::provider(
-            radiata::ProviderErrorKind::Unsupported,
-            radiata::ProviderErrorContext::LoadBalancingPolicy,
-          )
-        })
-    })
-  }
-}
-
-#[derive(Debug)]
 struct PubNextHop;
 
 impl RouteNextHop for PubNextHop {
-  fn next_hop<'a>(&'a self, view: radiata::NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+  fn plan<'a>(
+    &'a self, view: radiata::NextHopView<'a>,
+  ) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
     Box::pin(async move {
-      let _ = (view.destination(), view.local());
-      view.peers().first().cloned().ok_or_else(|| {
-        radiata::Error::provider(
-          radiata::ProviderErrorKind::Unsupported,
-          radiata::ProviderErrorContext::NeighborPolicy,
-        )
-      })
+      let _ = (view.destination(), view.local(), view.remaining_hops());
+      view
+        .peers()
+        .first()
+        .cloned()
+        .map(|peer| Some(vec![peer]))
+        .ok_or_else(|| {
+          radiata::Error::provider(
+            radiata::ProviderErrorKind::Unsupported,
+            radiata::ProviderErrorContext::RoutingPolicy,
+          )
+        })
     })
   }
 }
@@ -565,15 +549,15 @@ impl RouteNextHop for PubNextHop {
 /// Stream policies, metadata, and targets are externally constructible.
 #[test]
 fn stream_surface_is_externally_constructible() {
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 3)
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 3)
     .unwrap()
-    .load_balancer(QualifiedTag::parse("example.org/balancers/first").unwrap());
+    .load_balancer(QualifiedTag::parse(radiata::DefaultLoadBalancer::TAG).unwrap());
   assert_eq!(policy.max_hops(), 3);
   assert_eq!(
     policy.load_balancing_policy(),
-    Some(&QualifiedTag::parse("example.org/balancers/first").unwrap())
+    Some(&QualifiedTag::parse(radiata::DefaultLoadBalancer::TAG).unwrap())
   );
-  assert_eq!(policy.routing_policy(), &RoutingPolicy::Direct);
+  assert_eq!(policy.routing_policy(), &RoutingPolicy::DIRECT);
 
   let key = QualifiedTag::parse("example.org/pubs/hint").unwrap();
   let metadata = StreamMetadata::new()
@@ -586,6 +570,10 @@ fn stream_surface_is_externally_constructible() {
   let _exact = StreamTarget::Exact(node.clone());
   let _matching =
     StreamTarget::MatchingNodes(Selector::parse("example.org/labels/lane=one").unwrap());
+  let _path = StreamTarget::Path {
+    destination: node.clone(),
+    path: vec![node.clone()],
+  };
   let selector = Selector::parse("example.org/labels/lane=one").unwrap();
   assert_eq!(selector.as_str(), "example.org/labels/lane=one");
 }
@@ -646,12 +634,6 @@ fn config_and_registry_are_externally_constructible() {
     .register_next_hop(
       QualifiedTag::parse("example.org/policies/next-hop").unwrap(),
       Arc::new(PubNextHop),
-    )
-    .unwrap();
-  registry
-    .register_load_balancer(
-      QualifiedTag::parse("example.org/balancers/first").unwrap(),
-      Arc::new(PubLoadBalancer),
     )
     .unwrap();
   let _config = config;
@@ -946,13 +928,54 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .unwrap();
   assert!(one_resource.is_some());
 
+  // The durable resource feed: a watch resumes after a version, replays
+  // the later entries, and follows a live commit.
+  let mut feed: radiata::ResourceWatch = issuer.handle.watch_resources(Some(0)).await.unwrap();
+  let replayed = tokio::time::timeout(Duration::from_secs(5), feed.next())
+    .await
+    .unwrap()
+    .unwrap();
+  assert!(replayed.version() > 0);
+  let _ = (replayed.name(), replayed.kind());
+  let mut live: radiata::ResourceWatch = issuer.handle.watch_resources(None).await.unwrap();
+  let live_write = ResourceWrite::new(
+    ResourceName::parse("radiata.woooo.tech/resources/pub-api-002").unwrap(),
+    ResourceLabels::new(
+      LabelValue::parse("document").unwrap(),
+      ResourceUri::parse("file:///pub-api-live").unwrap(),
+    ),
+  );
+  issuer
+    .handle
+    .resources()
+    .put(live_write)
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let observed = tokio::time::timeout(Duration::from_secs(5), live.next())
+    .await
+    .unwrap()
+    .unwrap();
+  assert_eq!(
+    observed.name().as_str(),
+    "radiata.woooo.tech/resources/pub-api-002"
+  );
+  match observed.kind() {
+    radiata::ResourceChangeKind::Put(view) => {
+      assert_eq!(view.labels().uri().as_str(), "file:///pub-api-live");
+    }
+    other => panic!("expected a put change, got {other:?}"),
+  }
+
   // Stream with an exact-node target and a delivery ack.
   let packet: OutboundStream = issuer
     .handle
     .open_stream(
       StreamTarget::Exact(member_id.clone()),
       ProtocolTag::parse("example.org/protocols/echo").unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap();
@@ -967,7 +990,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .send(
       StreamTarget::Exact(member_id.clone()),
       ProtocolTag::parse("example.org/protocols/echo").unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       pub_body(b"pub-body"),
     )
     .await
@@ -1047,7 +1070,7 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .open_stream(
       StreamTarget::Exact(member_id.clone()),
       ProtocolTag::parse("example.org/protocols/echo").unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap();
@@ -1205,8 +1228,8 @@ async fn every_typed_facade_signature_drives_a_real_cluster() {
     .wait()
     .await
     .unwrap();
-  assert_eq!(retention.forgotten, 0);
-  assert!(!retention.remaining);
+  assert_eq!(retention.forgotten(), 0);
+  assert!(!retention.remaining());
 
   // The frozen-journal recovery command on a healthy store: the typed
   // rejection is the contract (nothing is frozen), and the acknowledged

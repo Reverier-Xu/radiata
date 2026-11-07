@@ -1,9 +1,10 @@
 //! The task entity: the admitted-operation model behind the declarative
 //! verb surface. A task is the *observation* of one admitted mutating
-//! intent — a printable ordered id, a closed kind set (plus
-//! caller-registered extension kinds), a phase machine with typed error
-//! and output payloads, and the cloneable caller handle [`Task`] over
-//! the shared in-memory task table.
+//! intent — a printable ordered id, a kind tag (a core verb's constant,
+//! or a caller-registered tag under the caller's own domain), a phase
+//! machine with typed error and encoded output payloads, and the
+//! cloneable caller handle [`Task`] over the shared in-memory task
+//! table.
 //!
 //! The table is deliberately in-memory: durable desired state remains
 //! exactly each effect's existing durable footprint (leave intent,
@@ -31,10 +32,118 @@ use crate::{
   },
 };
 
-/// The closed set of core task kinds plus caller-registered extension
-/// kinds (a qualified tag under the caller's own domain).
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum TaskKind {
+/// The canonical-CBOR payloads behind [`TaskOutput`].
+pub(crate) mod output;
+
+/// The tag identifying one admitted task's kind: a canonical qualified
+/// tag. The core verbs are the associated constants under the builtin
+/// domain; a caller-registered kind is any tag under a caller-owned
+/// domain — exactly the registration key of the caller's reconciler.
+/// The tag *is* the identity, so a caller-defined kind needs no crate
+/// change to exist.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TaskKind(QualifiedTag);
+
+impl TaskKind {
+  /// The core verbs, in canonical tag order. Each is the tag the task
+  /// surface reports for that verb and the key of the crate's own
+  /// policy dispatch (the private core-kind table).
+  pub const JOIN: Self = Self(QualifiedTag::from_static("radiata.woooo.tech/tasks/join"));
+  pub const LEAVE: Self = Self(QualifiedTag::from_static("radiata.woooo.tech/tasks/leave"));
+  pub const CONNECT: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/connect",
+  ));
+  pub const DISCONNECT: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/disconnect",
+  ));
+  pub const REVOKE: Self = Self(QualifiedTag::from_static("radiata.woooo.tech/tasks/revoke"));
+  pub const PURGE_REVOCATION: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/purge-revocation",
+  ));
+  pub const CLEANUP: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/cleanup",
+  ));
+  pub const ISSUE_CLEANUP_CHECKPOINT: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/issue-cleanup-checkpoint",
+  ));
+  pub const RESOLVE_FROZEN_JOURNAL: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/resolve-frozen-journal",
+  ));
+  pub const LISTEN: Self = Self(QualifiedTag::from_static("radiata.woooo.tech/tasks/listen"));
+  pub const STOP_LISTENER: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/stop-listener",
+  ));
+  pub const PUT_RESOURCE: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/put-resource",
+  ));
+  pub const DELETE_RESOURCE: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/delete-resource",
+  ));
+  pub const PATCH_NODE_METADATA: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/patch-node-metadata",
+  ));
+  pub const ISSUE_CREDENTIAL: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/issue-credential",
+  ));
+  pub const ROTATE_CREDENTIAL: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/rotate-credential",
+  ));
+  pub const START_RECOVERY: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/start-recovery",
+  ));
+  pub const APPLY_RECEIPT_RETENTION: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/apply-receipt-retention",
+  ));
+  pub const SYNC_ROUND: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/sync-round",
+  ));
+
+  /// Parses one kind tag: any canonical qualified tag. A tag outside the
+  /// core set is a caller-defined kind and must live under a caller-owned
+  /// domain to be registrable (see
+  /// [`ExtensionRegistry::register_task_reconciler`](crate::ExtensionRegistry::register_task_reconciler)).
+  pub fn parse(value: &str) -> Result<Self> {
+    Ok(Self(QualifiedTag::parse(value)?))
+  }
+
+  /// The canonical tag text.
+  pub fn as_str(&self) -> &str {
+    self.0.as_str()
+  }
+
+  /// The kind's qualified tag.
+  pub const fn tag(&self) -> &QualifiedTag {
+    &self.0
+  }
+}
+
+impl From<QualifiedTag> for TaskKind {
+  fn from(tag: QualifiedTag) -> Self {
+    Self(tag)
+  }
+}
+
+impl std::fmt::Display for TaskKind {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str(self.as_str())
+  }
+}
+
+impl std::fmt::Debug for TaskKind {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_tuple("TaskKind")
+      .field(&self.as_str())
+      .finish()
+  }
+}
+
+/// The core verb set as a closed enum: the private dispatch key behind
+/// every policy the crate itself owns (the retry class, the slot class,
+/// the shutdown drain, and the coalescing rules). A tag outside the set
+/// is a caller-defined kind and takes the extension policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreTaskKind {
   Join,
   Leave,
   Connect,
@@ -54,36 +163,82 @@ pub enum TaskKind {
   StartRecovery,
   ApplyReceiptRetention,
   SyncRound,
-  /// A caller-registered kind: the tag is the registration key of the
-  /// caller's registered task reconciler and must live under a
-  /// caller-owned domain, never the builtin one.
-  Extension(QualifiedTag),
 }
 
-impl TaskKind {
-  /// Whether the kind's effect is awaited to its terminal phase during
-  /// node shutdown instead of being cancelled on the manager's cancel
-  /// watch: the journaled/store-atomic kinds whose outcome must settle
-  /// before teardown completes. Every other kind's effect may exit
-  /// mid-flight, leaving the task non-terminal for the process.
-  pub(crate) const fn drains_on_shutdown(&self) -> bool {
+/// Every core verb, in canonical tag order: the single source of the
+/// closed set. [`CoreTaskKind::from_tag`] scans it, so a verb cannot be
+/// added to [`TaskKind`]'s constants and forgotten here.
+const CORE_TASK_KINDS: [CoreTaskKind; 19] = [
+  CoreTaskKind::Join,
+  CoreTaskKind::Leave,
+  CoreTaskKind::Connect,
+  CoreTaskKind::Disconnect,
+  CoreTaskKind::Revoke,
+  CoreTaskKind::PurgeRevocation,
+  CoreTaskKind::Cleanup,
+  CoreTaskKind::IssueCleanupCheckpoint,
+  CoreTaskKind::ResolveFrozenJournal,
+  CoreTaskKind::Listen,
+  CoreTaskKind::StopListener,
+  CoreTaskKind::PutResource,
+  CoreTaskKind::DeleteResource,
+  CoreTaskKind::PatchNodeMetadata,
+  CoreTaskKind::IssueCredential,
+  CoreTaskKind::RotateCredential,
+  CoreTaskKind::StartRecovery,
+  CoreTaskKind::ApplyReceiptRetention,
+  CoreTaskKind::SyncRound,
+];
+
+impl CoreTaskKind {
+  /// The core verb one tag names, or `None` for a caller-defined kind.
+  pub(crate) fn from_tag(kind: &TaskKind) -> Option<Self> {
+    CORE_TASK_KINDS
+      .iter()
+      .copied()
+      .find(|core| core.tag() == *kind)
+  }
+
+  /// The verb's tag.
+  pub(crate) const fn tag(self) -> TaskKind {
+    match self {
+      Self::Join => TaskKind::JOIN,
+      Self::Leave => TaskKind::LEAVE,
+      Self::Connect => TaskKind::CONNECT,
+      Self::Disconnect => TaskKind::DISCONNECT,
+      Self::Revoke => TaskKind::REVOKE,
+      Self::PurgeRevocation => TaskKind::PURGE_REVOCATION,
+      Self::Cleanup => TaskKind::CLEANUP,
+      Self::IssueCleanupCheckpoint => TaskKind::ISSUE_CLEANUP_CHECKPOINT,
+      Self::ResolveFrozenJournal => TaskKind::RESOLVE_FROZEN_JOURNAL,
+      Self::Listen => TaskKind::LISTEN,
+      Self::StopListener => TaskKind::STOP_LISTENER,
+      Self::PutResource => TaskKind::PUT_RESOURCE,
+      Self::DeleteResource => TaskKind::DELETE_RESOURCE,
+      Self::PatchNodeMetadata => TaskKind::PATCH_NODE_METADATA,
+      Self::IssueCredential => TaskKind::ISSUE_CREDENTIAL,
+      Self::RotateCredential => TaskKind::ROTATE_CREDENTIAL,
+      Self::StartRecovery => TaskKind::START_RECOVERY,
+      Self::ApplyReceiptRetention => TaskKind::APPLY_RECEIPT_RETENTION,
+      Self::SyncRound => TaskKind::SYNC_ROUND,
+    }
+  }
+
+  /// Whether the verb's effect is awaited to its terminal phase during
+  /// node shutdown (the journaled/store-atomic kinds whose outcome must
+  /// settle before teardown completes). Declared onto the reconciler
+  /// registration channel by `register_default` (see
+  /// [`core_task_policies`]); never derived at dispatch time.
+  pub(crate) const fn drains_on_shutdown(self) -> bool {
     matches!(self, Self::Leave | Self::ResolveFrozenJournal)
   }
 
-  /// The execution-slot channel the kind's effect draws from: the
-  /// network dials (join/connect), which can hold a slot for a whole
-  /// dial deadline, draw from their own channel so local work
-  /// (resource writes, credentials, maintenance) never queues behind a
-  /// wedged dial, and the caller-registered extension kinds draw from
-  /// their own channel so a workflow awaiting core verbs through its
-  /// handle never occupies the local capacity its own child operations
-  /// need. The two core budgets live in
-  /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots);
-  /// the extension channel's budget is the task manager's own constant.
-  pub(crate) const fn slot_class(&self) -> SlotClass {
+  /// The execution-slot channel the verb draws from. Declared onto the
+  /// reconciler registration channel by `register_default` (see
+  /// [`core_task_policies`]); never derived at dispatch time.
+  pub(crate) const fn slot_class(self) -> SlotClass {
     match self {
       Self::Join | Self::Connect => SlotClass::Network,
-      Self::Extension(_) => SlotClass::Extension,
       _ => SlotClass::Local,
     }
   }
@@ -107,18 +262,65 @@ pub(crate) enum SlotClass {
   /// awaits *other* admitted tasks through its public handle — drawing
   /// from the local channel would let a workflow occupy the very
   /// capacity its child writes need (with one local slot, the first
-  /// such workflow deadlocks on itself). Recursive waiting is bounded
-  /// per class: code running inside one class's effect may await tasks
-  /// of other classes, but awaiting another task of the *same* class
-  /// (an extension reconciler awaiting an extension task) can
-  /// self-deadlock on that class's bounded budget, so reconcile code
-  /// must never do it.
+  /// such workflow deadlocks on itself). Same-class recursive waiting
+  /// is refused, not merely discouraged: a submission made from inside
+  /// an effect of the same class is a typed admission refusal (the
+  /// nested-submit refusal), because awaiting a task of one's own
+  /// bounded channel can self-deadlock on that budget.
   Extension,
+}
+
+/// The execution policy a task kind's registration declares: the slot
+/// class its effect draws from plus whether the shutdown drain awaits
+/// it to terminality. The policy rides the reconciler registration
+/// (the core verbs declare theirs through the same channel in
+/// [`ExtensionRegistry::register_default`](crate::ExtensionRegistry::register_default),
+/// see [`core_task_policies`]); it is never derived from the tag being
+/// a core verb.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaskReconcilePolicy {
+  /// The execution-slot channel the kind's effect draws from (see
+  /// [`SlotClass`]). The core budgets live in
+  /// [`NodeConfig::with_task_reconcile_slots`](crate::NodeConfig::with_task_reconcile_slots);
+  /// the extension channel's budget lives in
+  /// [`NodeConfig::with_task_reconcile_extension_slots`](crate::NodeConfig::with_task_reconcile_extension_slots).
+  pub(crate) slot_class: SlotClass,
+  /// Whether the kind's effect is awaited to its terminal phase during
+  /// node shutdown instead of being cancelled on the manager's cancel
+  /// watch: the journaled/store-atomic kinds whose outcome must settle
+  /// before teardown completes. Every other kind's effect may exit
+  /// mid-flight, leaving the task non-terminal for the process.
+  pub(crate) drains_on_shutdown: bool,
+}
+
+impl TaskReconcilePolicy {
+  /// The extension policy every caller-registered kind declares: its
+  /// own slot channel, cancelled on shutdown.
+  pub(crate) const EXTENSION: Self = Self {
+    slot_class: SlotClass::Extension,
+    drains_on_shutdown: false,
+  };
+}
+
+/// Every core verb's declared execution policy: the single source of
+/// the core kinds' slot class and shutdown drain, installed onto the
+/// reconciler registration channel by `register_default`. A caller
+/// kind never appears here — its registration declares
+/// [`TaskReconcilePolicy::EXTENSION`].
+pub(crate) fn core_task_policies() -> impl Iterator<Item = (TaskKind, TaskReconcilePolicy)> {
+  CORE_TASK_KINDS.iter().copied().map(|core| {
+    let policy = TaskReconcilePolicy {
+      slot_class: core.slot_class(),
+      drains_on_shutdown: core.drains_on_shutdown(),
+    };
+    (core.tag(), policy)
+  })
 }
 
 /// The task phase machine. `Succeeded` and `Failed` are terminal; no
 /// transition ever leaves a terminal state.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum TaskPhase {
   Pending,
   Running,
@@ -143,7 +345,10 @@ pub struct TaskError {
 }
 
 impl TaskError {
-  pub(crate) fn from_error(error: Error) -> Self {
+  /// Projects one error onto the terminal-failure surface: the stable
+  /// kind plus its redacted context. Also the constructor for the
+  /// explicit [`ReconcileDecision::Failed`] decision.
+  pub fn from_error(error: Error) -> Self {
     Self {
       kind: error.kind(),
       context: error.context(),
@@ -189,33 +394,32 @@ impl CredentialIssued {
   }
 }
 
-/// The verb-specific success payload, stored on the task so late
-/// `wait()` callers can read the outcome after the fact from the
-/// bounded terminal history. The two credential variants carry the
+/// One task's terminal success payload: the opaque payload bytes, stored
+/// on the task so late `wait()` callers can read the outcome after the
+/// fact from the bounded terminal history.
+///
+/// A core verb's payload is its result in the crate's canonical CBOR
+/// encoding; a caller-defined kind's payload is exactly the bytes its
+/// reconciler returned. The typed form of a core result is recovered
+/// through [`Task::wait`], which decodes the payload under the kind the
+/// handle was admitted for; the repeatedly readable view exposes the
+/// bytes. The credential kinds' payload carries the
 /// [`CredentialIssued`] observation only — the secret is collected once
 /// through the typed handle (see [`CredentialIssued`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TaskOutput {
-  Join(MergeView),
-  Leave(LeaveOutcome),
-  Connect(NodeId),
-  Disconnect(()),
-  Revoke(RevokeOutcome),
-  PurgeRevocation(()),
-  Cleanup(()),
-  IssueCleanupCheckpoint(u64),
-  ResolveFrozenJournal(()),
-  Listen(ListenerView),
-  StopListener(()),
-  PutResource(ResourceMutationView),
-  DeleteResource(ResourceMutationView),
-  PatchNodeMetadata(MemberView),
-  IssueCredential(CredentialIssued),
-  RotateCredential(CredentialIssued),
-  StartRecovery(RecoveryView),
-  ApplyReceiptRetention(ReceiptRetentionReport),
-  SyncRound(()),
-  Extension(()),
+pub struct TaskOutput {
+  bytes: Arc<[u8]>,
+}
+
+impl TaskOutput {
+  /// The opaque payload bytes.
+  pub fn bytes(&self) -> &[u8] {
+    &self.bytes
+  }
+
+  pub(crate) fn new(bytes: Arc<[u8]>) -> Self {
+    Self { bytes }
+  }
 }
 
 /// The cheap status snapshot: the live phase, the attempt count, and
@@ -283,12 +487,14 @@ impl TaskStatusRecord {
   }
 }
 
-/// One task-table entry: the kind, the per-task status watch, and the
-/// terminal payloads. `secret` holds an issued credential exactly until
-/// the first typed `wait()` collects it; eviction and shutdown drop the
-/// entry, and the secret's own zeroizing drop does the rest.
+/// One task-table entry: the kind, the admission-resolved execution
+/// policy, the per-task status watch, and the terminal payloads.
+/// `secret` holds an issued credential exactly until the first typed
+/// `wait()` collects it; eviction and shutdown drop the entry, and the
+/// secret's own zeroizing drop does the rest.
 pub(crate) struct TaskEntry {
   pub(crate) kind: TaskKind,
+  pub(crate) policy: TaskReconcilePolicy,
   pub(crate) status: watch::Sender<TaskStatusRecord>,
   pub(crate) output: Option<TaskOutput>,
   pub(crate) secret: Option<IssuedMergeCredential>,
@@ -324,10 +530,15 @@ impl TaskTable {
     self.entries.lock().map_err(Error::task_table)
   }
 
-  /// Inserts one admitted task's `Pending` entry. `false` when the id
-  /// already exists (an admission invariant violation, never a caller
-  /// path).
-  pub(crate) fn insert_pending(&self, id: &TaskId, kind: TaskKind, created: SystemTime) -> bool {
+  /// Inserts one admitted task's `Pending` entry, carrying the
+  /// execution policy admission resolved from the kind's registration
+  /// (the single resolution point: every later consumer — the slot
+  /// channel, the shutdown drain, the wait arbitration — reads the
+  /// entry, never the registry). `false` when the id already exists (an
+  /// admission invariant violation, never a caller path).
+  pub(crate) fn insert_pending(
+    &self, id: &TaskId, kind: TaskKind, policy: TaskReconcilePolicy, created: SystemTime,
+  ) -> bool {
     let Ok(mut entries) = self.lock() else {
       return false;
     };
@@ -339,12 +550,23 @@ impl TaskTable {
       id.clone(),
       TaskEntry {
         kind,
+        policy,
         status,
         output: None,
         secret: None,
       },
     );
     true
+  }
+
+  /// Whether the id's effect is awaited to its terminal phase by the
+  /// shutdown drain, read off the admission-resolved registration
+  /// policy. `None` for an unknown or evicted id.
+  pub(crate) fn drains_on_shutdown(&self, id: &TaskId) -> Option<bool> {
+    self
+      .lock()
+      .ok()
+      .and_then(|entries| entries.get(id).map(|entry| entry.policy.drains_on_shutdown))
   }
 
   /// The per-task status watch, when the id is live or inside the
@@ -462,7 +684,7 @@ impl TaskTable {
       entries
         .values()
         .filter(|entry| {
-          entry.kind.slot_class() == class && !entry.status.borrow().phase.is_terminal()
+          entry.policy.slot_class == class && !entry.status.borrow().phase.is_terminal()
         })
         .count()
     })
@@ -489,13 +711,15 @@ impl TaskObserver {
   /// missed-transition race), and with the typed shutdown failure
   /// once the manager's terminal publication can no longer arrive
   /// (the status watch closed, or the stop signal reached a kind the
-  /// shutdown drain does not await). A kind the drain awaits to
+  /// shutdown drain does not await — read off the admission-resolved
+  /// registration policy). A kind the drain awaits to
   /// terminality (the journaled leave and frozen-journal resolution)
   /// still resolves with its real outcome: the manager publishes it
   /// before the drain completes.
-  pub(crate) async fn await_terminal(
-    &self, id: &TaskId, kind: &TaskKind,
-  ) -> Result<TaskStatusRecord> {
+  pub(crate) async fn await_terminal(&self, id: &TaskId) -> Result<TaskStatusRecord> {
+    // The drain decision first: an unknown id falls through to the
+    // watch lookup's typed not-found below.
+    let drains = self.table.drains_on_shutdown(id);
     let Some(mut status) = self.table.watch(id) else {
       return Err(Error::not_found("task"));
     };
@@ -509,7 +733,7 @@ impl TaskObserver {
       // once the stop signal reaches a kind the drain does not await.
       let stopped = tokio::select! {
         changed = status.changed() => changed.is_err(),
-        changed = stop.changed() => changed.is_err() || !kind.drains_on_shutdown(),
+        changed = stop.changed() => changed.is_err() || !drains.unwrap_or(false),
       };
       if stopped {
         // The terminal publication can land in the same wake as the
@@ -526,133 +750,91 @@ impl TaskObserver {
 }
 
 /// The sealed bound behind every typed task handle: it maps a stored
-/// [`TaskOutput`] variant to the verb's historical return type, once
-/// per verb output, and only this crate can implement it.
+/// [`TaskOutput`] payload to the verb's historical return type, once per
+/// verb output, and only this crate can implement it.
 mod private {
   pub(crate) trait Sealed {}
 }
 
 pub(crate) trait TaskResult: private::Sealed + Sized + Send + 'static {
-  /// Builds the verb's success value from the stored output. The
-  /// `secret` slot is the consumed-once credential payload: the first
-  /// collector receives `Some`, every later caller `None` (a typed
-  /// invalid-input error for credential kinds, ignored by the rest).
-  fn from_output(output: TaskOutput, secret: Option<IssuedMergeCredential>) -> Result<Self>;
+  /// Builds the verb's success value from the stored output, decoded
+  /// under the kind the handle was admitted for (a kind outside that
+  /// verb's set is the typed internal mismatch). The `secret` slot is
+  /// the consumed-once credential payload: the first collector receives
+  /// `Some`, every later caller `None` (a typed invalid-input error for
+  /// the credential kinds, ignored by the rest).
+  fn from_output(
+    kind: &TaskKind, output: TaskOutput, secret: Option<IssuedMergeCredential>,
+  ) -> Result<Self>;
 }
 
-/// The mismatch error for every wrong-variant mapping: the handle's
-/// type and the task's kind drifted, which only a crate bug can cause.
+/// The mismatch error for every wrong-kind mapping: the handle's type
+/// and the task's kind drifted, which only a crate bug can cause.
 const OUTPUT_MISMATCH: &str = "task output";
 
-impl TaskResult for MergeView {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::Join(view) => Ok(view),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
+/// One impl row per verb return type: the kinds whose payload the type
+/// decodes (matched against the handle's admitted kind) plus the payload
+/// decoder. The unit result and the credential kinds' consumed-once
+/// secret slot have their own impls below.
+macro_rules! task_result {
+  ($($ty:ty => [$($kind:ident)|+] via $decode:path),+ $(,)?) => { $(
+    impl TaskResult for $ty {
+      fn from_output(
+        kind: &TaskKind, output: TaskOutput, _secret: Option<IssuedMergeCredential>,
+      ) -> Result<Self> {
+        match CoreTaskKind::from_tag(kind) {
+          $(Some(CoreTaskKind::$kind) => $decode(output.bytes()),)+
+          _ => Err(Error::internal(OUTPUT_MISMATCH)),
+        }
+      }
     }
-  }
+    impl private::Sealed for $ty {}
+  )+ };
 }
 
-impl TaskResult for LeaveOutcome {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::Leave(outcome) => Ok(outcome),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for NodeId {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::Connect(peer) => Ok(peer),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
+task_result!(
+  MergeView => [Join] via output::decode_join,
+  LeaveOutcome => [Leave] via output::decode_leave,
+  NodeId => [Connect] via output::decode_connect,
+  RevokeOutcome => [Revoke] via output::decode_revoke,
+  i64 => [IssueCleanupCheckpoint] via output::decode_checkpoint,
+  ListenerView => [Listen] via output::decode_listen,
+  ResourceMutationView => [PutResource | DeleteResource] via output::decode_resource_mutation,
+  MemberView => [PatchNodeMetadata] via output::decode_member,
+  RecoveryView => [StartRecovery] via output::decode_recovery,
+  ReceiptRetentionReport => [ApplyReceiptRetention] via output::decode_receipt_retention,
+);
 
 impl TaskResult for () {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::Disconnect(())
-      | TaskOutput::PurgeRevocation(())
-      | TaskOutput::Cleanup(())
-      | TaskOutput::ResolveFrozenJournal(())
-      | TaskOutput::StopListener(())
-      | TaskOutput::SyncRound(())
-      | TaskOutput::Extension(()) => Ok(()),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for RevokeOutcome {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::Revoke(outcome) => Ok(outcome),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for u64 {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::IssueCleanupCheckpoint(watermark) => Ok(watermark),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for ListenerView {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::Listen(view) => Ok(view),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for ResourceMutationView {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::PutResource(view) | TaskOutput::DeleteResource(view) => Ok(view),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for MemberView {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::PatchNodeMetadata(view) => Ok(view),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for RecoveryView {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::StartRecovery(view) => Ok(view),
-      _ => Err(Error::internal(OUTPUT_MISMATCH)),
-    }
-  }
-}
-
-impl TaskResult for ReceiptRetentionReport {
-  fn from_output(output: TaskOutput, _secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::ApplyReceiptRetention(report) => Ok(report),
+  fn from_output(
+    kind: &TaskKind, output: TaskOutput, _secret: Option<IssuedMergeCredential>,
+  ) -> Result<Self> {
+    match CoreTaskKind::from_tag(kind) {
+      Some(
+        CoreTaskKind::Disconnect
+        | CoreTaskKind::PurgeRevocation
+        | CoreTaskKind::Cleanup
+        | CoreTaskKind::ResolveFrozenJournal
+        | CoreTaskKind::StopListener
+        | CoreTaskKind::SyncRound,
+      ) => output::decode_unit(output.bytes()),
+      // A caller-defined kind's payload is the reconciler's own bytes:
+      // the crate decodes nothing out of it.
+      None => Ok(()),
       _ => Err(Error::internal(OUTPUT_MISMATCH)),
     }
   }
 }
 
 impl TaskResult for IssuedMergeCredential {
-  fn from_output(output: TaskOutput, secret: Option<IssuedMergeCredential>) -> Result<Self> {
-    match output {
-      TaskOutput::IssueCredential(_) | TaskOutput::RotateCredential(_) => {
+  fn from_output(
+    kind: &TaskKind, output: TaskOutput, secret: Option<IssuedMergeCredential>,
+  ) -> Result<Self> {
+    match CoreTaskKind::from_tag(kind) {
+      Some(CoreTaskKind::IssueCredential | CoreTaskKind::RotateCredential) => {
+        // The payload is the non-secret expiry observation; decoding it
+        // pins that the stored bytes are the shape this kind owns.
+        output::decode_credential(output.bytes())?;
         secret.ok_or_else(|| Error::invalid_input("task output already collected"))
       }
       _ => Err(Error::internal(OUTPUT_MISMATCH)),
@@ -660,17 +842,7 @@ impl TaskResult for IssuedMergeCredential {
   }
 }
 
-impl private::Sealed for MergeView {}
-impl private::Sealed for LeaveOutcome {}
-impl private::Sealed for NodeId {}
 impl private::Sealed for () {}
-impl private::Sealed for RevokeOutcome {}
-impl private::Sealed for u64 {}
-impl private::Sealed for ListenerView {}
-impl private::Sealed for ResourceMutationView {}
-impl private::Sealed for MemberView {}
-impl private::Sealed for RecoveryView {}
-impl private::Sealed for ReceiptRetentionReport {}
 impl private::Sealed for IssuedMergeCredential {}
 
 /// One admitted operation: the caller's proof of acceptance and its
@@ -712,15 +884,20 @@ impl<T: TaskResult> Task<T> {
   }
 
   /// The current status snapshot, read locally from the shared table
-  /// without a runtime round trip. An id outside the live table and the
-  /// bounded terminal history (evicted long after terminalizing) reads
-  /// as a fresh admission snapshot; the typed wait surfaces eviction as
-  /// a typed not-found instead.
-  pub fn status(&self) -> TaskStatus {
-    self.observer.table.status(&self.id).map_or_else(
-      || TaskStatus::new(TaskPhase::Pending, 0, None),
-      |(_, status)| status,
-    )
+  /// without a runtime round trip.
+  ///
+  /// `None` means the id left the live table and the bounded terminal
+  /// history: the task was evicted long after it terminalized, so the
+  /// runtime no longer observes it. An evicted task has no status at all —
+  /// it is never reported as a fresh `Pending` admission — and the typed
+  /// surfaces ([`crate::Tasks::get`], [`crate::Tasks::wait`]) report the
+  /// same absence as `None` and a typed not-found error.
+  pub fn status(&self) -> Option<TaskStatus> {
+    self
+      .observer
+      .table
+      .status(&self.id)
+      .map(|(_, status)| status)
   }
 
   /// Resolves when the task reaches a terminal phase: `Ok(T)` on
@@ -731,16 +908,17 @@ impl<T: TaskResult> Task<T> {
   /// its real outcome: the manager publishes it before the drain
   /// completes.
   pub async fn wait(self) -> Result<T> {
-    let record = self.observer.await_terminal(&self.id, &self.kind).await?;
-    resolve_terminal::<T>(record, &self.id, &self.observer.table)
+    let record = self.observer.await_terminal(&self.id).await?;
+    resolve_terminal::<T>(record, &self.id, &self.kind, &self.observer.table)
   }
 }
 
 /// Maps one terminal status record to its result: the success path
 /// takes (consumes) the secret slot and maps the stored output through
-/// [`TaskResult`]; the failure path rebuilds the typed error.
+/// [`TaskResult`] under the handle's expected kind; the failure path
+/// rebuilds the typed error.
 fn resolve_terminal<T: TaskResult>(
-  record: TaskStatusRecord, id: &TaskId, table: &TaskTable,
+  record: TaskStatusRecord, id: &TaskId, kind: &TaskKind, table: &TaskTable,
 ) -> Result<T> {
   match record.phase {
     TaskPhase::Succeeded => {
@@ -748,7 +926,10 @@ fn resolve_terminal<T: TaskResult>(
       match collected {
         // A `Succeeded` entry always carries its output; the missing
         // shapes are internal invariant violations, never caller data.
-        Ok(Some((Some(output), secret))) => T::from_output(output, secret),
+        // The payload decodes under the kind this handle was admitted
+        // for: a drift between the two decodes as the typed internal
+        // mismatch, never caller data.
+        Ok(Some((Some(output), secret))) => T::from_output(kind, output, secret),
         Ok(Some((None, _))) => Err(Error::internal(OUTPUT_MISMATCH)),
         Ok(None) => Err(Error::not_found("task")),
         Err(error) => Err(error),
@@ -770,9 +951,10 @@ fn resolve_terminal<T: TaskResult>(
 /// Hooks registered through
 /// [`ExtensionRegistry::register_resource_hook`](crate::ExtensionRegistry::register_resource_hook)
 /// run in canonical tag order. `validate` and `mutate` run on the
-/// caller's admission path, before any IO; `observed` runs on the
-/// node's bounded observation lanes after this node's own commit
-/// lands, off the write task's execution slot.
+/// caller's admission path, before any IO; they must not block, because
+/// a slow or waiting hook stalls the caller's `put().await`. `observed`
+/// runs on the node's bounded observation lanes after this node's own
+/// commit lands, off the write task's execution slot.
 pub trait ResourceHook: std::fmt::Debug + Send + Sync + 'static {
   /// Rejects a write at admission, before any IO runs. The first
   /// rejection in tag order wins and the verb fails typed with it.
@@ -1107,30 +1289,59 @@ pub(crate) async fn notify_resource_observers(
 }
 
 /// The caller-supplied effect behind one custom task kind: the
-/// reconcile half of [`TaskKind::Extension`]. Registered through
+/// reconcile half of a caller-registered [`TaskKind`] tag. Registered
+/// through
 /// [`ExtensionRegistry::register_task_reconciler`](crate::ExtensionRegistry::register_task_reconciler)
 /// under a caller-owned tag and dispatched by the `tasks().submit`
 /// admission.
 ///
 /// A reconciler runs on the extension slot channel: it may freely await
 /// core verbs (the local and network classes) through its handle, but
-/// must never await another extension-kind task — the extension
-/// channel's bounded budget is not reentrant, and same-class recursive
-/// waiting can self-deadlock (see `SlotClass`).
+/// never another extension-kind task — the extension channel's bounded
+/// budget is not reentrant, and same-class recursive waiting can
+/// self-deadlock. The refusal is enforced, not documented: a submission
+/// made from inside an effect of the same slot class fails admission
+/// with a typed conflict error instead of deadlocking (see `SlotClass`).
+///
+/// One reconciler registration record: the reconciler itself (the core
+/// verbs declare policy-only records — their effects are the runtime's
+/// own closures, never registered reconcilers) plus the execution
+/// policy the registration declares.
+pub(crate) struct TaskReconcilerRegistration {
+  pub(crate) reconciler: Option<Arc<dyn TaskReconciler>>,
+  pub(crate) policy: TaskReconcilePolicy,
+}
+
 pub trait TaskReconciler: std::fmt::Debug + Send + Sync + 'static {
   /// Produces the effect for one attempt. `Ok(Succeeded)` completes the
-  /// task, `Ok(Retry)` re-arms the retry schedule without progress, and
-  /// `Err` retries (bounded) before failing the task with that error.
+  /// task with an empty output payload, `Ok(SucceededWithOutput)`
+  /// completes it with the caller's opaque bytes, `Ok(Retry)` re-arms
+  /// the bounded retry schedule without progress, and `Ok(Failed)` or
+  /// `Err` terminalizes the task as failed with that error — the crate
+  /// never re-runs a failed attempt on its own; retrying a failed
+  /// effect is the caller's logic to re-submit.
   fn reconcile<'a>(&'a self, ctx: ReconcileContext) -> BoxFuture<'a, Result<ReconcileDecision>>;
 }
 
 /// What one reconcile attempt decided.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ReconcileDecision {
-  /// The effect completed: the task terminalizes `Succeeded`.
+  /// The effect completed: the task terminalizes `Succeeded` with an
+  /// empty output payload.
   Succeeded,
-  /// The effect made no progress: re-arm the retry schedule.
+  /// The effect completed with the caller's opaque output payload: the
+  /// bytes become the task's [`TaskOutput`] payload verbatim, observable
+  /// through [`TaskView::output`](crate::TaskView::output).
+  SucceededWithOutput(Vec<u8>),
+  /// The effect made no progress: re-arm the bounded retry schedule.
+  /// The only decision that retries an attempt — an error or a `Failed`
+  /// decision terminalizes the task.
   Retry,
+  /// The effect decided to fail: the task terminalizes `Failed` with
+  /// the carried error, exactly like a returned `Err`, but as an
+  /// explicit terminal decision rather than an exceptional one.
+  Failed(TaskError),
 }
 
 /// The owned context of one reconcile attempt.
@@ -1141,10 +1352,43 @@ pub enum ReconcileDecision {
 /// sessions, no supervisor internals).
 #[derive(Clone)]
 pub struct ReconcileContext {
-  pub handle: crate::NodeHandle,
-  pub spec: CustomTaskSpec,
-  pub attempt: u32,
-  pub last_error: Option<TaskError>,
+  handle: crate::NodeHandle,
+  spec: CustomTaskSpec,
+  attempt: u32,
+  last_error: Option<TaskError>,
+}
+
+impl ReconcileContext {
+  /// The ordinary public node surface this attempt reconciles through.
+  pub const fn handle(&self) -> &crate::NodeHandle {
+    &self.handle
+  }
+
+  /// The caller's submission this attempt belongs to.
+  pub const fn spec(&self) -> &CustomTaskSpec {
+    &self.spec
+  }
+
+  /// The 1-based reconcile attempt number of this context.
+  pub const fn attempt(&self) -> u32 {
+    self.attempt
+  }
+
+  /// The typed error of the previous attempt, once one failed.
+  pub const fn last_error(&self) -> Option<TaskError> {
+    self.last_error
+  }
+
+  pub(crate) const fn new(
+    handle: crate::NodeHandle, spec: CustomTaskSpec, attempt: u32, last_error: Option<TaskError>,
+  ) -> Self {
+    Self {
+      handle,
+      spec,
+      attempt,
+      last_error,
+    }
+  }
 }
 
 impl std::fmt::Debug for ReconcileContext {
@@ -1193,10 +1437,60 @@ mod tests {
   };
 
   use super::{
-    ObservationLanes, ResourceHook, TASK_OBSERVATION_INBOX, TaskKind, TaskTable, lane_of,
+    CORE_TASK_KINDS, CoreTaskKind, ObservationLanes, ResourceHook, SlotClass,
+    TASK_OBSERVATION_INBOX, TaskKind, TaskReconcilePolicy, TaskTable, core_task_policies, lane_of,
     notify_resource_observers,
   };
   use crate::{ErrorKind, NodeId, Result, TaskId};
+
+  /// The core kind set is one table: every constant parses to itself
+  /// (the const constructor computes the same offsets the parser does),
+  /// maps back onto its `CoreTaskKind`, and its declared policy — the
+  /// one `core_task_policies` installs onto the registration channel —
+  /// agrees with the verb's class and drain.
+  #[test]
+  fn every_core_kind_constant_parses_maps_and_declares_its_policy() {
+    let declared: Vec<(TaskKind, TaskReconcilePolicy)> = core_task_policies().collect();
+    assert_eq!(declared.len(), CORE_TASK_KINDS.len());
+    for core in CORE_TASK_KINDS {
+      let tag = core.tag();
+      assert_eq!(
+        TaskKind::parse(tag.as_str()).expect("parse"),
+        tag,
+        "the fixed tag text drifted from the parser's canonical form"
+      );
+      assert_eq!(CoreTaskKind::from_tag(&tag), Some(core));
+      let (_, policy) = declared
+        .iter()
+        .find(|(kind, _)| kind == &tag)
+        .expect("every core verb declares a policy");
+      assert_eq!(
+        policy.slot_class,
+        match core {
+          CoreTaskKind::Join | CoreTaskKind::Connect => SlotClass::Network,
+          _ => SlotClass::Local,
+        }
+      );
+      assert_eq!(
+        policy.drains_on_shutdown,
+        matches!(
+          core,
+          CoreTaskKind::Leave | CoreTaskKind::ResolveFrozenJournal
+        )
+      );
+    }
+  }
+
+  /// A caller-defined kind is just a tag outside the core set: it never
+  /// collides with a core verb, and the extension policy its registration
+  /// declares is not derived from any core table entry.
+  #[test]
+  fn a_caller_tag_takes_the_extension_policy() {
+    let caller = TaskKind::parse("example.com/tasks/v1/probe").expect("tag");
+    assert_eq!(CoreTaskKind::from_tag(&caller), None);
+    assert!(!core_task_policies().any(|(kind, _)| kind == caller));
+    assert!(CORE_TASK_KINDS.iter().all(|core| core.tag() != caller));
+  }
 
   struct Harness {
     table: TaskTable,
@@ -1214,7 +1508,12 @@ mod tests {
     fn admit(&mut self, kind: TaskKind) -> TaskId {
       let id = TaskId::compose(0, self.next).expect("composition");
       self.next += 1;
-      assert!(self.table.insert_pending(&id, kind, SystemTime::UNIX_EPOCH));
+      assert!(self.table.insert_pending(
+        &id,
+        kind,
+        super::TaskReconcilePolicy::EXTENSION,
+        SystemTime::UNIX_EPOCH
+      ));
       id
     }
   }
@@ -1224,9 +1523,9 @@ mod tests {
     NodeId::parse(&text).expect("node id")
   }
 
-  /// The P2-1 regression at the facility level: a wedged observation
-  /// parks its lane's runner, the lane's inbox bounds how much further
-  /// work may queue behind it, the next observation is dropped with the
+  /// The observation-lane regression at the facility level: a wedged
+  /// observation parks its lane's runner, the lane's inbox bounds how much
+  /// further work may queue behind it, the next observation is dropped with the
   /// overload diagnostic, and dropping the lanes aborts the parked
   /// runner — wedged observer code is cancelled at shutdown instead of
   /// surviving as detached work.
@@ -1331,7 +1630,7 @@ mod tests {
     assert!(!overflow_ran.load(Ordering::SeqCst));
   }
 
-  /// The P2-1 resource-observer half: awaiting
+  /// The resource-observer half: awaiting
   /// [`notify_resource_observers`] only schedules onto the lanes — the
   /// write task never waits on observer code — and one resource's
   /// observations keep their commit order on the resource's pinned
@@ -1415,7 +1714,7 @@ mod tests {
   #[test]
   fn page_views_reports_a_poisoned_table_instead_of_an_empty_page() {
     let mut harness = Harness::new();
-    harness.admit(TaskKind::SyncRound);
+    harness.admit(TaskKind::SYNC_ROUND);
     let poisoner = harness.table.clone();
     // Panicking while holding the guard poisons the shared table.
     let _ = std::thread::spawn(move || {

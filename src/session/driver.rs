@@ -25,7 +25,7 @@
 
 use std::{
   sync::{Arc, Mutex},
-  time::{Duration, SystemTime},
+  time::Duration,
 };
 
 use tokio::time::timeout;
@@ -119,7 +119,7 @@ pub(crate) struct SessionDriver {
   /// features) that built this driver's offer. Every handshake role
   /// selects against it, so a caller-registered feature survives into
   /// the session's feature intersection instead of being dropped by a
-  /// builtin-only rebuild (audit 2026-10-09 item 15).
+  /// builtin-only rebuild.
   features: Arc<FeatureRegistry>,
   authentication_deadline: Duration,
   limiter: crate::identity::merge_rate::MergeLimiter,
@@ -275,7 +275,7 @@ impl SessionDriver {
       HandshakeMode::Merge => {
         let active = {
           let issuer = self.issuer.lock().map_err(Error::join_credential_issuer)?;
-          let now = SystemTime::now();
+          let now = crate::time::now();
           let active_generation = issuer
             .generation_id()
             .ok_or_else(|| Error::authentication_failed("join credential"))?;
@@ -679,10 +679,15 @@ mod deadline_tests {
       .unwrap()
     });
     let (tcp, _) = listener.accept().await.unwrap();
-    let mut connection =
-      Connection::accept_tls_ws(tcp, server, connection_frame_rules().unwrap(), None)
-        .await
-        .unwrap();
+    let mut connection = Connection::accept_tls_ws(
+      tcp,
+      server,
+      connection_frame_rules().unwrap(),
+      crate::transport::TransportAdmission::PeerAddressed,
+      None,
+    )
+    .await
+    .unwrap();
 
     let error = driver.respond(&mut connection).await.unwrap_err();
     assert_eq!(

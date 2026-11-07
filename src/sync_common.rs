@@ -222,6 +222,7 @@ fn outbound_request(
   let request = crate::packet::OutboundRequest {
     trace_id,
     target: crate::StreamTarget::Exact(peer.clone()),
+    routing_policy: crate::RoutingPolicy::DIRECT,
     load_balancer: None,
     max_hops: 1,
     protocol: protocol.clone(),
@@ -260,13 +261,14 @@ pub(crate) fn send_pumped_payload(
   let (request, ack_rx) = outbound_request(peer, protocol, trace_id, body);
   // The pump runs as its own task: the acknowledgement channel resolves
   // at admission and the task itself completes after the record body
-  // flushed to the session.
+  // flushed to the session. Control traffic is a single direct hop, so it
+  // carries no route envelope and teaches the topology graph nothing.
   let pump = tokio::spawn(crate::routing::outbound::run_outbound(
-    context.entry,
+    crate::session::DeliveryLeg::Session(context.entry),
     context.local.clone(),
     request,
     context.routes.clone(),
-    false,
+    None,
     None,
     context.events.clone(),
   ));

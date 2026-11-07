@@ -51,7 +51,7 @@ use tokio_tungstenite::{
   tungstenite::{Bytes as WsBytes, Message as WsMessage},
 };
 
-use super::{framing, framing::MergeHint, ws};
+use super::{framing, framing::MergeHint, registry::TransportAdmission, ws};
 /// The local policy applied to every sent and received wire message
 /// (defined in the protocol domain; re-exported for connection callers).
 pub(crate) use crate::protocol::wire::FrameRules;
@@ -125,15 +125,15 @@ pub(crate) struct Connection {
   /// connections carry none.
   peer_addr: Option<SocketAddr>,
   /// Whether the medium attributes its accepted connections to peers at
-  /// all. TCP classes always do (a kernel failure to report the address
-  /// is a transport fault, not a property of the medium); custom
-  /// media never do, by contract. Admission semantics consume this
-  /// distinction: a missing address on an attributing medium fails
-  /// closed, while an addressless medium attributes to its shared class
-  /// bucket.
+  /// all. The transport declares this through
+  /// [`TransportAdmission`](crate::transport::TransportAdmission): a
+  /// peer-addressed medium (every official transport, and any provider
+  /// that declares the same state) always does — a kernel or medium
+  /// failure to report the address is a transport fault, not a property
+  /// of the medium — while an addressless medium attributes to its
+  /// shared class bucket. Admission semantics consume this distinction:
+  /// a missing address on an attributing medium fails closed.
   attributable: bool,
-  /// UNIX-seconds of the last peer pong (keepalive liveness).
-  pong_last_seen: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Connection {
@@ -143,24 +143,22 @@ impl Connection {
   /// admit joiners, `hint` publishes the non-secret credential
   /// generation ID as an upgrade response header inside the TLS channel.
   pub(crate) async fn accept_tls_ws(
-    tcp: TcpStream, config: Arc<ServerConfig>, rules: FrameRules, hint: Option<&MergeHint>,
+    tcp: TcpStream, config: Arc<ServerConfig>, rules: FrameRules, admission: TransportAdmission,
+    hint: Option<&MergeHint>,
   ) -> Result<Self> {
-    let peer_addr = tcp.peer_addr().ok();
-    tracing::debug!("tls connection accepted");
-    let tls = TlsAcceptor::from(config)
-      .accept(tcp)
-      .await
-      .map_err(|_| Error::authentication_failed("tls accept"))?;
-    let channel_binding = exporter_channel_binding(tls.get_ref().1)?;
-    let stream = ws::accept(TlsStream::from(tls), hint).await?;
+    let (tls, peer_addr, channel_binding) = accept_tls_raw(tcp, config).await?;
+    let stream = ws::accept(tls, hint).await?;
+    let peer_addr = match admission {
+      TransportAdmission::PeerAddressed => peer_addr,
+      TransportAdmission::Addressless => None,
+    };
     Ok(Self {
       io: TransportIo::Ws(Box::new(stream)),
       rules,
       channel_binding,
       merge_hint: None,
       peer_addr,
-      attributable: true,
-      pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+      attributable: admission == TransportAdmission::PeerAddressed,
     })
   }
 
@@ -176,7 +174,6 @@ impl Connection {
   pub(crate) async fn connect_tls_ws(
     tcp: TcpStream, config: Arc<ClientConfig>, server_name: ServerName<'static>, rules: FrameRules,
   ) -> Result<Self> {
-    tracing::debug!("tls connection established");
     let port = tcp
       .peer_addr()
       .map_err(|_| {
@@ -187,12 +184,8 @@ impl Connection {
       })?
       .port();
     let authority = upgrade_authority(&server_name, port);
-    let tls = TlsConnector::from(config)
-      .connect(server_name, tcp)
-      .await
-      .map_err(|_| Error::authentication_failed("tls connect"))?;
-    let channel_binding = exporter_channel_binding(tls.get_ref().1)?;
-    let (stream, merge_hint) = ws::connect(TlsStream::from(tls), &authority).await?;
+    let (tls, channel_binding) = connect_tls_raw(tcp, config, server_name).await?;
+    let (stream, merge_hint) = ws::connect(tls, &authority).await?;
     Ok(Self {
       io: TransportIo::Ws(Box::new(stream)),
       rules,
@@ -200,7 +193,6 @@ impl Connection {
       merge_hint,
       peer_addr: None,
       attributable: true,
-      pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
   }
 
@@ -211,20 +203,27 @@ impl Connection {
   pub(crate) async fn accept_raw(
     read: Box<dyn AsyncRead + Unpin + Send>, write: SharedWrite,
     channel_binding: [u8; CHANNEL_BINDING_LEN], rules: FrameRules, peer_addr: Option<SocketAddr>,
-    attributable: bool, hint: Option<&MergeHint>,
+    admission: TransportAdmission, hint: Option<&MergeHint>,
   ) -> Result<Self> {
     {
       let mut write = write.lock().await;
       framing::write_hint(&mut *write, hint).await?;
     }
+    // The declared admission state is authoritative: an addressless
+    // medium never charges a peer bucket, even if it reported an address,
+    // and a peer-addressed medium reports exactly the address the
+    // admission plane must charge.
+    let peer_addr = match admission {
+      TransportAdmission::PeerAddressed => peer_addr,
+      TransportAdmission::Addressless => None,
+    };
     Ok(Self {
       io: TransportIo::Raw { read, write },
       rules,
       channel_binding,
       merge_hint: None,
       peer_addr,
-      attributable,
-      pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+      attributable: admission == TransportAdmission::PeerAddressed,
     })
   }
 
@@ -249,7 +248,6 @@ impl Connection {
       merge_hint,
       peer_addr: None,
       attributable: true,
-      pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
   }
 
@@ -302,10 +300,8 @@ impl Connection {
   /// One receive wake of the unsplit connection, class-dispatched.
   async fn receive_once(&mut self) -> Result<Option<Received>> {
     match &mut self.io {
-      TransportIo::Ws(stream) => next_message(stream, self.rules, &self.pong_last_seen).await,
-      TransportIo::Raw { read, write } => {
-        next_raw_frame(&mut *read, write, self.rules, &self.pong_last_seen).await
-      }
+      TransportIo::Ws(stream) => next_message(stream, self.rules).await,
+      TransportIo::Raw { read, write } => next_raw_frame(&mut *read, write, self.rules).await,
     }
   }
 
@@ -343,11 +339,8 @@ impl Connection {
   }
 
   /// Splits the connection into independent writer and reader halves for
-  /// the post-authentication session phase. Only the reader carries the
-  /// pong clock: pongs arrive on the read half, and a writer-side
-  /// timestamp no one reads is dead weight.
+  /// the post-authentication session phase.
   pub(crate) fn into_split(self) -> (ConnectionWriter, ConnectionReader) {
-    let pong_last_seen = self.pong_last_seen;
     match self.io {
       TransportIo::Ws(stream) => {
         let (sink, stream) = stream.split();
@@ -359,7 +352,6 @@ impl Connection {
           ConnectionReader {
             source: ReaderSource::Ws(stream),
             rules: self.rules,
-            pong_last_seen,
           },
         )
       }
@@ -373,7 +365,6 @@ impl Connection {
           ConnectionReader {
             source: ReaderSource::Raw { read, pong_write },
             rules: self.rules,
-            pong_last_seen,
           },
         )
       }
@@ -438,7 +429,6 @@ impl ConnectionWriter {
 pub(crate) struct ConnectionReader {
   source: ReaderSource,
   rules: FrameRules,
-  pong_last_seen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 enum ReaderSource {
@@ -450,32 +440,24 @@ enum ReaderSource {
 }
 
 impl ConnectionReader {
-  /// UNIX-seconds of the last peer pong (host clock), used by the session
-  /// reader to reflect keepalive responses into its injected clock.
-  pub(crate) fn pong_last_seen(&self) -> u64 {
-    self
-      .pong_last_seen
-      .load(std::sync::atomic::Ordering::Relaxed)
-  }
-
   /// Receives the next wire message or keepalive pong. Returns `Ok(None)`
   /// on an orderly close; every limit or framing violation fails closed.
   /// The session read loop consumes this event form: a pong wake must
-  /// reach the loop so it can refresh the session's activity mark.
+  /// reach the loop so it can stamp the session's activity mark.
   pub(crate) async fn receive_event(&mut self) -> Result<Option<Received>> {
     match &mut self.source {
-      ReaderSource::Ws(stream) => next_message(stream, self.rules, &self.pong_last_seen).await,
+      ReaderSource::Ws(stream) => next_message(stream, self.rules).await,
       ReaderSource::Raw { read, pong_write } => {
-        next_raw_frame(&mut *read, pong_write, self.rules, &self.pong_last_seen).await
+        next_raw_frame(&mut *read, pong_write, self.rules).await
       }
     }
   }
 }
 
 /// What one receive wake observed: a wire message, or a keepalive pong
-/// the caller must reflect into its own liveness clock. Surfacing pongs
+/// the caller must reflect into its own activity mark. Surfacing pongs
 /// (instead of swallowing them) lets a frame-silent session stay alive
-/// on keepalone responses alone.
+/// on keepalive responses alone.
 pub(crate) enum Received {
   Message(Message),
   Pong,
@@ -499,12 +481,10 @@ fn upgrade_authority(server_name: &ServerName<'_>, port: u16) -> String {
 }
 
 /// The single receive loop of the WebSocket class: binary messages are
-/// split and limit-checked, pongs refresh the shared liveness stamp and
-/// surface as [`Received::Pong`], and every other control shape fails
-/// closed or is skipped exactly as documented.
-async fn next_message<S>(
-  stream: &mut S, rules: FrameRules, pong_last_seen: &std::sync::atomic::AtomicU64,
-) -> Result<Option<Received>>
+/// split and limit-checked, pongs surface as [`Received::Pong`], and
+/// every other control shape fails closed or is skipped exactly as
+/// documented.
+async fn next_message<S>(stream: &mut S, rules: FrameRules) -> Result<Option<Received>>
 where
   S: futures_util::Stream<
       Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
@@ -540,14 +520,9 @@ where
       WsMessage::Text(_) => return Err(Error::invalid_input("websocket text message")),
       WsMessage::Ping(_) => continue,
       WsMessage::Pong(_) => {
-        // The peer answered a keepalive ping; record the liveness time
-        // (tungstenite answers pings itself, so this observes the peer's
-        // own pong responses) and wake the caller so it can reflect the
-        // response into the session's activity mark.
-        pong_last_seen.store(
-          crate::time::now_seconds(),
-          std::sync::atomic::Ordering::Relaxed,
-        );
+        // The peer answered a keepalive ping (tungstenite answers pings
+        // itself, so this observes the peer's own pong responses); wake
+        // the caller so it can stamp the session's activity mark.
         return Ok(Some(Received::Pong));
       }
       WsMessage::Close(_) => return Ok(None),
@@ -558,26 +533,19 @@ where
 
 /// The raw class's receive translation, shared by the unsplit
 /// connection and the split reader: one framed read mapped onto the
-/// receive-event vocabulary, a keepalive pong refreshing the shared
-/// liveness stamp and waking the caller. No lock is held across the
-/// read: the framing layer locks the shared write half itself only when
-/// a ping must be answered.
+/// receive-event vocabulary, a keepalive pong waking the caller. No lock
+/// is held across the read: the framing layer locks the shared write
+/// half itself only when a ping must be answered.
 async fn next_raw_frame<R>(
   read: &mut R, write: &SharedWrite, rules: FrameRules,
-  pong_last_seen: &std::sync::atomic::AtomicU64,
 ) -> Result<Option<Received>>
 where
   R: AsyncRead + Send + Unpin, {
   match framing::read_frame(&mut *read, write, rules).await? {
     Some(framing::RawFrame::Data(message)) => Ok(Some(Received::Message(message))),
     Some(framing::RawFrame::Pong) => {
-      // The peer answered a keepalive ping; record the liveness time and
-      // wake the caller so it can reflect the response into its own
-      // activity mark.
-      pong_last_seen.store(
-        crate::time::now_seconds(),
-        std::sync::atomic::Ordering::Relaxed,
-      );
+      // The peer answered a keepalive ping; wake the caller so it can
+      // stamp its own activity mark.
       Ok(Some(Received::Pong))
     }
     Some(framing::RawFrame::Hint(_)) => Err(Error::invalid_input("transport hint")),
@@ -591,6 +559,19 @@ where
 pub(crate) fn encode_frame(
   rules: FrameRules, schema_id: u16, kind_id: u16, flags: u16, body: &[u8],
 ) -> Result<Vec<u8>> {
+  let mut frame = Vec::with_capacity(PRELUDE_LEN + body.len());
+  encode_frame_into(&mut frame, rules, schema_id, kind_id, flags, body)?;
+  Ok(frame)
+}
+
+/// Appends one rule-checked frame — prelude then body, no intermediate
+/// allocation — to `buffer`, which the caller may already hold other
+/// bytes in (the byte-stream framing prepends its tag byte into the same
+/// buffer). [`encode_frame`] is the fresh-buffer form of the same
+/// builder, so both classes emit identical bytes.
+pub(crate) fn encode_frame_into(
+  buffer: &mut Vec<u8>, rules: FrameRules, schema_id: u16, kind_id: u16, flags: u16, body: &[u8],
+) -> Result<()> {
   let body_len = u32::try_from(body.len()).map_err(|_| Error::invalid_input("wire body length"))?;
   let prelude = Prelude::new(schema_id, kind_id, flags, body_len);
   // The send side shares the declared/flags/message-limit trio with the
@@ -603,10 +584,9 @@ pub(crate) fn encode_frame(
     rules.message_limit,
     rules.is_declared,
   )?;
-  let mut frame = Vec::with_capacity(PRELUDE_LEN + body.len());
-  frame.extend_from_slice(&prelude.encode());
-  frame.extend_from_slice(body);
-  Ok(frame)
+  buffer.extend_from_slice(&prelude.encode());
+  buffer.extend_from_slice(body);
+  Ok(())
 }
 
 /// Reads the RFC 9266 `tls-exporter` channel binding from the local TLS
@@ -650,17 +630,100 @@ fn class_channel_binding(label: &str) -> Result<[u8; CHANNEL_BINDING_LEN]> {
 
 fn receive_error(error: tokio_tungstenite::tungstenite::Error) -> Error {
   use tokio_tungstenite::tungstenite::Error as WsError;
+  if let Some(error) = ws_io_error(&error, ProviderErrorContext::TransportReceive) {
+    return error;
+  }
   match error {
-    WsError::Io(_) => Error::provider(
-      ProviderErrorKind::Io,
-      ProviderErrorContext::TransportReceive,
-    ),
     WsError::Capacity(_) => Error::provider(
       ProviderErrorKind::Overloaded,
       ProviderErrorContext::TransportReceive,
     ),
     _ => Error::invalid_input("websocket message"),
   }
+}
+
+/// The shared tungstenite IO classification: an underlying transport
+/// failure is the provider's `Io` kind under `context`, so a transient
+/// socket fault never reads as a malformed message or an authentication
+/// failure. `None` means the failure is not IO and the caller applies its
+/// own classification (a malformed message, an exhausted message bound, or
+/// a rejected upgrade).
+pub(crate) fn ws_io_error(
+  error: &tokio_tungstenite::tungstenite::Error, context: ProviderErrorContext,
+) -> Option<Error> {
+  match error {
+    tokio_tungstenite::tungstenite::Error::Io(_) => {
+      Some(Error::provider(ProviderErrorKind::Io, context))
+    }
+    _ => None,
+  }
+}
+
+/// Classifies one TLS handshake failure: a transport IO failure — the
+/// socket died, or rustls surfaced its own IO error — is the provider's
+/// `Io` kind under `context`, while every verification or protocol failure
+/// stays the typed authentication failure named by `auth_context`.
+///
+/// rustls 0.23 reports socket failures as plain `io::Error`s and wraps only
+/// its own protocol/verification errors (`InvalidData`), so "no wrapped
+/// rustls error" is exactly the transport-IO case; a wrapped rustls error
+/// is never a transient socket fault.
+pub(crate) fn tls_handshake_error(
+  error: &std::io::Error, context: ProviderErrorContext, auth_context: &'static str,
+) -> Error {
+  if error
+    .get_ref()
+    .is_some_and(|source| source.is::<rustls::Error>())
+  {
+    return Error::authentication_failed(auth_context);
+  }
+  Error::provider(ProviderErrorKind::Io, context)
+}
+
+/// Performs the inbound TLS 1.3 handshake over one accepted TCP stream
+/// and derives the exporter channel binding. Shared by every TLS-class
+/// listener accept: the WebSocket class upgrades the returned stream, the
+/// raw class frames it directly.
+pub(crate) async fn accept_tls_raw(
+  tcp: TcpStream, config: Arc<ServerConfig>,
+) -> Result<(
+  TlsStream<TcpStream>,
+  Option<SocketAddr>,
+  [u8; CHANNEL_BINDING_LEN],
+)> {
+  let peer_addr = tcp.peer_addr().ok();
+  let server = TlsAcceptor::from(config)
+    .accept(tcp)
+    .await
+    .map_err(|error| {
+      tls_handshake_error(&error, ProviderErrorContext::TransportAccept, "tls accept")
+    })?;
+  tracing::debug!("tls connection accepted");
+  let channel_binding = exporter_channel_binding(server.get_ref().1)?;
+  let tls = TlsStream::from(server);
+  Ok((tls, peer_addr, channel_binding))
+}
+
+/// Performs the outbound TLS 1.3 handshake to `server_name` over one
+/// dialed TCP stream and derives the exporter channel binding. Shared by
+/// every TLS-class dial.
+pub(crate) async fn connect_tls_raw(
+  tcp: TcpStream, config: Arc<ClientConfig>, server_name: ServerName<'static>,
+) -> Result<(TlsStream<TcpStream>, [u8; CHANNEL_BINDING_LEN])> {
+  let client = TlsConnector::from(config)
+    .connect(server_name, tcp)
+    .await
+    .map_err(|error| {
+      tls_handshake_error(
+        &error,
+        ProviderErrorContext::TransportConnect,
+        "tls connect",
+      )
+    })?;
+  tracing::debug!("tls connection established");
+  let channel_binding = exporter_channel_binding(client.get_ref().1)?;
+  let tls = TlsStream::from(client);
+  Ok((tls, channel_binding))
 }
 
 #[cfg(test)]

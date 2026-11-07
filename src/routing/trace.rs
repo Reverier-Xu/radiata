@@ -19,19 +19,19 @@
 //!   mid-flight failure rewrites a durable `Delivered` into the explicit
 //!   `Failed(StreamInterrupted)` (the durable twin of the in-memory monotonic
 //!   terminal machine), so the durable evidence converges with the in-memory
-//!   record under either writer ordering (remaining items 2026-10-10, P2-7).
+//!   record under either writer ordering.
 //!
-//! Record accessors that only the unit tests and the compatibility
-//! golden-vector reader consume are `#[cfg(test)]`; the production
-//! surface stays exactly the record writer, decoder, and sweeps.
+//! Record accessors that only the unit tests consume are
+//! `#[cfg(test)]`; the production surface stays exactly the record
+//! writer, decoder, and sweeps.
 
 use std::time::{Duration, SystemTime};
 
 use minicbor::{Decode, Encode};
 
 use crate::{
-  Error, ErrorKind, NodeId, Result, TraceId, api::Entropy, protocol::decode_canonical_strict,
-  storage::MetadataStore, time::WallClock,
+  Error, ErrorKind, NodeId, Result, TraceId, api::Entropy, packet::RouteState,
+  protocol::decode_canonical_strict, storage::MetadataStore, time::WallClock,
 };
 
 /// The durable schema and namespace of one route-trace record.
@@ -42,114 +42,98 @@ pub(crate) use crate::storage::families::TRACE_NAMESPACE;
 /// sweep's work per commit.
 const MAX_BATCH_OPERATIONS: usize = 64;
 
-/// The sentinel failure code for non-failed phases (never a valid kind).
-const NO_FAILURE: u8 = 0;
+/// The one failure-code table for [`ErrorKind`], in declaration order:
+/// the code is the index, so the renumbering stays contiguous and both
+/// directions derive from the same rows. Codes are internal to this
+/// record schema and the table covers every kind; a kind missing from
+/// the table fails the encode closed instead of shipping an unstorage
+/// record, and an unknown stored byte fails the decode closed.
+const FAILURE_KINDS: [ErrorKind; 24] = [
+  ErrorKind::InvalidInput,
+  ErrorKind::Conflict,
+  ErrorKind::NotFound,
+  ErrorKind::NotReady,
+  ErrorKind::NotTrusted,
+  ErrorKind::Revoked,
+  ErrorKind::Unsupported,
+  ErrorKind::UnsupportedSchema,
+  ErrorKind::UnsupportedCapability,
+  ErrorKind::AuthenticationFailed,
+  ErrorKind::RouteUnavailable,
+  ErrorKind::StreamInterrupted,
+  ErrorKind::Overloaded,
+  ErrorKind::FrameTooLarge,
+  ErrorKind::ResourceExhausted,
+  ErrorKind::StorageLocked,
+  ErrorKind::StorageCorrupt,
+  ErrorKind::PermissionDenied,
+  ErrorKind::Io,
+  ErrorKind::CommitUnknown,
+  ErrorKind::Cancelled,
+  ErrorKind::ShuttingDown,
+  ErrorKind::CallerError,
+  ErrorKind::Internal,
+];
 
-/// One observed trace phase. Terminal phases are `Delivered` and `Failed`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TracePhase {
-  Routing,
-  Streaming,
-  Delivered,
-  Failed(ErrorKind),
+/// The failure code of one [`ErrorKind`]: its index in the single table.
+/// `None` means the kind has not joined the table yet — an internal
+/// invariant break the caller reports instead of encoding a wrong byte.
+fn kind_code(kind: ErrorKind) -> Option<u8> {
+  FAILURE_KINDS
+    .iter()
+    .position(|candidate| *candidate == kind)
+    .map(|index| index as u8)
 }
 
-impl TracePhase {
-  const ROUTING: u8 = 0;
-  const STREAMING: u8 = 1;
-  const DELIVERED: u8 = 2;
-  const FAILED: u8 = 3;
-
-  fn code(&self) -> u8 {
-    match self {
-      Self::Routing => Self::ROUTING,
-      Self::Streaming => Self::STREAMING,
-      Self::Delivered => Self::DELIVERED,
-      Self::Failed(_) => Self::FAILED,
-    }
-  }
-
-  fn from_code(code: u8, failure: Option<u8>) -> Result<Self> {
-    match (code, failure) {
-      (Self::ROUTING, None) => Ok(Self::Routing),
-      (Self::STREAMING, None) => Ok(Self::Streaming),
-      (Self::DELIVERED, None) => Ok(Self::Delivered),
-      (Self::FAILED, Some(failure)) if failure != NO_FAILURE => {
-        Ok(Self::Failed(kind_from_code(failure)?))
-      }
-      _ => Err(Error::invalid_input("route trace phase")),
-    }
-  }
-
-  fn is_terminal(&self) -> bool {
-    matches!(self, Self::Delivered | Self::Failed(_))
-  }
-}
-
-/// The closed wire-code mapping for [`ErrorKind`] failures. Codes are
-/// internal to this record schema; the mapping covers every kind, so the
-/// code is total and unknown codes only exist on the decode side.
-const fn kind_code(kind: ErrorKind) -> u8 {
-  match kind {
-    ErrorKind::InvalidInput => 1,
-    ErrorKind::Conflict => 2,
-    ErrorKind::NotFound => 3,
-    ErrorKind::NotReady => 4,
-    ErrorKind::NotTrusted => 5,
-    ErrorKind::Revoked => 6,
-    ErrorKind::Unsupported => 7,
-    ErrorKind::UnsupportedSchema => 8,
-    ErrorKind::UnsupportedCapability => 9,
-    ErrorKind::AuthenticationFailed => 10,
-    ErrorKind::RouteUnavailable => 11,
-    ErrorKind::StreamInterrupted => 12,
-    ErrorKind::Overloaded => 13,
-    ErrorKind::FrameTooLarge => 24,
-    ErrorKind::ResourceExhausted => 14,
-    ErrorKind::StorageLocked => 15,
-    ErrorKind::StorageCorrupt => 16,
-    ErrorKind::PermissionDenied => 17,
-    ErrorKind::Io => 18,
-    ErrorKind::CommitUnknown => 19,
-    ErrorKind::Cancelled => 20,
-    ErrorKind::ShuttingDown => 21,
-    ErrorKind::CallerError => 23,
-    ErrorKind::Internal => 22,
-  }
-}
-
-/// The inverse of [`kind_code`]: a stored failure byte outside the known
-/// set is schema corruption and fails closed instead of masquerading as
+/// The kind behind one stored failure byte: a byte outside the table is
+/// schema corruption and fails closed instead of masquerading as
 /// `Internal`.
-const fn kind_from_code(code: u8) -> Result<ErrorKind> {
-  let kind = match code {
-    1 => ErrorKind::InvalidInput,
-    2 => ErrorKind::Conflict,
-    3 => ErrorKind::NotFound,
-    4 => ErrorKind::NotReady,
-    5 => ErrorKind::NotTrusted,
-    6 => ErrorKind::Revoked,
-    7 => ErrorKind::Unsupported,
-    8 => ErrorKind::UnsupportedSchema,
-    9 => ErrorKind::UnsupportedCapability,
-    10 => ErrorKind::AuthenticationFailed,
-    11 => ErrorKind::RouteUnavailable,
-    12 => ErrorKind::StreamInterrupted,
-    13 => ErrorKind::Overloaded,
-    24 => ErrorKind::FrameTooLarge,
-    14 => ErrorKind::ResourceExhausted,
-    15 => ErrorKind::StorageLocked,
-    16 => ErrorKind::StorageCorrupt,
-    17 => ErrorKind::PermissionDenied,
-    18 => ErrorKind::Io,
-    19 => ErrorKind::CommitUnknown,
-    20 => ErrorKind::Cancelled,
-    21 => ErrorKind::ShuttingDown,
-    23 => ErrorKind::CallerError,
-    22 => ErrorKind::Internal,
-    _ => return Err(Error::invalid_input("route trace failure code")),
+fn kind_from_code(code: u8) -> Result<ErrorKind> {
+  match FAILURE_KINDS.get(usize::from(code)) {
+    Some(kind) => Ok(*kind),
+    None => Err(Error::invalid_input("route trace failure code")),
+  }
+}
+
+/// The wire phase codes of one persisted route-trace record.
+const PHASE_ROUTING: u8 = 0;
+const PHASE_STREAMING: u8 = 1;
+const PHASE_DELIVERED: u8 = 2;
+const PHASE_FAILED: u8 = 3;
+
+/// The wire phase code and failure byte of one observed route state:
+/// `Selecting` is a pre-routing observation only — it is never persisted,
+/// so its appearance here is an internal invariant break that fails
+/// closed instead of encoding a wrong byte.
+fn persist_code(state: &RouteState) -> Result<(u8, Option<u8>)> {
+  let kind = match state {
+    RouteState::Routing => return Ok((PHASE_ROUTING, None)),
+    RouteState::Streaming => return Ok((PHASE_STREAMING, None)),
+    RouteState::Delivered => return Ok((PHASE_DELIVERED, None)),
+    RouteState::Failed(kind) => kind,
+    RouteState::Selecting => return Err(Error::internal("route trace phase")),
   };
-  Ok(kind)
+  let code = kind_code(*kind).ok_or_else(|| Error::internal("route trace failure kind"))?;
+  Ok((PHASE_FAILED, Some(code)))
+}
+
+/// The route state behind one stored phase byte and failure byte: an
+/// unknown combination is schema corruption and fails closed.
+fn phase_from_code(code: u8, failure: Option<u8>) -> Result<RouteState> {
+  match (code, failure) {
+    (PHASE_ROUTING, None) => Ok(RouteState::Routing),
+    (PHASE_STREAMING, None) => Ok(RouteState::Streaming),
+    (PHASE_DELIVERED, None) => Ok(RouteState::Delivered),
+    (PHASE_FAILED, Some(failure)) => Ok(RouteState::Failed(kind_from_code(failure)?)),
+    _ => Err(Error::invalid_input("route trace phase")),
+  }
+}
+
+/// Whether one observed route state is terminal (`Delivered` or
+/// `Failed`): active records are never removed by retention and are
+/// terminated by the restart sweep.
+fn is_terminal(state: &RouteState) -> bool {
+  matches!(state, RouteState::Delivered | RouteState::Failed(_))
 }
 
 /// One durable route-trace record: bounded metadata only, never payload
@@ -161,7 +145,7 @@ pub(crate) struct TraceRecord {
   /// The selected destination: exact target or load-balancer pick.
   destination: NodeId,
   attempts: u32,
-  phase: TracePhase,
+  phase: RouteState,
   updated_at: SystemTime,
 }
 
@@ -175,13 +159,13 @@ impl TraceRecord {
       source,
       destination,
       attempts: 1,
-      phase: TracePhase::Routing,
+      phase: RouteState::Routing,
       updated_at,
     }
   }
 
   pub(crate) fn failed(mut self, kind: ErrorKind) -> Self {
-    self.phase = TracePhase::Failed(kind);
+    self.phase = RouteState::Failed(kind);
     self
   }
 
@@ -204,41 +188,25 @@ impl TraceRecord {
   }
 
   #[cfg(test)]
-  pub(crate) fn phase(&self) -> &TracePhase {
+  pub(crate) fn phase(&self) -> &RouteState {
     &self.phase
   }
 
   /// Applies one route transition beyond the initial routing record.
-  pub(crate) fn with_transition(mut self, transition: TraceTransition, at: SystemTime) -> Self {
+  /// The state is the single route-state type ([`RouteState`]); the
+  /// in-flight `Streaming` value exists for the frozen golden-vector
+  /// fixtures — production records route progress in memory and
+  /// terminals durably, so production writes only terminal states.
+  pub(crate) fn with_transition(mut self, state: RouteState, at: SystemTime) -> Self {
     self.updated_at = at;
-    self.phase = match transition {
-      TraceTransition::Delivered => TracePhase::Delivered,
-      TraceTransition::Failed(kind) => TracePhase::Failed(kind),
-      // The in-flight transition is a persisted phase only: production
-      // records route progress in memory and terminals durably, so the
-      // constructor value exists for the frozen golden-vector fixtures.
-      #[cfg(test)]
-      TraceTransition::Streaming => TracePhase::Streaming,
-    };
+    self.phase = state;
     self
   }
 
-  /// Canonical wire encoding of the trace record; the compatibility
-  /// suite's golden-vector reader shares this exact encoder.
+  /// Canonical wire encoding of the trace record.
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical_record(self)
   }
-}
-
-/// One persisted route transition beyond the initial routing record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TraceTransition {
-  /// Test-only constructor value: the in-flight phase is a persisted
-  /// wire shape (the golden vectors pin it), never a production write.
-  #[cfg(test)]
-  Streaming,
-  Delivered,
-  Failed(ErrorKind),
 }
 
 #[derive(Encode, Decode)]
@@ -261,14 +229,11 @@ struct TraceWire {
   #[n(7)]
   failure: Option<u8>,
   #[n(8)]
-  updated_at_millis: u64,
+  updated_at_millis: i64,
 }
 
 fn encode_canonical_record(record: &TraceRecord) -> Result<Vec<u8>> {
-  let (phase_code, failure) = match &record.phase {
-    TracePhase::Failed(kind) => (TracePhase::FAILED, kind_code(*kind)),
-    phase => (phase.code(), NO_FAILURE),
-  };
+  let (phase_code, failure) = persist_code(&record.phase)?;
   crate::protocol::encode_canonical(
     &TraceWire {
       schema: TRACE_SCHEMA.to_owned(),
@@ -278,11 +243,7 @@ fn encode_canonical_record(record: &TraceRecord) -> Result<Vec<u8>> {
       destination: record.destination.to_string(),
       attempts: record.attempts,
       phase: phase_code,
-      failure: if failure == NO_FAILURE {
-        None
-      } else {
-        Some(failure)
-      },
+      failure,
       updated_at_millis: crate::time::to_millis(record.updated_at),
     },
     crate::protocol::CONTROL_CBOR_LIMITS,
@@ -305,7 +266,7 @@ pub(crate) fn decode_trace_record(bytes: &[u8]) -> Result<TraceRecord> {
     source: wire.source.parse()?,
     destination: wire.destination.parse()?,
     attempts: wire.attempts,
-    phase: TracePhase::from_code(wire.phase, wire.failure)?,
+    phase: phase_from_code(wire.phase, wire.failure)?,
     updated_at: crate::time::from_millis(wire.updated_at_millis),
   })
 }
@@ -351,7 +312,7 @@ pub(crate) async fn put_trace(
 /// the given origin-side identity, because the revision races the origin
 /// pump's still-in-flight terminal write and must be able to win that
 /// ordering too (the durable twin's mirror of the route table's monotonic
-/// terminal machine — remaining items 2026-10-10, P2-7). One conditional
+/// terminal machine). One conditional
 /// write per call: the caller retries a lost store race against the
 /// winner's committed value instead of silently diverging.
 async fn revise_terminal_once(
@@ -403,7 +364,7 @@ pub(crate) async fn terminate_stale(
         continue;
       }
     };
-    if record.phase.is_terminal() {
+    if is_terminal(&record.phase) {
       continue;
     }
     stale.push((
@@ -462,7 +423,7 @@ pub(crate) async fn sweep(
         continue;
       }
     };
-    if !record.phase.is_terminal() {
+    if !is_terminal(&record.phase) {
       // Active streams never enter the removal sets at all.
       continue;
     }
@@ -564,7 +525,7 @@ mod tests {
   };
 
   use super::{
-    MAX_QUEUED_TRACE_PERSISTENCE, TRACE_NAMESPACE, TracePhase, TraceRecord, TraceSink,
+    MAX_QUEUED_TRACE_PERSISTENCE, RouteState, TRACE_NAMESPACE, TraceRecord, TraceSink,
     decode_trace_record, put_trace, sweep, terminate_stale,
   };
   use crate::{
@@ -614,8 +575,8 @@ mod tests {
 
   // ---- Trace metadata without body bytes ----
 
-  /// Every `ErrorKind` survives the closed failure-code mapping, and an
-  /// unknown stored byte fails closed instead of decoding as a valid kind.
+  /// Every `ErrorKind` survives the single contiguous failure-code table, and
+  /// an unknown stored byte fails closed instead of decoding as a valid kind.
   #[test]
   fn failure_codes_round_trip_and_reject_unknown() {
     let kinds = [
@@ -644,11 +605,17 @@ mod tests {
       ErrorKind::CallerError,
       ErrorKind::Internal,
     ];
-    for kind in kinds {
-      let code = super::kind_code(kind);
-      assert_eq!(super::kind_from_code(code).unwrap(), kind);
+    // Contiguous renumbering by declaration order: the code is the
+    // index in the single table, from zero with no gaps.
+    for (index, kind) in kinds.iter().enumerate() {
+      let code = super::kind_code(*kind).unwrap();
+      assert_eq!(usize::from(code), index, "{kind:?} drifted off its index");
+      assert_eq!(super::kind_from_code(code).unwrap(), *kind);
     }
-    for code in [0_u8, 25, u8::MAX] {
+    // The table is total over ErrorKind: every kind encodes.
+    assert_eq!(super::FAILURE_KINDS.len(), kinds.len());
+    // A stored byte outside the table fails closed.
+    for code in [kinds.len() as u8, u8::MAX] {
       assert!(super::kind_from_code(code).is_err());
     }
   }
@@ -670,7 +637,7 @@ mod tests {
       &SystemEntropy,
       clock.as_ref(),
       TraceRecord::new(trace(1), node(1), node(2), clock.now())
-        .with_transition(super::TraceTransition::Streaming, clock.now()),
+        .with_transition(super::RouteState::Streaming, clock.now()),
     )
     .await
     .unwrap();
@@ -679,7 +646,7 @@ mod tests {
       &SystemEntropy,
       clock.as_ref(),
       TraceRecord::new(trace(1), node(1), node(2), clock.now())
-        .with_transition(super::TraceTransition::Delivered, clock.now()),
+        .with_transition(super::RouteState::Delivered, clock.now()),
     )
     .await
     .unwrap();
@@ -692,7 +659,7 @@ mod tests {
     assert_eq!(record.trace_id(), &trace(1));
     assert_eq!(record.source(), &node(1));
     assert_eq!(record.destination(), &node(2));
-    assert_eq!(record.phase(), &TracePhase::Delivered);
+    assert_eq!(record.phase(), &RouteState::Delivered);
 
     let space = crate::StoreNamespace::new(crate::QualifiedTag::parse(TRACE_NAMESPACE).unwrap());
     let snapshot = store.snapshot().await.unwrap();
@@ -747,7 +714,7 @@ mod tests {
     // The authoritative record survived unchanged.
     let records = all_records(&store).await;
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].phase(), &TracePhase::Routing);
+    assert_eq!(records[0].phase(), &RouteState::Routing);
 
     // Re-writing the identical state is idempotent old-or-new.
     put_trace(&store, &SystemEntropy, clock.as_ref(), record)
@@ -779,7 +746,7 @@ mod tests {
       &SystemEntropy,
       clock.as_ref(),
       TraceRecord::new(trace(4), node(1), node(5), clock.now())
-        .with_transition(super::TraceTransition::Delivered, clock.now()),
+        .with_transition(super::RouteState::Delivered, clock.now()),
     )
     .await
     .unwrap();
@@ -809,7 +776,7 @@ mod tests {
       .unwrap();
     assert_eq!(
       stale.phase(),
-      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+      &RouteState::Failed(ErrorKind::StreamInterrupted)
     );
 
     // Reopening the same store observes the terminated record only; there
@@ -821,7 +788,11 @@ mod tests {
       .unwrap();
     let reopened = all_records(&reopened_store).await;
     assert_eq!(reopened.len(), 2);
-    assert!(reopened.iter().all(|record| record.phase().is_terminal()));
+    assert!(
+      reopened
+        .iter()
+        .all(|record| super::is_terminal(record.phase()))
+    );
   }
 
   /// A stored record that no longer decodes is skipped with a logged
@@ -859,7 +830,7 @@ mod tests {
       &SystemEntropy,
       clock.as_ref(),
       TraceRecord::new(trace(2), node(1), node(3), clock.now())
-        .with_transition(super::TraceTransition::Delivered, clock.now()),
+        .with_transition(super::RouteState::Delivered, clock.now()),
     )
     .await
     .unwrap();
@@ -920,7 +891,7 @@ mod tests {
         &SystemEntropy,
         clock.as_ref(),
         TraceRecord::new(trace(seed), node(1), node(9), clock.now())
-          .with_transition(super::TraceTransition::Delivered, clock.now()),
+          .with_transition(super::RouteState::Delivered, clock.now()),
       )
       .await
       .unwrap();
@@ -967,7 +938,7 @@ mod tests {
     let records = all_records(&store).await;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].trace_id(), &trace(8));
-    assert_eq!(records[0].phase(), &TracePhase::Routing);
+    assert_eq!(records[0].phase(), &RouteState::Routing);
   }
 
   // Retention sweeps re-read the wall clock on every pass, so rollback or
@@ -983,7 +954,7 @@ mod tests {
       &SystemEntropy,
       clock.as_ref(),
       TraceRecord::new(trace(9), node(1), node(9), clock.now())
-        .with_transition(super::TraceTransition::Delivered, clock.now()),
+        .with_transition(super::RouteState::Delivered, clock.now()),
     )
     .await
     .unwrap();
@@ -1040,7 +1011,7 @@ mod tests {
     let (_factory, store, clock) = open_store().await;
     let terminal = |seed: u32, at| {
       TraceRecord::new(trace(seed), node(1), node(9), at)
-        .with_transition(super::TraceTransition::Delivered, at)
+        .with_transition(super::RouteState::Delivered, at)
     };
 
     // Two terminals that will expire, then two written one hundred
@@ -1084,7 +1055,7 @@ mod tests {
     assert!(
       survivors
         .iter()
-        .all(|record| record.phase() == &TracePhase::Delivered)
+        .all(|record| record.phase() == &RouteState::Delivered)
     );
     let ids: Vec<_> = survivors.iter().map(|record| record.trace_id()).collect();
     assert!(ids.contains(&&trace(12)) && ids.contains(&&trace(13)));
@@ -1099,7 +1070,7 @@ mod tests {
     let total = super::MAX_BATCH_OPERATIONS * 2 + 6;
     for seed in 0..total as u32 {
       let record = TraceRecord::new(trace(seed), node(1), node(9), clock.now())
-        .with_transition(super::TraceTransition::Delivered, clock.now());
+        .with_transition(super::RouteState::Delivered, clock.now());
       put_trace(&store, &SystemEntropy, clock.as_ref(), record)
         .await
         .unwrap();
@@ -1167,14 +1138,13 @@ mod tests {
       &'a self, namespace: &'a crate::StoreNamespace, key: &'a crate::StoreKey,
     ) -> crate::BoxFuture<'a, crate::Result<Option<crate::StoreValue>>> {
       Box::pin(async move {
-        // The production schema baseline keeps the open-time migration
-        // pass on its idempotent Current path.
+        // The production schema baseline keeps the open-time schema
+        // gate on its accept-without-writes path.
         let schema = crate::storage::migration::schema_namespace()?;
         if namespace == &schema && key == &crate::storage::migration::schema_key() {
           return Ok(Some(crate::storage::migration::encode_schema_record(
             crate::storage::migration::BASE_RECORD_KIND,
             crate::storage::migration::METADATA_SCHEMA_V1,
-            None,
           )));
         }
         Ok(None)
@@ -1281,7 +1251,7 @@ mod tests {
     let records = (0..seeds)
       .map(|seed| {
         let record = TraceRecord::new(trace(seed as u32), node(1), node(9), UNIX_EPOCH)
-          .with_transition(super::TraceTransition::Delivered, UNIX_EPOCH);
+          .with_transition(super::RouteState::Delivered, UNIX_EPOCH);
         crate::StoreEntry::new(
           crate::StoreNamespace::new(crate::QualifiedTag::parse(TRACE_NAMESPACE).unwrap()),
           super::key(record.trace_id()),
@@ -1424,7 +1394,7 @@ mod tests {
 
   fn terminal_record(seed: u32, sink: &TraceSink) -> TraceRecord {
     TraceRecord::new(trace(seed), node(1), node(9), sink.clock_now())
-      .with_transition(super::TraceTransition::Delivered, sink.clock_now())
+      .with_transition(super::RouteState::Delivered, sink.clock_now())
   }
 
   /// A sink whose owning identity context is already dropped — the
@@ -1452,9 +1422,9 @@ mod tests {
   }
 
   /// A terminal fact admitted after the node tore down skips its store
-  /// write and lands in the same drop aggregate the queue bound feeds
-  /// (audit 2026-10-27 B3, mechanism 2): the weak handle finds no
-  /// context, so nothing re-pins the released store, and the best-effort
+  /// write and lands in the same drop aggregate the queue bound feeds:
+  /// the weak handle finds no context, so nothing re-pins the released
+  /// store, and the best-effort
   /// surface keeps its accounting exact — one fed record is exactly one
   /// of dropped or persisted.
   #[tokio::test]
@@ -1644,17 +1614,17 @@ mod tests {
   /// A revision moves an existing durable `Delivered` terminal to the
   /// explicit failure while keeping the row's bound identity — the
   /// durable twin of the in-memory monotonic terminal machine's
-  /// "a late failure overrides a recorded `Delivered`" (remaining items
-  /// 2026-10-10, P2-7): without it, a relay-leg death leaves the durable
-  /// trace claiming `Delivered` for the whole retention window while the
-  /// in-memory record ends `Failed(StreamInterrupted)`.
+  /// "a late failure overrides a recorded `Delivered`": without it, a relay-leg
+  /// death leaves the durable trace claiming `Delivered` for the whole
+  /// retention window while the in-memory record ends
+  /// `Failed(StreamInterrupted)`.
   #[tokio::test]
   async fn revision_moves_a_delivered_terminal_to_the_failure_kind() {
     let sink = TraceSink::test_sink().await;
     sink
       .record(
         TraceRecord::new(trace(11), node(1), node(9), sink.clock_now())
-          .with_transition(super::TraceTransition::Delivered, sink.clock_now()),
+          .with_transition(super::RouteState::Delivered, sink.clock_now()),
       )
       .await;
 
@@ -1667,7 +1637,7 @@ mod tests {
     assert_eq!(records[0].destination(), &node(9));
     assert_eq!(
       records[0].phase(),
-      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+      &RouteState::Failed(ErrorKind::StreamInterrupted)
     );
   }
 
@@ -1688,7 +1658,7 @@ mod tests {
     assert_eq!(records[0].destination(), &node(9));
     assert_eq!(
       records[0].phase(),
-      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+      &RouteState::Failed(ErrorKind::StreamInterrupted)
     );
   }
 
@@ -1701,7 +1671,7 @@ mod tests {
     sink
       .record(
         TraceRecord::new(trace(13), node(1), node(9), sink.clock_now()).with_transition(
-          super::TraceTransition::Failed(ErrorKind::StreamInterrupted),
+          super::RouteState::Failed(ErrorKind::StreamInterrupted),
           sink.clock_now(),
         ),
       )
@@ -1712,7 +1682,7 @@ mod tests {
     assert_eq!(records.len(), 1);
     assert_eq!(
       records[0].phase(),
-      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+      &RouteState::Failed(ErrorKind::StreamInterrupted)
     );
   }
 }
@@ -1818,9 +1788,9 @@ impl TraceSink {
 
   /// Skips one admitted persistence task whose node is already torn
   /// down: re-pinning the store the shutdown reply just released is the
-  /// residual lock tail (audit 2026-10-27 B3, mechanism 2), so the
-  /// record is dropped into the same aggregate the queue-bound drops
-  /// feed — the durable trace is a best-effort observation surface —
+  /// residual lock tail, so the record is dropped into the same aggregate
+  /// the queue-bound drops feed — the durable trace is a best-effort
+  /// observation surface —
   /// with a debug diagnostic matching that severity.
   fn drop_after_teardown(&self) {
     let dropped = self
@@ -1874,7 +1844,7 @@ impl TraceSink {
   }
 
   /// The durable twin's mirror of the route table's monotonic terminal
-  /// machine (remaining items 2026-10-10, P2-7): the same late mid-flight
+  /// machine: the same late mid-flight
   /// failure that flips the in-memory route record to `Failed` revises
   /// this trace id's durable terminal record to `Failed(kind)`. An
   /// existing row keeps its bound identity and only the phase moves; an

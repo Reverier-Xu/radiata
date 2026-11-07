@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{borrow::Cow, fmt, str::FromStr};
 
 use crate::{Error, Result};
 
@@ -17,17 +17,51 @@ const MAX_DNS_NAME_LEN: usize = 253;
 /// drift apart.
 pub(crate) const BUILTIN_DOMAIN: &str = "radiata.woooo.tech";
 
+/// Refuses one caller-supplied tag that lives under the reserved built-in
+/// domain: the core owns that namespace, so a caller registration there
+/// could only collide with (or shadow) a core entry. `context` names the
+/// refused registration surface in the typed error. Every caller
+/// registration seam (features, protocols, task reconcilers, routing
+/// policies) reads this one predicate, so the reserved-domain rule cannot
+/// fork per surface.
+pub(crate) fn require_caller_domain(domain: &str, context: &'static str) -> Result<()> {
+  if domain == BUILTIN_DOMAIN {
+    return Err(Error::invalid_input(context));
+  }
+  Ok(())
+}
+
 /// The closed tag categories the crate compares against (single source):
 /// protocol-fixed, so one constant table makes the set auditable and a
-/// typo in any comparison impossible to compile.
+/// typo in any comparison impossible to compile. The version policy of
+/// each category lives beside these names in [`super::builtin`].
 pub(crate) const CATEGORY_CRYPTO: &str = "crypto";
-pub(crate) const CATEGORY_METADATA: &str = "metadata";
-pub(crate) const CATEGORY_RESOURCES: &str = "resources";
+pub(crate) const CATEGORY_EVENTS: &str = "events";
+pub(crate) const CATEGORY_FEATURES: &str = "features";
 pub(crate) const CATEGORY_LABELS: &str = "labels";
+pub(crate) const CATEGORY_METADATA: &str = "metadata";
+pub(crate) const CATEGORY_PROTOCOLS: &str = "protocols";
+pub(crate) const CATEGORY_RESOURCES: &str = "resources";
+pub(crate) const CATEGORY_TRANSPORTS: &str = "transports";
+/// Test-only: the inventory in [`super::builtin`] is the sole consumer.
+#[cfg(test)]
+pub(crate) const CATEGORY_ROUTE_POLICIES: &str = "route-policies";
+/// Test-only: the inventory in [`super::builtin`] is the sole consumer.
+#[cfg(test)]
+pub(crate) const CATEGORY_SCHEMAS: &str = "schemas";
+/// Test-only: the inventory in [`super::builtin`] is the sole consumer.
+#[cfg(test)]
+pub(crate) const CATEGORY_STATUS: &str = "status";
+/// Test-only: the inventory in [`super::builtin`] is the sole consumer.
+#[cfg(test)]
+pub(crate) const CATEGORY_TASKS: &str = "tasks";
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct QualifiedTag {
-  value: String,
+  /// The canonical text: borrowed for the crate's own fixed tags (the
+  /// const-constructed ones, see [`QualifiedTag::from_static`]), owned
+  /// for every parsed tag.
+  value: Cow<'static, str>,
   domain_end: usize,
   category_end: usize,
   /// The end offset of the version segment when the tag carries one;
@@ -39,11 +73,44 @@ impl QualifiedTag {
   pub fn parse(value: &str) -> Result<Self> {
     let (value, domain_end, category_end, version_end) = validate_tag(value)?;
     Ok(Self {
-      value,
+      value: Cow::Owned(value),
       domain_end,
       category_end,
       version_end,
     })
+  }
+
+  /// Builds one of the crate's own fixed tags from its compile-time
+  /// canonical text: the const-callable twin of [`QualifiedTag::parse`],
+  /// so a fixed tag can be an associated constant instead of a runtime
+  /// parse. The text is not re-validated here — the segment offsets are
+  /// computed by scanning for the separators — so every `from_static`
+  /// constant is paired with a test that it parses to itself.
+  pub(crate) const fn from_static(value: &'static str) -> Self {
+    let bytes = value.as_bytes();
+    let mut domain_end = 0;
+    let mut category_end = 0;
+    let mut version_end = None;
+    let mut separators = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+      if bytes[index] == b'/' {
+        match separators {
+          0 => domain_end = index,
+          1 => category_end = index,
+          2 => version_end = Some(index),
+          _ => {}
+        }
+        separators += 1;
+      }
+      index += 1;
+    }
+    Self {
+      value: Cow::Borrowed(value),
+      domain_end,
+      category_end,
+      version_end,
+    }
   }
 
   pub fn as_str(&self) -> &str {
@@ -99,14 +166,10 @@ impl fmt::Debug for QualifiedTag {
 }
 
 /// Generates one category tag type. The canonical-text and domain
-/// accessors are generated only for the tags that carry them: a tag whose
-/// registry surface is still test-only (discovery) has no production
-/// reader, so `@without_accessors` emits the type alone instead of
-/// silencing the dead-code lint for an accessor nothing calls. The
-/// accessors ride into the same `impl` block as `parse`, so a tag with
-/// them renders exactly like it did before the split.
+/// accessors ride into the same `impl` block as `parse`, so a tag renders
+/// exactly like it did before the split.
 macro_rules! category_tag {
-  ($name:ident, $category:literal, $context:literal) => {
+  ($name:ident, $category:expr, $context:literal) => {
     category_tag!(@type $name, $category, $context, {
       /// The canonical text.
       pub fn as_str(&self) -> &str {
@@ -121,11 +184,7 @@ macro_rules! category_tag {
     });
   };
 
-  (@without_accessors $name:ident, $category:literal, $context:literal) => {
-    category_tag!(@type $name, $category, $context, {});
-  };
-
-  (@type $name:ident, $category:literal, $context:literal, { $($accessors:tt)* }) => {
+  (@type $name:ident, $category:expr, $context:literal, { $($accessors:tt)* }) => {
     #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
     pub struct $name(QualifiedTag);
 
@@ -166,11 +225,10 @@ macro_rules! category_tag {
   };
 }
 
-category_tag!(FeatureTag, "features", "feature tag");
-category_tag!(ProtocolTag, "protocols", "protocol tag");
-category_tag!(TransportTag, "transports", "transport tag");
-#[cfg(test)]
-category_tag!(@without_accessors DiscoveryTag, "discovery", "discovery tag");
+category_tag!(EventTag, CATEGORY_EVENTS, "event tag");
+category_tag!(FeatureTag, CATEGORY_FEATURES, "feature tag");
+category_tag!(ProtocolTag, CATEGORY_PROTOCOLS, "protocol tag");
+category_tag!(TransportTag, CATEGORY_TRANSPORTS, "transport tag");
 
 /// Validates one tag and returns its canonical text with the domain,
 /// category, and version split offsets. The grammar admits exactly two
@@ -317,6 +375,27 @@ fn valid_version_component(component: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::{MAX_DNS_NAME_LEN, MAX_HOSTNAME_LABEL_LEN, QualifiedTag, valid_dns_hostname};
+
+  /// The const constructor is the parse result for every shape it is
+  /// used with: the three-segment tag and the versioned four-segment
+  /// tag (the crate's fixed tags are all three-segment, so the versioned
+  /// case pins the offset scan's third separator).
+  #[test]
+  fn from_static_matches_parse_for_every_fixed_shape() {
+    for value in [
+      "radiata.woooo.tech/tasks/join",
+      "example.com/labels/lane",
+      "a.b/schemas/v12/multi-word-name",
+    ] {
+      let parsed = QualifiedTag::parse(value).unwrap();
+      let fixed = QualifiedTag::from_static(value);
+      assert_eq!(fixed, parsed, "fixed tag drifted for {value:?}");
+      assert_eq!(fixed.domain(), parsed.domain());
+      assert_eq!(fixed.category(), parsed.category());
+      assert_eq!(fixed.version(), parsed.version());
+      assert_eq!(fixed.name(), parsed.name());
+    }
+  }
 
   #[test]
   fn parses_versioned_tags_with_split_accessors() {

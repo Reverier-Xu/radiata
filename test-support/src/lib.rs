@@ -8,8 +8,8 @@ pub mod ledger;
 /// The multi-cluster test gate's lock file name, created inside the
 /// workspace `target/` directory so parallel test processes of one
 /// checkout (cargo/nextest run test files as separate processes)
-/// serialize their oversubscribed cluster lanes machine-wide (audit
-/// 2026-10-27 B3). The lock is a kernel-managed advisory file lock: it
+/// serialize their oversubscribed cluster lanes machine-wide. The lock
+/// is a kernel-managed advisory file lock: it
 /// is released by `drop` and by process exit, so a crashed lane can
 /// never leave a stale lock behind.
 const CLUSTER_GATE_LOCK_NAME: &str = ".radiata-cluster-gate.lock";
@@ -23,7 +23,7 @@ const CLUSTER_GATE_POLL: std::time::Duration = std::time::Duration::from_millis(
 static CLUSTER_GATE_PROCESS: std::sync::OnceLock<tokio::sync::Mutex<()>> =
   std::sync::OnceLock::new();
 
-/// One held multi-cluster slot (audit 2026-10-27 B3): serializes the
+/// One held multi-cluster slot: serializes the
 /// heavy multi-cluster lanes against every other such lane, in this
 /// process (async mutex) and across processes (exclusive file lock
 /// under `target/`). The OS lock drops before the process mutex —
@@ -40,9 +40,9 @@ pub struct ClusterGate {
 /// releases it on drop. Test files that run several-node clusters use
 /// one gate per lane so at most one oversubscribed cluster owns the
 /// machine at a time, regardless of which test file's process it runs
-/// in — the per-file `OnceLock` gates this replaces serialized lanes
-/// only within their own binary and left cross-file parallelism
-/// unbounded (audit 2026-10-27 B3).
+/// in — a per-file `OnceLock` gate would serialize lanes
+/// only within their own binary and leave cross-file parallelism
+/// unbounded.
 pub async fn cluster_gate() -> ClusterGate {
   cluster_gate_with_lock_path(cluster_gate_lock_path()).await
 }
@@ -138,7 +138,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 pub const MAX_ARTIFACT_BYTES: usize = 1_048_576;
 pub const MAX_RETAINED_EVENTS: usize = 10_000;
 const EVENT_DIGEST_DOMAIN: &[u8] = b"radiata.woooo.tech/failure-replay/event-stream/v2";
-const FAILURE_SCHEMA: &str = "radiata.woooo.tech/schemas/failure-replay";
+const FAILURE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/failure-replay";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForbiddenFieldClass {
@@ -1633,7 +1633,7 @@ mod tests {
       assert!(
         artifact
           .as_bytes()
-          .starts_with(b"{\"schema\":\"radiata.woooo.tech/schemas/failure-replay\"")
+          .starts_with(b"{\"schema\":\"radiata.woooo.tech/schemas/v1/failure-replay\"")
       );
       assert_eq!(artifact.producer(), producer);
       assert_eq!(source.event_reads.get(), 1);

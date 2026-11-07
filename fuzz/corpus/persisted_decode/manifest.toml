@@ -9,126 +9,126 @@ aggregate = { entry_count = 22, total_bytes = 3838 }
 digest = "8029b63cf6bfadab5c1b1f5188fe34157da7f1c00d8e0122b83f0f8e7cd8291e"
 byte_count = 187
 origin = "golden-fixture"
-lineage = "compatibility manifest local-identity-v1"
+lineage = "canonical local-identity record"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "7b6a6b9ba2a647d8d7add78049c103e6fe4cf86705c79eca61c0a67b1f1d4716"
 byte_count = 184
 origin = "golden-fixture"
-lineage = "compatibility manifest key-creation-intent-v1"
+lineage = "canonical key-creation-intent record"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "aae1a6a23589f9c66b1e8e50cc42dc0f5a7b0df18a6dcb7647407e675fd4360b"
 byte_count = 143
 origin = "golden-fixture"
-lineage = "compatibility manifest identity-binding-v1"
+lineage = "canonical identity-binding record"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "7091ff7573a72637a33b4e8625c51757a3400fe7fb5c1ae091ee85913f570125"
 byte_count = 206
 origin = "golden-fixture"
-lineage = "compatibility manifest cluster-genesis-v1"
+lineage = "canonical cluster-genesis record"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "b0d021a566b97113be71fed275be5df6665840295df1a17a35a552a86a294dbe"
 byte_count = 118
 origin = "golden-fixture"
-lineage = "compatibility manifest local-cluster-pointer-v1"
+lineage = "canonical local-cluster-pointer record"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "46c255a0ff6e06cb158015fbe701ff04fc3f443904981004074126a31655763b"
 byte_count = 201
 origin = "golden-fixture"
-lineage = "compatibility manifest credential-use-v1"
+lineage = "canonical credential-use record"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "660d06a59b4068357275ce84f1e9a99f4e37739f596c9113d0db566b89d2f0a0"
 byte_count = 268
 origin = "golden-fixture"
-lineage = "compatibility manifest admission-grant-v1"
+lineage = "canonical admission-grant record"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "3130aae70a1c97b8a19191be1ae9f420a2663ed2a84ea5d0ea334d3c9a0cc8ff"
 byte_count = 91
 origin = "golden-fixture"
-lineage = "compatibility manifest key-deleted-v1"
+lineage = "canonical key-deleted record"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "c0b9528cc3d40b96cdeba885e4efacbf831bab38e2a3997f7a864cf080257271"
 byte_count = 142
 origin = "golden-fixture"
-lineage = "compatibility manifest descriptor-v1"
+lineage = "previous-shape node descriptor: record version 1 without capability labels"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "11e4286d9c2173d6efa2bb1f4e8202fded00460e3582975a2a4ce3103812bec2"
 byte_count = 177
 origin = "golden-fixture"
-lineage = "compatibility manifest descriptor-v2"
+lineage = "canonical node descriptor: record version 2 with capability labels"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "4ddb8a126551d28df4096d0ff04dd4e72118bc718c7b71e083a9905e377aa91f"
 byte_count = 309
 origin = "golden-fixture"
-lineage = "compatibility manifest record-g7-previous"
+lineage = "resource record: previous resource version fixture"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "91a9d82d485dac7d7a6edc8964a9fe3b8589bf71ea7112e47beb67178693cb03"
 byte_count = 334
 origin = "golden-fixture"
-lineage = "compatibility manifest record-g9-live"
+lineage = "resource record: live multi-domain register"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "1306807189b91f9fa369704944eba1df05155dfc6809a1e896ee4b7624dca099"
 byte_count = 283
 origin = "golden-fixture"
-lineage = "compatibility manifest record-g9-removal"
+lineage = "resource record: removal register"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "4380a8e8e5f268cca6f9f61a1309a46f251e108078b31f5aebf6c33999a9961f"
 byte_count = 134
 origin = "golden-fixture"
-lineage = "compatibility manifest record-routing-v1"
+lineage = "route-trace record: routing phase"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "ae21670afe28f5a527933df5d1904bb0248201dddd686a739d6042646571eae1"
 byte_count = 134
 origin = "golden-fixture"
-lineage = "compatibility manifest record-delivered-v1"
+lineage = "route-trace record: delivered phase"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "a0200e4bbdf3dcc9b252e6e9f3cf631258fcd0ae66c31ed3ca84ecb0f2c6313f"
 byte_count = 403
 origin = "golden-fixture"
-lineage = "compatibility manifest pending-record-v1"
+lineage = "pending-transaction journal record"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "b96b2ffb17c7fce847f0cdb70d104db5a97658e8a8869cd086be8ee79d015e56"
 byte_count = 43
 origin = "golden-fixture"
-lineage = "compatibility manifest base-record-v1"
+lineage = "metadata schema record: baseline kind with a fixture-chain version tag"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]
 digest = "9a005100c7895bff417927bfc7d1cb4f7d046ae5c7669b00ca3caf2a93937fd3"
 byte_count = 80
 origin = "golden-fixture"
-lineage = "compatibility manifest edge-record-v1"
+lineage = "metadata schema record: retired edge kind must fail closed"
 schema_tags = ["radiata.woooo.tech/schemas/v1/resource-record"]
 
 [[entry]]

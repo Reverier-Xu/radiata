@@ -297,12 +297,33 @@ pub(crate) struct BoundedReceiver {
 impl BoundedReceiver {
   pub(crate) async fn recv(&mut self) -> Option<SessionFrame> {
     let frame = self.inner.recv().await?;
+    self.release(&frame);
+    Some(frame)
+  }
+
+  /// Releases one drained frame's reservation: the count, byte, and audit
+  /// accounting return to the queue and waiting relays wake on the
+  /// progress.
+  fn release(&self, frame: &SessionFrame) {
     let bytes = FRAME_OVERHEAD.saturating_add(frame.body.len());
     self.state.count.fetch_sub(1, Ordering::Relaxed);
     self.state.bytes.fetch_sub(bytes, Ordering::Relaxed);
     self.state.audit_removed.fetch_add(1, Ordering::Relaxed);
     self.state.released.notify_one();
-    Some(frame)
+  }
+}
+
+impl Drop for BoundedReceiver {
+  /// Frames still queued when the receiver goes away release their
+  /// reservations exactly like a drain: the accounting must not outlive
+  /// the channel, or a later send would report permanent saturation
+  /// (`Overloaded`) instead of the closed queue (`ShuttingDown`).
+  /// Idempotent — a receiver the caller already drained finds nothing
+  /// left and subtracts nothing.
+  fn drop(&mut self) {
+    while let Ok(frame) = self.inner.try_recv() {
+      self.release(&frame);
+    }
   }
 }
 
@@ -420,6 +441,45 @@ mod queue_tests {
       sender.audit_delta(),
       1,
       "the rejected frame reserved nothing"
+    );
+  }
+
+  /// Dropping the receiver with frames still queued releases their
+  /// reservations: the accounting must not outlive the channel, or the
+  /// sender would report permanent saturation instead of the closed
+  /// queue.
+  #[tokio::test]
+  async fn dropping_a_receiver_with_queued_frames_releases_their_reservations() {
+    let (sender, receiver) = queue(1, 1_000);
+    sender.send(frame(10)).await.unwrap();
+    assert_eq!(sender.queued_messages(), 1);
+    drop(receiver);
+
+    assert_eq!(sender.queued_messages(), 0, "the drain released the count");
+    assert_eq!(sender.queued_bytes(), 0, "the drain released the bytes");
+    assert_eq!(sender.audit_delta(), 0, "the drain released the audit");
+    // A closed queue reports the shutdown, never saturation: the send
+    // fails typed even though the drained reservations left the queue
+    // counter-freely empty.
+    let error = sender.send(frame(10)).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ShuttingDown);
+    assert_eq!(error.context(), "session queue");
+  }
+
+  /// The drop-time drain is idempotent: a receiver the caller already
+  /// drained releases nothing more.
+  #[tokio::test]
+  async fn dropping_a_drained_receiver_releases_nothing_more() {
+    let (sender, mut receiver) = queue(2, 1_000);
+    sender.send(frame(10)).await.unwrap();
+    let _ = receiver.recv().await.unwrap();
+    drop(receiver);
+
+    assert_eq!(sender.queued_messages(), 0);
+    assert_eq!(sender.audit_delta(), 0);
+    assert_eq!(
+      sender.send(frame(10)).await.unwrap_err().kind(),
+      ErrorKind::ShuttingDown
     );
   }
 

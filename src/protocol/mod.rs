@@ -5,8 +5,12 @@ pub(crate) mod feature;
 pub(crate) mod handshake;
 pub(crate) mod offer;
 pub(crate) mod selection;
+pub(crate) mod signature;
 pub(crate) mod tag;
 pub(crate) mod wire;
+
+#[cfg(test)]
+pub(crate) mod builtin;
 
 /// The handshake/control body ceiling: one wire body never exceeds
 /// it, and every derived limit (parser defaults, aggregate WebSocket
@@ -27,6 +31,4 @@ pub(crate) use cbor::{
 };
 pub(crate) use envelope::{PRELUDE_LEN, Prelude, check_frame, split_message};
 pub use feature::FeatureDefinition;
-#[cfg(test)]
-pub use tag::DiscoveryTag;
-pub use tag::{FeatureTag, ProtocolTag, QualifiedTag, TransportTag};
+pub use tag::{EventTag, FeatureTag, ProtocolTag, QualifiedTag, TransportTag};

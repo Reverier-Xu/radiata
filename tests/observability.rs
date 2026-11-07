@@ -182,7 +182,7 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
   let result = issuer.handle.open_stream(
     StreamTarget::Exact(member.id.clone().unwrap()),
     ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered").unwrap(),
-    StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap(),
+    StreamPolicy::new(radiata::RoutingPolicy::DIRECT, 8).unwrap(),
     StreamMetadata::new(),
   );
   match result {
@@ -311,7 +311,7 @@ async fn redaction_lane_rejects_every_forbidden_class() {
   let packet = member.handle.open_stream(
     StreamTarget::Exact(issuer.id.clone().unwrap()),
     ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered-marker").unwrap(),
-    StreamPolicy::new(radiata::RoutingPolicy::Direct, 8).unwrap(),
+    StreamPolicy::new(radiata::RoutingPolicy::DIRECT, 8).unwrap(),
     StreamMetadata::new(),
   );
   match packet {
@@ -426,13 +426,13 @@ impl PacketConsumer for DrainAll {
   }
 }
 
-/// Audit 2026-10-09, item 4: a finished packet pump is reaped from the
+/// a finished packet pump is reaped from the
 /// supervisor's task set as it completes, so the background-task
 /// counter returns to its baseline instead of growing by one per
 /// completed stream until shutdown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn finished_packet_pumps_are_reaped_from_the_task_set() {
-  const REAP_PROTOCOL: &str = "radiata.woooo.tech/protocols/observability-reap";
+  const REAP_PROTOCOL: &str = "example.org/protocols/observability-reap";
   const SEND_COUNT: usize = 8;
 
   let start_with_protocol = async |seed: u64| {
@@ -503,7 +503,7 @@ async fn finished_packet_pumps_are_reaped_from_the_task_set() {
       .send(
         StreamTarget::Exact(issuer_id.clone()),
         ProtocolTag::parse(REAP_PROTOCOL).unwrap(),
-        StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+        StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
         futures_util::stream::once(async move { Ok(chunk) }),
       )
       .await

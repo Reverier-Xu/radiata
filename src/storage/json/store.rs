@@ -168,8 +168,7 @@ impl StoreGuard {
       .canonicalize()
       .map_err(|_| Error::provider(ProviderErrorKind::Io, ProviderErrorContext::StorageOpen))?;
     if !canonical.is_dir() {
-      return Err(Error::provider(
-        ProviderErrorKind::StorageCorrupt,
+      return Err(super::super::storage_corrupt(
         ProviderErrorContext::StorageOpen,
       ));
     }
@@ -300,17 +299,12 @@ impl JsonStorage {
         .map_err(|error| map_io_error(error, ProviderErrorContext::StorageOpen))?;
       uuid
     } else {
-      let header = LockHeader::decode(&lock_bytes).map_err(|_| {
-        Error::provider(
-          ProviderErrorKind::StorageCorrupt,
-          ProviderErrorContext::StorageOpen,
-        )
-      })?;
+      let header = LockHeader::decode(&lock_bytes)
+        .map_err(|_| super::super::storage_corrupt(ProviderErrorContext::StorageOpen))?;
       match crate::hex::decode_array::<16>(&header.store_uuid, "json store uuid") {
         Ok(uuid) => uuid,
         Err(_) => {
-          return Err(Error::provider(
-            ProviderErrorKind::StorageCorrupt,
+          return Err(super::super::storage_corrupt(
             ProviderErrorContext::StorageOpen,
           ));
         }
@@ -463,8 +457,7 @@ impl JsonStorage {
       .canonical
       .join(format!("{file_stem}{GENERATION_SUFFIX}"));
     if final_path.exists() {
-      return Err(Error::provider(
-        ProviderErrorKind::StorageCorrupt,
+      return Err(super::super::storage_corrupt(
         ProviderErrorContext::StorageCommit,
       ));
     }

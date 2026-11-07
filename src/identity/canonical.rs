@@ -10,8 +10,8 @@
 //! strictness stay single-sourced.
 //!
 //! Byte stability is the hard contract: the generated paths must produce
-//! exactly the bytes of the frozen compatibility vectors and the
-//! per-record golden tests. Generated wire structs hold byte strings as
+//! exactly the bytes of the per-record golden tests. Generated wire
+//! structs hold byte strings as
 //! [`::minicbor::bytes::ByteVec`], which encodes and decodes identically
 //! to the previous `#[cbor(with = "minicbor::bytes")] Vec<u8>` shape.
 //!
@@ -89,7 +89,8 @@
 ///   `StoreRevision::new(Arc::from(..)?)`.
 /// - `oid16(W, ctx)`: encode `field.as_bytes().to_vec()`, decode
 ///   `W::from_operation(OperationId::from_bytes(..)?)`.
-/// - `stamp`: passthrough `u64`.
+/// - `stamp`: passthrough integer (the record declares the wire type; stamps
+///   are signed `i64` milliseconds).
 /// - `sig(ctx)`: encode `field.as_bytes().to_vec()`, decode
 ///   `Signature::from_bytes(fixed_bytes(.., ctx)?)`.
 macro_rules! canonical_record {

@@ -14,7 +14,7 @@ use radiata::{
   ActionHook, BoxFuture, CustomTaskSpec, Endpoint, Error, ErrorKind, EventOptions, EventReceive,
   ExtensionRegistry, LabelKey, LabelSet, LabelValue, NodeBuilder, NodeConfig, NodeHandle, PageSpec,
   QualifiedTag, ReconcileContext, ReconcileDecision, ResourceHook, ResourceLabels, ResourceName,
-  ResourceUri, ResourceWrite, Result, TaskChanged, TaskKind, TaskOutput, TaskPhase, TaskReconciler,
+  ResourceUri, ResourceWrite, Result, TaskChanged, TaskKind, TaskPhase, TaskReconciler,
   TaskTransition,
   extension::{KeyProvider, StorageFactory},
 };
@@ -28,14 +28,20 @@ const PROBE_KIND: &str = "example.org/tasks/v1/probe";
 /// One scripted step of the probe reconciler.
 #[derive(Clone, Copy, Debug)]
 enum Step {
-  /// Fails the attempt with the typed error.
+  /// Returns an error from the attempt.
   Fail,
+  /// Decides the attempt explicitly failed with the typed error.
+  FailDecision,
   /// Parks the attempt until the shared release flips true.
   Park,
   /// Panics inside the reconcile attempt.
   Panic,
   /// Completes the attempt.
   Succeed,
+  /// Completes the attempt with the caller's opaque output payload.
+  SucceedWithPayload,
+  /// Makes the explicit no-progress decision (the only re-arm path).
+  Retry,
 }
 
 /// Everything the tests observe of one probe reconciler: the attempt
@@ -78,11 +84,12 @@ impl TaskReconciler for ProbeReconciler {
         .contexts
         .lock()
         .unwrap()
-        .push((ctx.attempt, ctx.last_error.map(|error| error.kind())));
+        .push((ctx.attempt(), ctx.last_error().map(|error| error.kind())));
       match step {
-        // The extension schedule retries every error kind, so one
-        // public constructor exercises the whole ladder.
         Step::Fail => Err(Error::caller("probe step")),
+        Step::FailDecision => Ok(ReconcileDecision::Failed(radiata::TaskError::from_error(
+          Error::caller("probe decision"),
+        ))),
         Step::Park => {
           loop {
             if *release.borrow_and_update() {
@@ -96,6 +103,10 @@ impl TaskReconciler for ProbeReconciler {
         }
         Step::Panic => panic!("scripted reconcile panic"),
         Step::Succeed => Ok(ReconcileDecision::Succeeded),
+        Step::SucceedWithPayload => Ok(ReconcileDecision::SucceededWithOutput(
+          b"probe-payload".to_vec(),
+        )),
+        Step::Retry => Ok(ReconcileDecision::Retry),
       }
     })
   }
@@ -180,10 +191,7 @@ async fn lifecycle_phases_and_value_based_waits() {
   let mut events = node.watch::<TaskChanged>(EventOptions::new()).unwrap();
 
   let task = node.tasks().submit(probe_spec()).await.unwrap();
-  assert_eq!(
-    task.kind(),
-    &TaskKind::Extension(QualifiedTag::parse(PROBE_KIND).unwrap())
-  );
+  assert_eq!(task.kind(), &TaskKind::parse(PROBE_KIND).unwrap());
 
   // Admission then the first spawn: exactly one event per transition.
   let pending = next_changed(&mut events).await;
@@ -201,7 +209,7 @@ async fn lifecycle_phases_and_value_based_waits() {
   assert!(view.finished().is_none());
   assert!(view.error().is_none());
   assert!(view.output().is_none());
-  let status = task.status();
+  let status = task.status().expect("live task status");
   assert_eq!(status.phase(), TaskPhase::Running);
   assert_eq!(status.attempts(), 1);
 
@@ -214,19 +222,43 @@ async fn lifecycle_phases_and_value_based_waits() {
   // handle delivers the verb output and the accessor the terminal view.
   let view = node.tasks().wait(task.id().clone()).await.unwrap();
   assert_eq!(view.phase(), TaskPhase::Succeeded);
-  assert_eq!(view.output(), Some(&TaskOutput::Extension(())));
+  let output = view.output().expect("the custom task carries its output");
+  assert!(
+    output.bytes().is_empty(),
+    "a reconciler that returns no payload leaves the bytes empty"
+  );
   assert!(view.finished().is_some());
   let clone = task.clone();
   clone.wait().await.unwrap();
   // The handle's local snapshot stays readable after the wait consumed
   // it: the phase and attempts are table state, not wait state.
-  assert_eq!(task.status().phase(), TaskPhase::Succeeded);
+  assert_eq!(
+    task.status().expect("live task status").phase(),
+    TaskPhase::Succeeded
+  );
 
   // Unknown ids: `get` distinguishes absence, `wait` is typed not-found.
   let unknown = radiata::TaskId::parse("task-00000000000000000009z").unwrap();
   assert!(node.tasks().get(unknown.clone()).await.unwrap().is_none());
   let missing = node.tasks().wait(unknown).await.unwrap_err();
   assert_eq!(missing.kind(), ErrorKind::NotFound);
+  node.shutdown().await.unwrap();
+}
+
+/// A caller-defined kind's payload is the reconciler's own bytes: the
+/// task view carries them verbatim under the caller's tag, and the typed
+/// handle still resolves with the workflow's `()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_custom_reconcilers_output_bytes_reach_the_task_view() {
+  common::init_tracing();
+  let (extensions, _log, _release) = probe_extensions(vec![Step::SucceedWithPayload]);
+  let node = start_node(20, extensions, NodeConfig::new()).await;
+  let task = node.tasks().submit(probe_spec()).await.unwrap();
+  let view = node.tasks().wait(task.id().clone()).await.unwrap();
+  assert_eq!(view.phase(), TaskPhase::Succeeded);
+  let output = view.output().expect("the custom task carries its output");
+  assert_eq!(output.bytes(), b"probe-payload");
+  task.wait().await.unwrap();
   node.shutdown().await.unwrap();
 }
 
@@ -262,13 +294,13 @@ async fn list_reports_admission_order_with_keyset_pages() {
   node.shutdown().await.unwrap();
 }
 
-/// The bounded retry schedule drives a failed attempt again: every wake
-/// re-publishes `Running`, the attempt index climbs, and the previous
-/// attempt's typed error rides the context.
+/// The bounded retry schedule drives an explicitly `Retry`-ing attempt
+/// again: every wake re-publishes `Running`, the attempt index climbs,
+/// and the previous attempt's typed re-arm marker rides the context.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn extension_retries_republish_running_with_the_last_error() {
+async fn explicit_retry_decisions_republish_running_with_the_last_error() {
   common::init_tracing();
-  let (extensions, log, _release) = probe_extensions(vec![Step::Fail, Step::Fail, Step::Succeed]);
+  let (extensions, log, _release) = probe_extensions(vec![Step::Retry, Step::Retry, Step::Succeed]);
   let node = start_node(3, extensions, NodeConfig::new()).await;
   let mut events = node.watch::<TaskChanged>(EventOptions::new()).unwrap();
 
@@ -295,13 +327,14 @@ async fn extension_retries_republish_running_with_the_last_error() {
     ]
   );
   // The contexts: the first attempt has no predecessor error, every
-  // later attempt carries the previous typed failure.
+  // later attempt carries the re-arm marker the explicit decision
+  // rides.
   assert_eq!(
     *log.contexts.lock().unwrap(),
     vec![
       (1, None),
-      (2, Some(ErrorKind::CallerError)),
-      (3, Some(ErrorKind::CallerError))
+      (2, Some(ErrorKind::Overloaded)),
+      (3, Some(ErrorKind::Overloaded))
     ]
   );
   let view = node.tasks().get(task.id().clone()).await.unwrap().unwrap();
@@ -309,21 +342,118 @@ async fn extension_retries_republish_running_with_the_last_error() {
   node.shutdown().await.unwrap();
 }
 
-/// Exhausting the bounded schedule terminalizes the task with the last
-/// typed error; nothing retries past the bound.
+/// Exhausting the bounded schedule on explicit `Retry` decisions
+/// terminalizes the task with the re-arm marker; nothing retries past
+/// the bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn extension_exhaustion_fails_with_the_last_error() {
   common::init_tracing();
   let (extensions, _log, _release) =
-    probe_extensions(vec![Step::Fail, Step::Fail, Step::Fail, Step::Fail]);
+    probe_extensions(vec![Step::Retry, Step::Retry, Step::Retry, Step::Retry]);
   let node = start_node(4, extensions, NodeConfig::new()).await;
   let task = node.tasks().submit(probe_spec()).await.unwrap();
   let error = task.clone().wait().await.unwrap_err();
-  assert_eq!(error.kind(), ErrorKind::CallerError);
+  assert_eq!(error.kind(), ErrorKind::Overloaded);
   let view = node.tasks().get(task.id().clone()).await.unwrap().unwrap();
   assert_eq!(view.phase(), TaskPhase::Failed);
   assert_eq!(view.attempts(), 4);
-  assert_eq!(view.error().unwrap().kind(), ErrorKind::CallerError);
+  assert_eq!(view.error().unwrap().kind(), ErrorKind::Overloaded);
+  node.shutdown().await.unwrap();
+}
+
+/// A returned error terminalizes the task after exactly one attempt:
+/// only an explicit `Retry` decision re-arms the schedule, so a failed
+/// effect is never re-executed on the crate's own initiative (business
+/// retry belongs to the caller's re-submission).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconciler_error_terminalizes_without_retry() {
+  common::init_tracing();
+  let (extensions, log, _release) = probe_extensions(vec![Step::Fail]);
+  let node = start_node(21, extensions, NodeConfig::new()).await;
+  let task = node.tasks().submit(probe_spec()).await.unwrap();
+  let error = task.clone().wait().await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::CallerError);
+  assert_eq!(error.context(), "probe step");
+  let view = node.tasks().get(task.id().clone()).await.unwrap().unwrap();
+  assert_eq!(view.phase(), TaskPhase::Failed);
+  assert_eq!(view.attempts(), 1);
+  assert_eq!(*log.contexts.lock().unwrap(), vec![(1, None)]);
+  node.shutdown().await.unwrap();
+}
+
+/// The explicit `Failed` decision terminalizes the task carrying its
+/// error — the typed, non-exceptional form of a business-level terminal
+/// failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_decision_carries_the_error() {
+  common::init_tracing();
+  let (extensions, _log, _release) = probe_extensions(vec![Step::FailDecision]);
+  let node = start_node(22, extensions, NodeConfig::new()).await;
+  let task = node.tasks().submit(probe_spec()).await.unwrap();
+  let error = task.clone().wait().await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::CallerError);
+  assert_eq!(error.context(), "probe decision");
+  let view = node.tasks().get(task.id().clone()).await.unwrap().unwrap();
+  assert_eq!(view.phase(), TaskPhase::Failed);
+  assert_eq!(view.attempts(), 1);
+  assert_eq!(view.error().unwrap().as_str(), "probe decision");
+  node.shutdown().await.unwrap();
+}
+
+const NESTED_KIND: &str = "example.org/tasks/v1/nested";
+
+/// The same-class nested-submit reconciler: it submits its own kind
+/// through the handle and turns the outcome into its decision.
+#[derive(Debug)]
+struct NestedSubmitReconciler;
+
+impl TaskReconciler for NestedSubmitReconciler {
+  fn reconcile<'a>(&'a self, ctx: ReconcileContext) -> BoxFuture<'a, Result<ReconcileDecision>> {
+    Box::pin(async move {
+      let spec = CustomTaskSpec::new(ctx.spec().kind().clone(), LabelSet::new());
+      match ctx.handle().tasks().submit(spec).await {
+        // The same-class nested submit is the typed refusal, never a
+        // deadlock: the attempt completes on it.
+        Err(error) if error.kind() == ErrorKind::Conflict => Ok(ReconcileDecision::Succeeded),
+        Err(error) => Ok(ReconcileDecision::Failed(radiata::TaskError::from_error(
+          error,
+        ))),
+        Ok(_) => Ok(ReconcileDecision::Failed(radiata::TaskError::from_error(
+          Error::caller("nested submit was admitted"),
+        ))),
+      }
+    })
+  }
+}
+
+/// The nested-submit refusal: a reconciler awaiting another task of its
+/// own slot class would self-deadlock on the extension channel's bounded
+/// budget, so the admission refuses the same-class nested submission
+/// typed instead. The reconciler observes the conflict and completes —
+/// which only the refusal (never a deadlock, never an admission) allows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_class_nested_submit_is_refused_typed() {
+  common::init_tracing();
+  let mut extensions = ExtensionRegistry::new();
+  extensions
+    .register_task_reconciler(
+      QualifiedTag::parse(NESTED_KIND).unwrap(),
+      Arc::new(NestedSubmitReconciler),
+    )
+    .unwrap();
+  let node = start_node(23, extensions, NodeConfig::new()).await;
+  let task = node
+    .tasks()
+    .submit(CustomTaskSpec::new(
+      QualifiedTag::parse(NESTED_KIND).unwrap(),
+      LabelSet::new(),
+    ))
+    .await
+    .unwrap();
+  let () = tokio::time::timeout(Duration::from_secs(30), task.wait())
+    .await
+    .expect("the nested submit must be refused, never deadlocked")
+    .expect("the reconciler completes on the typed refusal");
   node.shutdown().await.unwrap();
 }
 
@@ -412,9 +542,9 @@ async fn terminal_history_eviction_shapes_get_wait_and_status() {
   );
   let evicted = node.tasks().wait(first.id().clone()).await.unwrap_err();
   assert_eq!(evicted.kind(), ErrorKind::NotFound);
-  let status = first.status();
-  assert_eq!(status.phase(), TaskPhase::Pending);
-  assert_eq!(status.attempts(), 0);
+  // Eviction is absence, not a fabricated fresh admission: the handle's
+  // local status reads `None` exactly like `tasks().get`.
+  assert!(first.status().is_none());
   let view = node.tasks().get(last.id().clone()).await.unwrap().unwrap();
   assert_eq!(view.phase(), TaskPhase::Succeeded);
   node.shutdown().await.unwrap();
@@ -423,10 +553,10 @@ async fn terminal_history_eviction_shapes_get_wait_and_status() {
 /// The issued credential secret is delivered exactly once: the typed
 /// handle is the only carrier of the secret (a credential task is
 /// deliberately not cloneable — the amendment's once-only slot), the
-/// accessor's wait and views observe only the expiry, and the handle's
-/// local snapshot stays readable after the delivery. A second handle
-/// cannot exist for this kind, so the once-only slot is pinned by the
-/// secret's own non-clonability.
+/// accessor's wait and views observe only the non-secret payload, and
+/// the handle's local snapshot stays readable after the delivery. A
+/// second handle cannot exist for this kind, so the once-only slot is
+/// pinned by the secret's own non-clonability.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn credential_secret_is_delivered_exactly_once() {
   common::init_tracing();
@@ -434,25 +564,28 @@ async fn credential_secret_is_delivered_exactly_once() {
 
   let task = node.credentials().issue().await.unwrap();
   // The accessor wait never touches the secret slot: it resolves with
-  // the terminal view carrying the expiry observation only.
+  // the terminal view carrying the encoded expiry observation only.
   let view = node.tasks().wait(task.id().clone()).await.unwrap();
   assert_eq!(view.phase(), TaskPhase::Succeeded);
-  let TaskOutput::IssueCredential(observed) = view.output().unwrap() else {
-    panic!("credential task must carry the expiry observation");
-  };
-  assert!(observed.expires_at() > std::time::SystemTime::now());
+  let observed = view
+    .output()
+    .expect("credential task must carry the expiry observation");
+  assert!(
+    !observed.bytes().is_empty(),
+    "the expiry observation is encoded in the payload"
+  );
 
   // The single typed wait collects the secret; the table keeps only the
   // observation afterwards.
   let task_id = task.id().clone();
   let issued = task.wait().await.unwrap();
-  assert_eq!(issued.expires_at(), observed.expires_at());
+  assert!(issued.expires_at() > std::time::SystemTime::now());
   assert!(!issued.credential().expose_secret().is_empty());
   let view = node.tasks().get(task_id).await.unwrap().unwrap();
-  assert!(matches!(
-    view.output(),
-    Some(TaskOutput::IssueCredential(later)) if later.expires_at() == observed.expires_at()
-  ));
+  assert!(
+    view.output().is_some(),
+    "the terminal payload stays readable after the secret is collected"
+  );
   node.shutdown().await.unwrap();
 }
 
@@ -481,7 +614,7 @@ async fn connect_coalesces_identical_in_flight_submissions() {
   );
   let joined = node.connect(endpoint.clone(), peer.clone()).await.unwrap();
   assert_eq!(joined.id(), first.id());
-  assert_eq!(joined.kind(), &TaskKind::Connect);
+  assert_eq!(joined.kind(), &TaskKind::CONNECT);
   // A distinct endpoint is a different intent for the same subject:
   // admission refuses it instead of smuggling it onto the dial.
   let other = Endpoint::parse(&format!("wss://127.0.0.1:{}", silent.port + 1)).unwrap();
@@ -1069,8 +1202,8 @@ impl KeyProvider for LeaveCapableKeys {
 
 /// A never-returning action hook neither occupies an execution slot nor
 /// delays the leave shutdown. The node runs with a single local slot:
-/// the task after the wedged observation must still run (under the old
-/// in-body observation, the wedged hook pinned the slot forever), and a
+/// the task after the wedged observation must still run (an in-body
+/// observation would pin the slot forever behind the wedged hook), and a
 /// leave whose observation wedges must still replace the identity and
 /// stop the node with the ActiveLeave reason (the signal is driven by
 /// the task table's terminal phase, not by the hook chain).

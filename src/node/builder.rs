@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
-  ExtensionRegistry, NodeConfig, NodeHandle, Result, TransportScheme,
+  ExtensionRegistry, NodeConfig, NodeHandle, Result,
   api::{Entropy, SystemEntropy},
   provider::{KeyProvider, StorageFactory},
   runtime::{RuntimeDependencies, spawn_runtime},
-  transport::registry::builtin_transport_tag,
 };
 
 pub struct NodeBuilder {
@@ -59,49 +58,14 @@ impl NodeBuilder {
 
   pub async fn start(self) -> Result<NodeHandle> {
     let mut extensions = self.extensions;
-    // The built-in transports seed the registry when their tags are
-    // still free: the direct TLS transport is the default choice, the
-    // WebSocket transport covers firewall-traversal deployments, and the
-    // plaintext transport serves closed intranet segments with
-    // constrained IoT devices. An explicit caller override installed
-    // through `ExtensionRegistry::override_builtin_transport` occupies
-    // the tag first, so the seeding skips that scheme and the override
-    // serves every dial and listen addressed to the built-in form; dial
-    // and listen resolve their transport from the endpoint's selector
-    // through the registry at runtime.
-    for (tag, transport) in [
-      (
-        builtin_transport_tag(TransportScheme::Tls)?,
-        Arc::new(crate::transport::tls_transport::TlsTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-      (
-        builtin_transport_tag(TransportScheme::Wss)?,
-        Arc::new(crate::transport::wss::WssTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-      (
-        builtin_transport_tag(TransportScheme::Tcp)?,
-        Arc::new(crate::transport::plain::PlainTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-    ] {
-      if extensions.transport(&tag).is_none() {
-        extensions.register_builtin_transport(tag, transport)?;
-      }
-    }
-    // The built-in next-hop policy is the default route policy: a node
-    // without a caller-selected tag relays through it, so multi-hop
-    // routes work out of the box. As with the transport, a caller
-    // registration for the same tag is a conflict, so only add it when
-    // absent.
-    let next_hop_tag = crate::routing::DefaultNextHop::tag()?;
-    if extensions.next_hop_policy(&next_hop_tag).is_none() {
-      extensions.register_next_hop(
-        next_hop_tag,
-        std::sync::Arc::new(crate::routing::DefaultNextHop),
-      )?;
-    }
+    // The official transports, core routing policies, the built-in load
+    // balancer, and the core feature definitions are installed explicitly.
+    // The transports keep their own insertion rule (an explicit
+    // registration survives the default pass); a caller claim on a core
+    // routing entry conflicts, so a caller names its own tag instead.
+    // Dial and listen resolve their transport from the endpoint's
+    // selector through the registry at runtime.
+    extensions.register_default()?;
     let extensions = Arc::new(extensions);
     let events = Arc::new(crate::node::EventHub::new());
     let (revision_tx, revision_rx) = tokio::sync::watch::channel(0_u64);

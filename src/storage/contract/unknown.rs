@@ -96,7 +96,6 @@ fn storage_contract_capability_refusal_checks_each_phase_a_requirement() {
       .unwrap_err();
     assert_eq!(error.kind(), crate::ErrorKind::UnsupportedCapability);
   }
-  assert!(!StoreRequirements::metadata().requires_transactional_migration());
   assert!(
     runtime
       .block_on(ReferenceFactory::new(required_capabilities()).open(StoreRequirements::metadata()))

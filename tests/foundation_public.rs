@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use radiata::{
   BoxFuture, CommitOutcome, CommitReceipt, CreatedKey, Digest, DurabilityLevel, Error,
-  KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId, ProviderErrorContext,
-  ProviderErrorKind, PublicKey, QualifiedTag, ReconcileOutcome, Result, Signature,
-  StoreCapabilities, StoreEntry, StoreExpectation, StoreKey, StoreNamespace, StoreOperation,
-  StoreRequirements, StoreRevision, StoreTransaction, StoreValue, TransactionId,
+  KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId, OperationId,
+  ProviderErrorContext, ProviderErrorKind, PublicKey, QualifiedTag, ReconcileOutcome, Result,
+  Signature, StoreCapabilities, StoreEntry, StoreExpectation, StoreKey, StoreNamespace,
+  StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue, TransactionId,
   extension::{KeyProvider, Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
 
@@ -134,6 +134,17 @@ impl StorageFactory for DummyFactory {
       Ok(Box::new(DummyStorage) as Box<dyn Storage>)
     })
   }
+}
+
+#[test]
+fn core_operation_id_round_trips_through_its_public_bytes() {
+  let bytes = [0x5A; 16];
+  let operation = OperationId::from_bytes(bytes);
+  assert_eq!(operation.as_bytes(), &bytes);
+  assert_eq!(OperationId::from_bytes(*operation.as_bytes()), operation);
+  assert_ne!(OperationId::from_bytes([0x5B; 16]), operation);
+  // The value is opaque in diagnostics: the bytes never render.
+  assert_eq!(format!("{operation:?}"), "OperationId(..)");
 }
 
 #[test]

@@ -580,7 +580,7 @@ mod tests {
     let bytes = fs::read(&path).unwrap();
     assert_eq!(bytes, artifact.as_bytes());
     assert!(bytes.len() <= MAX_ARTIFACT_BYTES);
-    assert!(bytes.starts_with(b"{\"schema\":\"radiata.woooo.tech/schemas/failure-replay\""));
+    assert!(bytes.starts_with(b"{\"schema\":\"radiata.woooo.tech/schemas/v1/failure-replay\""));
     assert!(bytes.ends_with(b"}"));
     assert_eq!(
       path.file_name().and_then(|value| value.to_str()),

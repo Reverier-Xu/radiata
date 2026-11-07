@@ -85,7 +85,7 @@ pub fn persisted_decode(input: &[u8]) {
   let _ = decode_trace_record(input);
   let _ = PendingTransactionV1::decode(input);
   // The migration schema-record grammar is byte-framed: kind byte, tag
-  // length, tag text, optional 32-byte digest.
+  // length, tag text; every other shape fails closed.
   let _ = decode_schema_record(&crate::StoreValue::new(std::sync::Arc::from(input)));
 }
 
@@ -438,9 +438,9 @@ pub fn admission(input: &[u8]) {
 
 /// The routing target: derived transition
 /// sequences over the route envelope preserve authenticated holder
-/// selection, one checked next hop, monotone budget drain, duplicate-free
-/// visited chains, and explicit termination; every rejection is a typed
-/// error, never a panic.
+/// selection, one checked next hop per carried path entry, monotone budget
+/// drain, and explicit termination; every rejection is a typed error,
+/// never a panic.
 pub fn routing(input: &[u8]) -> Option<()> {
   let pool: Vec<NodeId> = (1_u8..=8)
     .map(|index| NodeId::parse(&format!("node-{index:021}")))
@@ -449,29 +449,45 @@ pub fn routing(input: &[u8]) -> Option<()> {
   let node = |byte: u8| pool[usize::from(byte) % pool.len()].clone();
   let trace = TraceId::parse("trace-000000000000000000001").ok()?;
   let max_hops = u32::from(bytes_at(input, 0) % 8) + 1;
+  let destination = node(bytes_at(input, 2));
+  // A generated path that ends at the destination, so the envelope is
+  // well-formed; a path of length zero exercises the planning branch.
+  let path: Vec<NodeId> = (0..usize::from(bytes_at(input, 3) % 4))
+    .map(|offset| node(bytes_at(input, 4 + offset)))
+    .collect();
   let mut context = RouteContext::new(
     trace,
     node(bytes_at(input, 1)),
-    node(bytes_at(input, 2)),
+    destination.clone(),
+    path,
     max_hops,
   );
-  let mut step = 3_usize;
+  // The envelope as the first hop receives it: the origin's dispatch takes
+  // the plan's head as the first hop and carries the tail. An empty plan
+  // stays as it is — the unlearned fallback envelope the next holder plans
+  // from.
+  if let Ok((_, dispatched)) = context.clone().dispatch() {
+    context = dispatched;
+  }
+  let mut step = 8_usize;
   while step + 3 <= input.len() {
     let local = node(bytes_at(input, step));
     let peer = node(bytes_at(input, step + 1));
     let next_byte = bytes_at(input, step + 2);
-    let choose = |_: &RouteContext| -> crate::Result<NodeId> {
+    let planned = destination.clone();
+    let plan = |_: &RouteContext| -> crate::Result<Vec<NodeId>> {
       if next_byte == 0xFF {
         return Err(crate::Error::invalid_input("no next hop"));
       }
-      Ok(node(next_byte % 0xFF))
+      Ok(vec![planned.clone()])
     };
-    // `receive` consumes the envelope; keep a clone for the oracle
+    // `receive` consumes the envelope; keep the pre-state for the oracle
     // assertions below.
     let before = context.clone();
-    let remaining_before = before.hop_state().remaining_hops;
+    let remaining_before = before.remaining_hops();
     let visited_before = before.visited().len();
-    match before.receive(&local, &peer, choose) {
+    let path_before = before.path().to_vec();
+    match before.receive(&local, &peer, plan) {
       Ok(RouteProgress::Arrive) => {
         if context.destination() != &local {
           panic!("Arrive at a non-destination");
@@ -483,26 +499,34 @@ pub fn routing(input: &[u8]) -> Option<()> {
         context: advanced,
       }) => {
         // The forwarded envelope is a fresh route state: the previous
-        // holder joins the visited chain once and the budget drains once.
-        if advanced.hop_state().remaining_hops + 1 != remaining_before {
+        // holder joins the visited chain once, the budget drains once, and
+        // the remaining path loses exactly the head it followed.
+        if advanced.remaining_hops() + 1 != remaining_before {
           panic!("route budget did not drain exactly once");
         }
         if advanced.visited().len() != visited_before + 1 {
           panic!("the visited chain did not grow by exactly one holder");
         }
-        let mut seen = std::collections::BTreeSet::new();
-        for holder in advanced.visited() {
-          if !seen.insert(holder) || holder == advanced.current() {
-            panic!("visited chain has a duplicate or includes the current holder");
-          }
+        let expected: Vec<NodeId> = if path_before.is_empty() {
+          Vec::new()
+        } else {
+          path_before[1..].to_vec()
+        };
+        if advanced.path() != expected.as_slice() {
+          panic!("the remaining path does not follow the route it walked");
         }
-        if next_hop == local || next_hop == *advanced.current() {
-          panic!("the next hop loops back to the holder or the local node");
+        if path_before.is_empty() && next_hop != destination {
+          panic!("a planned hop must be the plan's head");
+        }
+        if let Some(head) = path_before.first()
+          && next_hop != *head
+        {
+          panic!("a carried path's hop must be its head");
         }
         context = advanced;
       }
       Err(error) => {
-        // Every rejection is a typed error (Conflict/InvalidInput/
+        // Every rejection is a typed error (InvalidInput/
         // NotTrusted/ResourceExhausted), never a panic.
         let _ = error.kind();
         break;

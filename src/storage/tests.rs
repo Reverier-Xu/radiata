@@ -79,15 +79,13 @@ impl StoreSnapshot for EmptySnapshot {
   ) -> BoxFuture<'a, Result<Option<StoreValue>>> {
     Box::pin(async move {
       // The scripted store presents the production schema baseline, so
-      // the open-time migration pass takes its idempotent Current path
-      // and the scripted commits stay reserved for the test's own
-      // transactions.
+      // the open-time schema gate accepts it without writing, and the
+      // scripted commits stay reserved for the test's own transactions.
       let schema = crate::storage::migration::schema_namespace()?;
       if namespace == &schema && key == &crate::storage::migration::schema_key() {
         return Ok(Some(crate::storage::migration::encode_schema_record(
           crate::storage::migration::BASE_RECORD_KIND,
           crate::storage::migration::METADATA_SCHEMA_V1,
-          None,
         )));
       }
       Ok(None)
@@ -556,6 +554,93 @@ async fn journal_recovery_unfreeze_skips_a_slot_that_moved_on() {
   }
   store.finish_journal_recovery(&resolved).unwrap();
   assert!(matches!(*store.lock_state().unwrap(), CommitState::Ready));
+}
+
+/// Captures the emitted log lines of one test thread (see
+/// `tracing::subscriber::set_default`), so a diagnostic can be asserted
+/// without a process-global subscriber.
+#[derive(Clone, Default)]
+struct LogCapture {
+  buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for LogCapture {
+  fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+    self
+      .buffer
+      .lock()
+      .map_err(|_| std::io::Error::other("log capture"))?
+      .extend_from_slice(bytes);
+    Ok(bytes.len())
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> {
+    Ok(())
+  }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+  type Writer = Self;
+
+  fn make_writer(&self) -> Self::Writer {
+    self.clone()
+  }
+}
+
+/// A settled freeze (frozen with no provider call in flight) never clears
+/// on its own, so a commit against it parks the whole entry bound and then
+/// surfaces `NotReady`. The diagnostic names the pending transaction
+/// exactly once per commit attempt — not once per entry retry — so the
+/// field report says which transaction needs the reconcile.
+#[tokio::test]
+async fn settled_freeze_commit_entry_warns_once_and_surfaces_not_ready() {
+  let (store, state) = scripted(vec![], vec![]).await;
+  let settled = PendingCommit {
+    transaction: transaction_id(9),
+    digest: Digest::from_bytes([9; 32]),
+    journal_proven: false,
+  };
+  {
+    let mut slot = store.lock_state().unwrap();
+    *slot = CommitState::Frozen {
+      pending: settled.clone(),
+      provider_call_active: false,
+    };
+  }
+  let capture = LogCapture::default();
+  let _guard = tracing::subscriber::set_default(
+    tracing_subscriber::fmt()
+      .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=warn"))
+      .with_ansi(false)
+      .with_writer(capture.clone())
+      .finish(),
+  );
+
+  let error = store.commit(transaction(1)).await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::NotReady);
+  assert_eq!(state.commit_calls.load(Ordering::SeqCst), 0);
+  assert!(matches!(
+    *store.lock_state().unwrap(),
+    CommitState::Frozen {
+      provider_call_active: false,
+      ..
+    }
+  ));
+
+  let logs = String::from_utf8(capture.buffer.lock().unwrap().clone()).unwrap();
+  assert_eq!(
+    logs.matches("frozen on a settled commit").count(),
+    1,
+    "one diagnostic per commit attempt: {logs}"
+  );
+  assert!(
+    logs.contains(settled.transaction.as_str()),
+    "the diagnostic names the pending transaction: {logs}"
+  );
+  assert!(
+    logs.contains("needs reconcile"),
+    "the diagnostic names the required action: {logs}"
+  );
 }
 
 async fn scripted(

@@ -9,8 +9,7 @@ use std::{
 
 use tokio::sync::watch;
 
-use super::stream::clock_seconds;
-use crate::routing::forward::{PendingAck, PendingAcks};
+use super::{pending::PendingAdmissions, stream::clock_seconds};
 
 /// Enforces the session liveness policy on host wall time:
 /// a session with no authenticated traffic or owned in-flight work for the
@@ -19,7 +18,7 @@ use crate::routing::forward::{PendingAck, PendingAcks};
 /// rollback or freeze delays both deadlines and a forward jump makes them
 /// immediately due.
 pub(super) async fn liveness_observer(
-  last_activity: &Arc<std::sync::atomic::AtomicU64>, pending_acks: &PendingAcks,
+  last_activity: &Arc<std::sync::atomic::AtomicU64>, pending_acks: &PendingAdmissions,
   clock: Arc<dyn crate::time::WallClock>, idle_timeout: Duration, keepalive_interval: Duration,
   keepalive_timeout: Duration, ping_tx: &watch::Sender<()>,
 ) {
@@ -58,27 +57,16 @@ pub(super) async fn liveness_observer(
     // outstanding for a full idle deadline, a silent peer no longer
     // exempts the session from the idle close (which then fails every
     // pending admission explicitly with StreamInterrupted).
-    let holds_session = pending_acks
-      .lock()
-      .map(|pending| {
-        if pending.is_empty() {
-          return false;
-        }
-        let oldest_wait = pending
-          .values()
-          .filter_map(|entry| match entry {
-            PendingAck::Wait { queued_at, .. } => Some(*queued_at),
-            PendingAck::Relay { .. } => None,
-          })
-          .min();
-        match oldest_wait {
-          Some(oldest) => now.saturating_sub(oldest) < idle_timeout.as_secs(),
-          // Pure forwarding hops are bounded transitively by the liveness
-          // policies of the sessions on both ends of the relay.
-          None => true,
-        }
-      })
-      .unwrap_or(false);
+    let holds_session = if pending_acks.is_empty() {
+      false
+    } else {
+      match pending_acks.oldest_wait() {
+        Some(oldest) => now.saturating_sub(oldest) < idle_timeout.as_secs(),
+        // Pure forwarding hops are bounded transitively by the liveness
+        // policies of the sessions on both ends of the relay.
+        None => true,
+      }
+    };
     // Idle close only when no owned in-flight work remains (or it went stale).
     if !idle_timeout.is_zero()
       && !holds_session
@@ -112,9 +100,8 @@ pub(super) async fn liveness_observer(
 #[cfg(test)]
 mod liveness_tests {
   use std::{
-    collections::HashMap,
     sync::{
-      Arc, Mutex,
+      Arc,
       atomic::{AtomicU64, Ordering},
     },
     time::{Duration, UNIX_EPOCH},
@@ -122,11 +109,11 @@ mod liveness_tests {
 
   use tokio::sync::{oneshot, watch};
 
-  use super::{PendingAcks, liveness_observer};
-  use crate::storage::contract::helpers::ManualClock;
+  use super::liveness_observer;
+  use crate::{session::pending::PendingAdmissions, storage::contract::helpers::ManualClock};
 
-  fn no_pending() -> PendingAcks {
-    Arc::new(Mutex::new(HashMap::new()))
+  fn no_pending() -> PendingAdmissions {
+    PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS)
   }
 
   /// While host wall time advances normally, only sessions without
@@ -140,7 +127,7 @@ mod liveness_tests {
     let (ping_tx, _) = watch::channel(());
     let handle = tokio::spawn({
       let last_activity = Arc::clone(&last_activity);
-      let pending = Arc::clone(&pending);
+      let pending = pending.clone();
       let clock = clock.clone();
       let ping_tx = ping_tx.clone();
       async move {
@@ -166,7 +153,7 @@ mod liveness_tests {
     let held = no_pending();
     let held_handle = tokio::spawn({
       let last_activity = Arc::clone(&last_activity);
-      let held = Arc::clone(&held);
+      let held = held.clone();
       let clock = clock.clone();
       let ping_tx = ping_tx.clone();
       async move {
@@ -202,7 +189,7 @@ mod liveness_tests {
     let pending = no_pending();
     let handle = tokio::spawn({
       let last_activity = Arc::clone(&last_activity);
-      let pending = Arc::clone(&pending);
+      let pending = pending.clone();
       let clock = clock.clone();
       let ping_tx = ping_tx.clone();
       async move {
@@ -240,7 +227,7 @@ mod liveness_tests {
     let pending = no_pending();
     let handle = tokio::spawn({
       let last_activity = Arc::clone(&last_activity);
-      let pending = Arc::clone(&pending);
+      let pending = pending.clone();
       let clock = clock.clone();
       let ping_tx = ping_tx.clone();
       async move {
@@ -269,7 +256,7 @@ mod liveness_tests {
     handle.await.unwrap();
   }
 
-  /// Regression (audit finding 5): the close deadline must key on an
+  /// Regression: the close deadline must key on an
   /// outstanding probe, not on the ping send cadence. With the wall clock
   /// advancing one tick at a time — no jump the send branch could hide
   /// behind — a peer that never answers must still be closed by the
@@ -283,7 +270,7 @@ mod liveness_tests {
     let pending = no_pending();
     let handle = tokio::spawn({
       let last_activity = Arc::clone(&last_activity);
-      let pending = Arc::clone(&pending);
+      let pending = pending.clone();
       let clock = clock.clone();
       let ping_tx = ping_tx.clone();
       async move {
@@ -338,7 +325,7 @@ mod liveness_tests {
     let pending = no_pending();
     let handle = tokio::spawn({
       let last_activity = Arc::clone(&last_activity);
-      let pending = Arc::clone(&pending);
+      let pending = pending.clone();
       let clock = clock.clone();
       let ping_tx = ping_tx.clone();
       async move {
@@ -391,7 +378,7 @@ mod liveness_tests {
     let pending = no_pending();
     let handle = tokio::spawn({
       let last_activity = Arc::clone(&last_activity);
-      let pending = Arc::clone(&pending);
+      let pending = pending.clone();
       let clock = clock.clone();
       let ping_tx = ping_tx.clone();
       async move {
@@ -432,18 +419,20 @@ mod liveness_tests {
     let pending = no_pending();
     {
       let (notify, _wait) = oneshot::channel();
-      pending.lock().unwrap().insert(
-        crate::TraceId::parse("trace-000000000000000000001").unwrap(),
-        super::PendingAck::Wait {
-          notify,
-          queued_at: 100,
-        },
-      );
+      pending
+        .try_reserve_admission(
+          &crate::TraceId::parse("trace-000000000000000000001").unwrap(),
+          crate::routing::forward::PendingAck::Wait {
+            notify,
+            queued_at: 100,
+          },
+        )
+        .unwrap();
     }
     let (ping_tx, _) = watch::channel(());
     let handle = tokio::spawn({
       let last_activity = Arc::clone(&last_activity);
-      let pending = Arc::clone(&pending);
+      let pending = pending.clone();
       let clock = clock.clone();
       let ping_tx = ping_tx.clone();
       async move {

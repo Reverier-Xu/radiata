@@ -22,7 +22,10 @@ use std::sync::Arc;
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
-use super::{canonical::canonical_record, records::TerminalWinner};
+use super::{
+  canonical::canonical_record,
+  records::{FLAT_RECORD_LIMITS, TerminalWinner},
+};
 /// The durable namespace of revocation records.
 pub(crate) use crate::storage::families::REVOCATION_NAMESPACE;
 use crate::{
@@ -36,15 +39,11 @@ pub(crate) const REVOCATION_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1
 pub(crate) const REVOCATION_RECORD_DOMAIN: &[u8] =
   b"radiata.woooo.tech/crypto/v1/revocation-record";
 
-/// Canonical-decoder bounds for the flat revocation record.
-const REVOCATION_LIMITS: crate::protocol::CborLimits =
-  crate::protocol::CborLimits::new(1, 8, 1_024);
-
 canonical_record! {
   wire RevocationRecordWire for RevocationRecordV1 vis [pub(crate)] {
     schema REVOCATION_RECORD_SCHEMA,
     version u16 1,
-    limits REVOCATION_LIMITS,
+    limits FLAT_RECORD_LIMITS,
     decode [strict remap "revocation record", canonical "revocation record canonical form", header_err "revocation record schema"]
     fields {
       #[n(2)] subject = subject: String => node()
@@ -662,7 +661,7 @@ mod tests {
   /// replaces the loser through the merge, a local re-revoke against a
   /// winning foreign record reports the idempotent already-revoked
   /// outcome instead of the old perpetual conflict, and the binding
-  /// stays revoked under the pinned key either way (audit A01).
+  /// stays revoked under the pinned key either way.
   #[tokio::test]
   async fn revocations_from_partitioned_issuers_converge_on_the_canonical_winner() {
     let (low_node, low_signing, low_key) = foreign_issuer("node-000000000000000000001", 0x21);
@@ -782,7 +781,7 @@ mod tests {
   }
 
   /// The merge never launders a different binding: a stored record
-  /// pinning another subject key still fails closed (audit A01).
+  /// pinning another subject key still fails closed.
   #[tokio::test]
   async fn revocations_over_different_bindings_still_fail_closed() {
     let store = open_store().await;

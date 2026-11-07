@@ -56,7 +56,9 @@ use crate::{
 /// intent protocol.
 #[derive(Debug)]
 pub(crate) struct LocalIdentityContext {
-  store: MetadataStore,
+  /// The metadata store, shared so an outliving reader (the resource feed
+  /// watch) can hold the same store handle the runtime commits through.
+  store: Arc<MetadataStore>,
   identity: LocalIdentityV1,
   /// The custody provider this identity was opened against: the caller
   /// injection, or the default store-backed provider assembled over the
@@ -66,8 +68,14 @@ pub(crate) struct LocalIdentityContext {
 }
 
 impl LocalIdentityContext {
-  pub(crate) const fn store(&self) -> &MetadataStore {
-    &self.store
+  pub(crate) fn store(&self) -> &MetadataStore {
+    self.store.as_ref()
+  }
+
+  /// The shared store handle for a reader that outlives one call (the
+  /// resource feed watch): the same store, one exclusive provider lock.
+  pub(crate) fn store_handle(&self) -> Arc<MetadataStore> {
+    Arc::clone(&self.store)
   }
 
   pub(crate) const fn identity(&self) -> &LocalIdentityV1 {
@@ -173,6 +181,7 @@ pub(crate) async fn open_local_identity(
   let (store, recovered) =
     MetadataStore::open_pending_recovered(factory, receipt_retention, LOCAL_IDENTITY_PURPOSE)
       .await?;
+  let store = Arc::new(store);
   if recovered.is_some() {
     reconcile_recovered_journal(&store).await?;
     let permit = store.write_permit().await;
@@ -234,11 +243,11 @@ pub(crate) async fn reconcile_recovered_journal(store: &MetadataStore) -> Result
 /// (returns `false`). Runs inside the caller's writer section, whose
 /// permit it receives.
 pub(crate) async fn recover_journal_prologue(
-  _permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, purpose: &str,
+  permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, purpose: &str,
   context: &'static str,
 ) -> Result<bool> {
   if store.resolve_pending_journal(purpose).await? {
-    cleanup_pending_exact(_permit, store, entropy, purpose, context).await?;
+    cleanup_pending_exact(permit, store, entropy, purpose, context).await?;
     return Ok(true);
   }
   store.reconcile_if_frozen().await?;
@@ -350,7 +359,7 @@ async fn discover_key_creation_intent(
 /// Loads a persisted identity only when the provider returns the exact
 /// persisted public key for the persisted handle.
 async fn load_existing_identity(
-  store: MetadataStore, keys: &Arc<dyn KeyProvider>, identity: LocalIdentityV1,
+  store: Arc<MetadataStore>, keys: &Arc<dyn KeyProvider>, identity: LocalIdentityV1,
 ) -> Result<LocalIdentityContext> {
   verify_provider_key(keys, identity.handle(), identity.public_key()).await?;
   Ok(LocalIdentityContext {
@@ -364,7 +373,7 @@ async fn load_existing_identity(
 /// intent with its own receipt reference, reconcile an unknown intent commit
 /// exactly once, then ask the provider to create the key.
 async fn create_identity(
-  store: MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
+  store: Arc<MetadataStore>, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
   snapshot: Box<dyn StoreSnapshot>,
 ) -> Result<LocalIdentityContext> {
   let node = NodeId::generate(entropy)?;
@@ -409,8 +418,8 @@ async fn create_identity(
 /// Resumes creation from a persisted intent: reconcile the provider
 /// operation first, creating only when the provider proves the key absent.
 async fn resume_identity_creation(
-  store: MetadataStore, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy, stored: StoreValue,
-  intent: KeyCreationIntentV1,
+  store: Arc<MetadataStore>, keys: &Arc<dyn KeyProvider>, entropy: &dyn Entropy,
+  stored: StoreValue, intent: KeyCreationIntentV1,
 ) -> Result<LocalIdentityContext> {
   let created = match keys.reconcile_create(intent.operation()).await? {
     KeyCreateState::Present(created) => {
@@ -470,7 +479,7 @@ pub(crate) async fn verify_provider_key(
 /// proven abort is accepted only when a fresh snapshot shows the exact final
 /// state.
 async fn finalize_identity(
-  store: MetadataStore, keys: Arc<dyn KeyProvider>, entropy: &dyn Entropy,
+  store: Arc<MetadataStore>, keys: Arc<dyn KeyProvider>, entropy: &dyn Entropy,
   intent: KeyCreationIntentV1, stored_intent: StoreValue, created: CreatedKey,
 ) -> Result<LocalIdentityContext> {
   let identity = LocalIdentityV1::new(
@@ -560,10 +569,7 @@ async fn accept_exact_final_state(store: &MetadataStore, expected: &LocalIdentit
 }
 
 pub(crate) fn discovery_corrupt() -> Error {
-  Error::provider(
-    ProviderErrorKind::StorageCorrupt,
-    ProviderErrorContext::StorageSnapshot,
-  )
+  crate::storage::storage_corrupt(ProviderErrorContext::StorageSnapshot)
 }
 
 /// The reconciled outcome of one prepared commit.
@@ -596,10 +602,7 @@ pub(crate) async fn commit_with_reconcile(
 }
 
 pub(crate) fn reconcile_corrupt() -> Error {
-  Error::provider(
-    ProviderErrorKind::StorageCorrupt,
-    ProviderErrorContext::StorageReconcile,
-  )
+  crate::storage::storage_corrupt(ProviderErrorContext::StorageReconcile)
 }
 
 pub(crate) fn reconcile_unknown() -> Error {

@@ -28,23 +28,49 @@ pub(crate) fn resource_pass_settled(peer: &str, continued: bool) {
   let _ = (peer, continued);
 }
 
-/// A member dial toward `peer` was attempted; `recovery` records
-/// whether the recovery plane (rather than an operator) initiated it.
-pub(crate) fn dial_started(peer: &str, recovery: bool) {
-  #[cfg(feature = "audit")]
-  debug!(target: "audit", peer, recovery, "member dial started");
-  #[cfg(not(feature = "audit"))]
-  let _ = (peer, recovery);
+/// The plane that initiated a dial. The audit line carries this typed
+/// initiator instead of a bare recovery flag, so a caller dial, a
+/// recovery dial, and a connection-degree probe stay distinguishable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DialInitiator {
+  /// A caller-configured join or member connect.
+  Caller,
+  /// The recovery plane's healing dial.
+  Recovery,
+  /// The connection-degree bridge probe.
+  Probe,
 }
 
-/// A member dial toward `peer` settled: `recovery` records the
-/// initiator as above, `connected` whether an authenticated session
-/// registered.
-pub(crate) fn dial_settled(peer: &str, recovery: bool, connected: bool) {
+impl DialInitiator {
   #[cfg(feature = "audit")]
-  debug!(target: "audit", peer, recovery, connected, "member dial settled");
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::Caller => "caller",
+      Self::Recovery => "recovery",
+      Self::Probe => "probe",
+    }
+  }
+}
+
+/// A member dial toward `peer` was attempted; `initiator` records the
+/// plane that initiated it. The peer field is the identity available at
+/// dial start (the endpoint for a join, the node id for a member dial),
+/// and the matching settle line carries the same value.
+pub(crate) fn dial_started(peer: &str, initiator: DialInitiator) {
+  #[cfg(feature = "audit")]
+  debug!(target: "audit", peer, initiator = initiator.as_str(), "member dial started");
   #[cfg(not(feature = "audit"))]
-  let _ = (peer, recovery, connected);
+  let _ = (peer, initiator);
+}
+
+/// A member dial toward `peer` settled: `initiator` records the plane as
+/// above, `connected` whether an authenticated session registered. The
+/// peer field is the same value the matching start line carried.
+pub(crate) fn dial_settled(peer: &str, initiator: DialInitiator, connected: bool) {
+  #[cfg(feature = "audit")]
+  debug!(target: "audit", peer, initiator = initiator.as_str(), connected, "member dial settled");
+  #[cfg(not(feature = "audit"))]
+  let _ = (peer, initiator, connected);
 }
 
 /// One member descriptor was installed from an anti-entropy page:
@@ -63,9 +89,8 @@ pub(crate) fn descriptor_installed(node: &str, revision: u64) {
 /// One membership diff page went on the wire with `rows` descriptors —
 /// the sent-side counter for the anti-entropy redundancy ledger: the
 /// ratio of summed `rows` to `descriptor_installed` events is the
-/// delivered-versus-useful traffic ratio (the 2026-10 audit's 98%
-/// finding), so a regression toward whole-catalog re-sends is
-/// measurable from the audit stream alone.
+/// delivered-versus-useful traffic ratio, so a regression toward
+/// whole-catalog re-sends is measurable from the audit stream alone.
 pub(crate) fn membership_page_emitted(rows: usize) {
   #[cfg(feature = "audit")]
   debug!(target: "audit", rows, "membership diff page emitted");

@@ -1,5 +1,5 @@
-//! Generic named resource metadata: signed records with public names,
-//! labels, and ordering versions.
+//! Generic named resource metadata: records with public names, labels,
+//! and ordering versions.
 //!
 //! A resource is a stable name plus labels: reserved labels carry the
 //! resource type and resource URI (callers provide the values; core never
@@ -7,39 +7,33 @@
 //! namespaced custom labels. One named resource is a multiwriter
 //! timestamp-maximum register, not a causal or real-time last-write
 //! register: the deterministic winner among concurrent records is the
-//! lexicographic maximum of the signed host wall-clock timestamp, the
-//! canonical writer [`NodeId`], the removal rank, and the canonical record
-//! digest. Accepting a write does not promise that it becomes or remains
-//! the winner; clock rollback can make a later local write lose and a
+//! lexicographic maximum of the host wall-clock timestamp, the canonical
+//! writer [`NodeId`], the removal rank, and the canonical record digest.
+//! Accepting a write does not promise that it becomes or remains the
+//! winner; clock rollback can make a later local write lose and a
 //! future-dated writer can dominate until wall time catches up.
 //!
-//! Every record is signed by its writer over the canonical unsigned body,
-//! and every field mutation (name, labels, timestamp, writer,
-//! removal rank, digest, or signature) fails verification before any
-//! comparison or persistence.
+//! Every record carries a canonical digest over its own fields, and every
+//! field mutation (name, labels, timestamp, writer, removal rank, or
+//! digest) fails the digest check before any comparison or persistence.
 //!
-//! The signature is end-to-end and survives relay: a resource row may
-//! reach a replica through intermediate members, so the receiver verifies
-//! the writer's signature instead of trusting the delivering session.
-//! Member descriptors deliberately take the other stance — they are
-//! routing metadata trusted through the authenticated session that
-//! delivered them, so they carry no per-entry signature. The asymmetry is
-//! intentional: user data is verified at the receiver, routing metadata
-//! is admitted through the session trust boundary.
+//! Records carry no per-record signature. A resource row is trusted
+//! through the authenticated session that delivered it, exactly as member
+//! descriptors are: the session is the trust boundary, so a row may reach
+//! a replica through intermediate members without a writer signature.
 
 use std::{fmt, sync::Arc};
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use crate::{
-  Digest, Error, LabelSet, LabelValue, NodeId, PublicKey, QualifiedTag, Result, Signature,
-  identity::signature::{body_digest, signature_message, verify_strict},
+  Digest, Error, LabelSet, LabelValue, NodeId, QualifiedTag, Result,
+  identity::signature::body_digest,
   protocol::{CborLimits, decode_canonical_strict, encode_canonical},
   time,
 };
 
 pub(crate) const RESOURCE_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/resource-record";
-pub(crate) const RESOURCE_RECORD_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/v1/resource-record";
 
 /// The reserved label key carrying the resource type value. Core stores the
 /// caller-provided value opaquely and never assigns it meaning beyond
@@ -62,7 +56,7 @@ const RECORD_VERSION: u16 = 1;
 /// Parsing reuses the canonical tag grammar, so names inherit domain
 /// validation, length bounds, and lowercase normalization; the category is
 /// fixed to `resources`, which keeps resource names out of the protocol,
-/// feature, transport, discovery, and label namespaces.
+/// feature, transport, and label namespaces.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ResourceName(QualifiedTag);
 
@@ -221,10 +215,10 @@ impl fmt::Debug for ResourceLabels {
 
 /// The ordering version of one resource record.
 ///
-/// The version is exactly the signed multiwriter tuple: the host
-/// wall-clock timestamp, the canonical writer [`NodeId`], the removal
-/// flag, and the canonical record digest. It carries no causal, freshness,
-/// or real-time guarantee.
+/// The version is exactly the multiwriter tuple: the host wall-clock
+/// timestamp, the canonical writer [`NodeId`], the removal flag, and the
+/// canonical record digest. It carries no causal, freshness, or real-time
+/// guarantee.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ResourceVersion {
   timestamp: std::time::SystemTime,
@@ -251,12 +245,12 @@ impl ResourceVersion {
     }
   }
 
-  /// The signed host wall-clock instant of the winning write.
+  /// The host wall-clock instant of the winning write.
   pub fn timestamp(&self) -> std::time::SystemTime {
     self.timestamp
   }
 
-  /// The canonical writer that signed the winning record.
+  /// The canonical writer that issued the winning record.
   pub fn writer(&self) -> &NodeId {
     &self.writer
   }
@@ -280,7 +274,7 @@ impl ResourceVersion {
       && self.digest == record.digest
   }
 
-  /// Extracts the public version view of one signed record.
+  /// Extracts the public version view of one stored record.
   pub(crate) fn from_record(record: &ResourceRecordV1) -> Self {
     Self {
       timestamp: record.timestamp(),
@@ -303,7 +297,7 @@ impl fmt::Debug for ResourceVersion {
   }
 }
 
-/// The canonical unsigned body one writer signs: every semantic field of
+/// The canonical body the record digest covers: every semantic field of
 /// the record in fixed order.
 #[derive(Encode, Decode)]
 #[cbor(array)]
@@ -324,9 +318,11 @@ struct ResourceRecordBodyWire {
   /// keys (the `LabelSet` invariant).
   #[n(5)]
   labels: Vec<(String, String)>,
-  /// Signed host wall-clock UNIX milliseconds (the tuple's first element).
+  /// Host wall-clock UNIX milliseconds, signed (pre-epoch readings stay
+  /// negative instead of collapsing onto the epoch) — the tuple's first
+  /// element.
   #[n(6)]
-  timestamp_millis: u64,
+  timestamp_millis: i64,
   #[n(7)]
   writer: String,
   /// Removal rank: orders removal evidence against same-writer writes at
@@ -339,8 +335,8 @@ struct ResourceRecordBodyWire {
   removed: bool,
 }
 
-/// The full wire record: the signed body plus its digest and the writer's
-/// signature over the domain-separated digest.
+/// The full wire record: the canonical body fields plus the digest that
+/// binds them.
 #[derive(Encode, Decode)]
 #[cbor(array)]
 struct ResourceRecordWire {
@@ -357,7 +353,7 @@ struct ResourceRecordWire {
   #[n(5)]
   labels: Vec<(String, String)>,
   #[n(6)]
-  timestamp_millis: u64,
+  timestamp_millis: i64,
   #[n(7)]
   writer: String,
   #[n(8)]
@@ -366,31 +362,28 @@ struct ResourceRecordWire {
   removed: bool,
   #[n(10)]
   digest: ByteVec,
-  #[n(11)]
-  signature: ByteVec,
 }
 
-/// One signed multiwriter resource-metadata record.
+/// One multiwriter resource-metadata record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceRecordV1 {
   name: ResourceName,
   resource_type: LabelValue,
   resource_uri: ResourceUri,
   labels: LabelSet,
-  timestamp_millis: u64,
+  timestamp_millis: i64,
   writer: NodeId,
   removal_rank: u64,
   removed: bool,
   digest: Digest,
-  signature: Signature,
 }
 
 impl ResourceRecordV1 {
-  /// Encodes the canonical unsigned body that `writer` signs.
+  /// Encodes the canonical body the record digest covers.
   #[allow(clippy::too_many_arguments)]
-  pub(crate) fn encode_signed_body(
+  pub(crate) fn encode_body(
     name: &ResourceName, resource_type: &LabelValue, resource_uri: &ResourceUri, labels: &LabelSet,
-    timestamp_millis: u64, writer: &NodeId, removal_rank: u64, removed: bool,
+    timestamp_millis: i64, writer: &NodeId, removal_rank: u64, removed: bool,
   ) -> Result<Vec<u8>> {
     encode_canonical(
       &ResourceRecordBodyWire {
@@ -412,15 +405,15 @@ impl ResourceRecordV1 {
     )
   }
 
-  /// Assembles one record from an already-produced writer signature over
-  /// the canonical signed body (the signing capability stays with the
-  /// caller's key provider).
+  /// Assembles one record from its fields: one encode, one digest. The
+  /// digest is computed, not decoded, so assembly cannot fail past the
+  /// canonical body encode.
   #[allow(clippy::too_many_arguments)]
-  pub(crate) fn seal(
+  pub(crate) fn new(
     name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri, labels: LabelSet,
-    timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool, signature: Signature,
+    timestamp_millis: i64, writer: NodeId, removal_rank: u64, removed: bool,
   ) -> Result<Self> {
-    let body = Self::encode_signed_body(
+    let body = Self::encode_body(
       &name,
       &resource_type,
       &resource_uri,
@@ -430,31 +423,7 @@ impl ResourceRecordV1 {
       removal_rank,
       removed,
     )?;
-    Ok(Self::seal_prepared(
-      body,
-      name,
-      resource_type,
-      resource_uri,
-      labels,
-      timestamp_millis,
-      writer,
-      removal_rank,
-      removed,
-      signature,
-    ))
-  }
-
-  /// Seals from an already-encoded canonical body: one encode, one digest
-  /// (shared by `sign`, `sign_with_provider`, and the write-shape probe).
-  /// Assembly itself cannot fail — the digest is computed, not decoded —
-  /// so the constructor returns the record directly.
-  #[allow(clippy::too_many_arguments)]
-  fn seal_prepared(
-    body: Vec<u8>, name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri,
-    labels: LabelSet, timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
-    signature: Signature,
-  ) -> Self {
-    Self {
+    Ok(Self {
       name,
       resource_type,
       resource_uri,
@@ -464,85 +433,7 @@ impl ResourceRecordV1 {
       removal_rank,
       removed,
       digest: body_digest(&body),
-      signature,
-    }
-  }
-
-  /// Signs the canonical body with the given signing key and assembles the
-  /// record (test and vector construction; production callers go through
-  /// [`ResourceRecordV1::sign_with_provider`]).
-  #[cfg(test)]
-  #[allow(clippy::too_many_arguments)]
-  pub(crate) fn sign(
-    name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri, labels: LabelSet,
-    timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
-    signing_key: &ed25519_dalek::SigningKey,
-  ) -> Result<Self> {
-    let body = Self::encode_signed_body(
-      &name,
-      &resource_type,
-      &resource_uri,
-      &labels,
-      timestamp_millis,
-      &writer,
-      removal_rank,
-      removed,
-    )?;
-    use ed25519_dalek::Signer as _;
-    let signature = Signature::from_bytes(
-      signing_key
-        .sign(&signature_message(RESOURCE_RECORD_DOMAIN, &body))
-        .to_bytes(),
-    );
-    Ok(Self::seal_prepared(
-      body,
-      name,
-      resource_type,
-      resource_uri,
-      labels,
-      timestamp_millis,
-      writer,
-      removal_rank,
-      removed,
-      signature,
-    ))
-  }
-
-  /// Assembles the record from a signature produced by the caller's key
-  /// provider over the canonical signed body — the single production
-  /// construction path: one sign-and-seal pipeline for put and remove,
-  /// no double encode, no transposable argument lists.
-  #[allow(clippy::too_many_arguments)]
-  pub(crate) async fn sign_with_provider(
-    name: ResourceName, resource_type: LabelValue, resource_uri: ResourceUri, labels: LabelSet,
-    timestamp_millis: u64, writer: NodeId, removal_rank: u64, removed: bool,
-    keys: &Arc<dyn crate::provider::KeyProvider>, handle: &crate::KeyHandle,
-  ) -> Result<Self> {
-    let body = Self::encode_signed_body(
-      &name,
-      &resource_type,
-      &resource_uri,
-      &labels,
-      timestamp_millis,
-      &writer,
-      removal_rank,
-      removed,
-    )?;
-    let signature = keys
-      .sign(handle, &signature_message(RESOURCE_RECORD_DOMAIN, &body))
-      .await?;
-    Ok(Self::seal_prepared(
-      body,
-      name,
-      resource_type,
-      resource_uri,
-      labels,
-      timestamp_millis,
-      writer,
-      removal_rank,
-      removed,
-      signature,
-    ))
+    })
   }
 
   /// The canonical resource name this record describes.
@@ -562,7 +453,7 @@ impl ResourceRecordV1 {
     &self.labels
   }
 
-  /// The signed host wall-clock instant of this write.
+  /// The host wall-clock instant of this write.
   pub(crate) fn timestamp(&self) -> std::time::SystemTime {
     time::from_millis(self.timestamp_millis)
   }
@@ -570,7 +461,7 @@ impl ResourceRecordV1 {
   /// The host wall-clock timestamp in milliseconds (test-only: readers
   /// consume the normalized time view instead).
   #[cfg(test)]
-  pub(crate) const fn timestamp_millis(&self) -> u64 {
+  pub(crate) const fn timestamp_millis(&self) -> i64 {
     self.timestamp_millis
   }
 
@@ -611,7 +502,6 @@ impl ResourceRecordV1 {
         removal_rank: self.removal_rank,
         removed: self.removed,
         digest: ByteVec::from(self.digest.as_bytes().to_vec()),
-        signature: ByteVec::from(self.signature.as_bytes().to_vec()),
       },
       RECORD_LIMITS,
     )
@@ -648,25 +538,20 @@ impl ResourceRecordV1 {
           .try_into()
           .map_err(|_| Error::invalid_input("resource record digest"))?,
       ),
-      signature: Signature::from_bytes(
-        wire.signature[..]
-          .try_into()
-          .map_err(|_| Error::invalid_input("resource record signature"))?,
-      ),
     };
     // The stored digest must match the decoded fields exactly: any field
     // mutation (or digest tampering) fails here, before comparison or
     // persistence.
-    let body = record.signed_body()?;
+    let body = record.body()?;
     if body_digest(&body) != record.digest {
       return Err(Error::invalid_input("resource record digest"));
     }
     Ok(record)
   }
 
-  /// Encodes the canonical unsigned body of this record's fields.
-  fn signed_body(&self) -> Result<Vec<u8>> {
-    Self::encode_signed_body(
+  /// Encodes the canonical body of this record's fields.
+  fn body(&self) -> Result<Vec<u8>> {
+    Self::encode_body(
       &self.name,
       &self.resource_type,
       &self.resource_uri,
@@ -678,28 +563,12 @@ impl ResourceRecordV1 {
     )
   }
 
-  /// Verifies the writer's signature against the writer's public key.
-  /// The digest was already checked against the fields at decode time;
-  /// this closes the chain from fields to writer identity — deliberately
-  /// re-derived here so verification stays independently complete
-  /// (defense in depth; the redundant encode+hash is ~2% of the
-  /// ed25519 verify on this path).
-  pub(crate) fn verify(&self, writer_key: &PublicKey) -> Result<()> {
-    verify_strict(
-      RESOURCE_RECORD_DOMAIN,
-      &self.signed_body()?,
-      writer_key,
-      &self.signature,
-      "resource record signature",
-    )
-  }
-
   /// The deterministic timestamp-maximum tuple order:
-  /// lexicographic maximum of signed wall-clock timestamp, canonical
-  /// writer id, removal rank, and canonical digest. Total, transitive,
-  /// commutative, associative, and idempotent under max-reduction; equal
-  /// timestamps break ties on writer, then removal rank, then digest, so
-  /// byte-identical replays are idempotent and signed equivocations
+  /// lexicographic maximum of wall-clock timestamp, canonical writer id,
+  /// removal rank, and canonical digest. Total, transitive, commutative,
+  /// associative, and idempotent under max-reduction; equal timestamps
+  /// break ties on writer, then removal rank, then digest, so
+  /// byte-identical replays are idempotent and equivocating writes
   /// converge to one deterministic winner.
   pub(crate) fn tuple_order(&self, other: &Self) -> std::cmp::Ordering {
     self
@@ -718,26 +587,27 @@ impl ResourceRecordV1 {
 
 /// Validates that a candidate with this name and labels fits the
 /// canonical record envelope under any stamp: the probe encodes
-/// the full wire shape with maximal-width timestamp/rank fields and a
-/// placeholder signature, so an accepted write can never exceed the record
-/// budget when the runtime stamps and signs it.
+/// the full wire shape with maximal-width timestamp/rank fields, so an
+/// accepted write can never exceed the record budget when the runtime
+/// stamps it.
 pub(crate) fn check_write_shape(name: &ResourceName, labels: &ResourceLabels) -> Result<()> {
   let writer = NodeId::parse("node-000000000000000000001")?;
-  let probe = ResourceRecordV1::seal(
+  let probe = ResourceRecordV1::new(
     name.clone(),
     labels.resource_type().clone(),
     labels.uri().clone(),
     labels.custom_labels().clone(),
-    u64::MAX,
+    i64::MAX,
     writer,
     u64::MAX,
     true,
-    Signature::from_bytes([0; 64]),
   )?;
   probe.encode()?;
   Ok(())
 }
 
+pub(crate) mod feed;
+pub(crate) mod lane;
 pub(crate) mod page;
 pub(crate) mod retention;
 pub(crate) mod select;
@@ -755,15 +625,10 @@ mod crash;
 mod tests {
   use std::cmp::Ordering;
 
-  use ed25519_dalek::SigningKey;
-
   use super::{
     RESERVED_TYPE_LABEL_KEY, RESERVED_URI_LABEL_KEY, ResourceName, ResourceRecordV1, ResourceUri,
   };
   use crate::{LabelKey, LabelSet, LabelValue, NodeId};
-
-  const SEED: [u8; 32] = [11; 32];
-  const OTHER_SEED: [u8; 32] = [13; 32];
 
   fn writer() -> NodeId {
     NodeId::parse("node-000000000000000000001").unwrap()
@@ -786,13 +651,13 @@ mod tests {
       .unwrap()
   }
 
-  /// Builds one live (non-removed) signed record at the fixed test cluster.
+  /// Builds one live (non-removed) record at the fixed test cluster.
   #[allow(clippy::too_many_arguments)]
   fn record(
-    name: &ResourceName, timestamp_millis: u64, writer: &NodeId, removal_rank: u64,
-    labels: &LabelSet, resource_type: &str, uri: &str, seed: [u8; 32],
+    name: &ResourceName, timestamp_millis: i64, writer: &NodeId, removal_rank: u64,
+    labels: &LabelSet, resource_type: &str, uri: &str,
   ) -> ResourceRecordV1 {
-    ResourceRecordV1::sign(
+    ResourceRecordV1::new(
       name.clone(),
       LabelValue::parse(resource_type).unwrap(),
       ResourceUri::parse(uri).unwrap(),
@@ -801,7 +666,6 @@ mod tests {
       writer.clone(),
       removal_rank,
       false,
-      &SigningKey::from_bytes(&seed),
     )
     .unwrap()
   }
@@ -815,43 +679,16 @@ mod tests {
       &labels(),
       "document",
       "file:///tmp/a",
-      SEED,
     )
   }
 
-  /// The pinned canonical encoding of `base_record()`: deterministic
-  /// CBOR plus the ed25519 signature over the domain-separated digest of
-  /// seed `[11; 32]`.
-  const GOLDEN_RESOURCE_RECORD_V1: &[u8] = &[
-    140, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
-    104, 47, 115, 99, 104, 101, 109, 97, 115, 47, 118, 49, 47, 114, 101, 115, 111, 117, 114, 99,
-    101, 45, 114, 101, 99, 111, 114, 100, 1, 120, 40, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111,
-    111, 111, 111, 46, 116, 101, 99, 104, 47, 114, 101, 115, 111, 117, 114, 99, 101, 115, 47, 100,
-    101, 109, 111, 45, 111, 98, 106, 101, 99, 116, 104, 100, 111, 99, 117, 109, 101, 110, 116, 109,
-    102, 105, 108, 101, 58, 47, 47, 47, 116, 109, 112, 47, 97, 129, 130, 120, 24, 101, 120, 97,
-    109, 112, 108, 101, 46, 111, 114, 103, 47, 108, 97, 98, 101, 108, 115, 47, 111, 119, 110, 101,
-    114, 102, 116, 101, 97, 109, 45, 97, 25, 3, 232, 120, 26, 110, 111, 100, 101, 45, 48, 48, 48,
-    48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 0, 244, 88, 32, 232,
-    209, 48, 96, 222, 7, 77, 195, 147, 217, 211, 78, 106, 213, 171, 102, 43, 91, 52, 71, 218, 131,
-    62, 140, 104, 196, 168, 39, 58, 102, 159, 2, 88, 64, 79, 202, 94, 44, 31, 189, 74, 118, 160,
-    185, 158, 88, 21, 239, 200, 142, 134, 177, 39, 162, 249, 126, 146, 71, 185, 36, 18, 26, 58, 17,
-    221, 35, 115, 243, 81, 214, 203, 113, 190, 27, 103, 35, 89, 233, 38, 241, 152, 20, 206, 239,
-    124, 227, 28, 161, 246, 161, 226, 151, 121, 70, 206, 140, 19, 2,
-  ];
+  // ---- Records validate before anything else ----
 
-  fn writer_key_of(seed: [u8; 32]) -> crate::PublicKey {
-    let key = SigningKey::from_bytes(&seed);
-    crate::PublicKey::from_bytes(key.verifying_key().to_bytes())
-  }
-
-  // ---- Signed records validate before anything else ----
-
-  /// A well-formed record verifies under its writer's key and round-trips
-  /// through the canonical encoding byte-exactly.
+  /// A well-formed record round-trips through the canonical encoding
+  /// byte-exactly, with no per-record signature in the wire shape.
   #[test]
-  fn well_formed_record_verifies_and_round_trips() {
+  fn well_formed_record_round_trips() {
     let record = base_record();
-    record.verify(&writer_key_of(SEED)).unwrap();
     let decoded = ResourceRecordV1::decode(&record.encode().unwrap()).unwrap();
     assert_eq!(decoded, record);
     assert_eq!(decoded.timestamp_millis(), 1_000);
@@ -870,9 +707,8 @@ mod tests {
     assert!(ResourceName::parse("radiata.woooo.tech/labels/not-a-resource").is_err());
   }
 
-  /// Mutating any covered field (or the digest or signature itself)
-  /// fails verification or canonical decode before comparison or
-  /// persistence.
+  /// Mutating any covered field (or the digest itself) fails the digest
+  /// check at canonical decode, before comparison or persistence.
   #[test]
   fn every_field_mutation_fails_closed() {
     type Mutator = dyn Fn(&mut ResourceRecordV1);
@@ -884,8 +720,8 @@ mod tests {
       copy
     };
 
-    // Field mutations keep the stale digest/signature and must fail
-    // verification (the digest no longer matches the fields).
+    // Field mutations keep the stale digest, so the re-encoded bytes
+    // fail the decode-time digest check.
     let cases: Vec<(&str, &Mutator)> = vec![
       ("timestamp", &|r: &mut ResourceRecordV1| {
         r.timestamp_millis += 1
@@ -897,30 +733,17 @@ mod tests {
     for (label, mutate) in &cases {
       let copy = mutated(mutate);
       assert!(
-        copy.verify(&writer_key_of(SEED)).is_err(),
+        ResourceRecordV1::decode(&copy.encode().unwrap()).is_err(),
         "mutation of {label} must fail closed"
       );
     }
 
-    // Digest tampering fails at decode (fields recompute to a different
-    // digest); signature tampering fails at verify on an otherwise valid
-    // record shape.
+    // Digest tampering fails at decode: flipping the final digest byte
+    // leaves fields that recompute to a different digest.
     let mut wire = record.encode().unwrap();
     let last = wire.len() - 1;
     wire[last] ^= 0xFF;
-    // Flipping the final signature byte must break decode-or-verify.
-    if let Ok(decoded) = ResourceRecordV1::decode(&wire) {
-      assert!(decoded.verify(&writer_key_of(SEED)).is_err());
-    }
-  }
-
-  /// A record signed by a different writer never verifies under another
-  /// writer's key (equivocation cannot borrow identities).
-  #[test]
-  fn signature_binds_the_writer_identity() {
-    let record = base_record();
-    assert!(record.verify(&writer_key_of(SEED)).is_ok());
-    assert!(record.verify(&writer_key_of(OTHER_SEED)).is_err());
+    assert!(ResourceRecordV1::decode(&wire).is_err());
   }
 
   // ---- Timestamp-maximum tuple algebra ----
@@ -933,29 +756,11 @@ mod tests {
     let n1 = ResourceName::parse("radiata.woooo.tech/resources/obj-1").unwrap();
     let n2 = ResourceName::parse("radiata.woooo.tech/resources/obj-2").unwrap();
     let pool = vec![
-      record(&n1, 1_000, &writer(), 0, &labels(), "a", "u://1", SEED),
-      record(&n1, 2_000, &writer(), 0, &labels(), "a", "u://1", SEED),
-      record(
-        &n1,
-        2_000,
-        &other_writer(),
-        0,
-        &labels(),
-        "a",
-        "u://2",
-        OTHER_SEED,
-      ),
-      record(&n1, 2_000, &writer(), 7, &labels(), "a", "u://3", SEED),
-      record(
-        &n2,
-        1_500,
-        &other_writer(),
-        3,
-        &labels(),
-        "b",
-        "u://4",
-        OTHER_SEED,
-      ),
+      record(&n1, 1_000, &writer(), 0, &labels(), "a", "u://1"),
+      record(&n1, 2_000, &writer(), 0, &labels(), "a", "u://1"),
+      record(&n1, 2_000, &other_writer(), 0, &labels(), "a", "u://2"),
+      record(&n1, 2_000, &writer(), 7, &labels(), "a", "u://3"),
+      record(&n2, 1_500, &other_writer(), 3, &labels(), "b", "u://4"),
     ];
 
     for a in &pool {
@@ -991,69 +796,32 @@ mod tests {
   /// and a future-dated write dominates until wall time catches up.
   #[test]
   fn equal_timestamp_tie_breaks_are_deterministic_and_rollback_loses() {
-    let early = record(&name(), 1_000, &writer(), 0, &labels(), "a", "u://1", SEED);
-    let late_local_same_writer = record(
-      &name(),
-      2_000,
-      &writer(),
-      0,
-      &labels(),
-      "a",
-      "u://1-late",
-      SEED,
-    );
+    let early = record(&name(), 1_000, &writer(), 0, &labels(), "a", "u://1");
+    let late_local_same_writer = record(&name(), 2_000, &writer(), 0, &labels(), "a", "u://1-late");
     // Wall-clock rollback: the host wrote later but stamped earlier, so
     // the earlier-stamped remote record still wins.
     assert!(!early.wins_over(&late_local_same_writer));
 
-    let same_time_a = record(&name(), 5_000, &writer(), 0, &labels(), "a", "u://a", SEED);
-    let same_time_b = record(
-      &name(),
-      5_000,
-      &other_writer(),
-      0,
-      &labels(),
-      "a",
-      "u://b",
-      OTHER_SEED,
-    );
+    let same_time_a = record(&name(), 5_000, &writer(), 0, &labels(), "a", "u://a");
+    let same_time_b = record(&name(), 5_000, &other_writer(), 0, &labels(), "a", "u://b");
     // Writer id breaks the tie deterministically.
     let by_writer = same_time_a.writer().as_str() > same_time_b.writer().as_str();
     assert_eq!(same_time_a.wins_over(&same_time_b), by_writer);
 
-    let ranked = record(&name(), 5_000, &writer(), 9, &labels(), "a", "u://a", SEED);
+    let ranked = record(&name(), 5_000, &writer(), 9, &labels(), "a", "u://a");
     assert!(ranked.wins_over(&same_time_a));
 
     // Future dominance: a far-future stamp beats everything present.
-    let future = record(
-      &name(),
-      9_999_999,
-      &writer(),
-      0,
-      &labels(),
-      "a",
-      "u://f",
-      SEED,
-    );
+    let future = record(&name(), 9_999_999, &writer(), 0, &labels(), "a", "u://f");
     assert!(future.tuple_order(&early) == Ordering::Greater);
   }
 
-  /// Signed equivocation at one tuple position converges to one
-  /// deterministic winner by digest, and byte-identical replay is
-  /// idempotent.
+  /// Equivocation at one tuple position converges to one deterministic
+  /// winner by digest, and byte-identical replay is idempotent.
   #[test]
   fn equivocation_converges_and_replay_is_idempotent() {
-    let equivocate_a = record(
-      &name(),
-      5_000,
-      &writer(),
-      0,
-      &labels(),
-      "a",
-      "u://one",
-      SEED,
-    );
-    let equivocate_b = ResourceRecordV1::sign(
+    let equivocate_a = record(&name(), 5_000, &writer(), 0, &labels(), "a", "u://one");
+    let equivocate_b = ResourceRecordV1::new(
       name(),
       LabelValue::parse("a").unwrap(),
       ResourceUri::parse("u://two").unwrap(),
@@ -1062,28 +830,16 @@ mod tests {
       writer(),
       0,
       false,
-      &SigningKey::from_bytes(&SEED),
     )
     .unwrap();
     assert_ne!(equivocate_a.digest(), equivocate_b.digest());
-    // Both are individually valid signed records (bounded evidence), and
-    // the register converges to the same single winner from either order.
+    // Both are individually valid records (bounded evidence), and the
+    // register converges to the same single winner from either order.
     let winner = max(&equivocate_a, &equivocate_b);
     assert_eq!(winner, max(&equivocate_b, &equivocate_a));
     // Byte-identical replay is idempotent.
     let decoded = ResourceRecordV1::decode(&equivocate_a.encode().unwrap()).unwrap();
     assert_eq!(&decoded, &equivocate_a);
-  }
-
-  /// Golden vector: the exact canonical bytes of one fixed record are
-  /// pinned so any encoder drift fails loudly. The signature
-  /// is deterministic (ed25519 over the domain-separated digest), so the
-  /// full encoding is reproducible from the fixed seed.
-  #[test]
-  fn golden_wire_vector_is_stable() {
-    let record = base_record();
-    let bytes = record.encode().unwrap();
-    assert_eq!(bytes.as_slice(), GOLDEN_RESOURCE_RECORD_V1);
   }
 
   // ---- Namespace ownership and reserved labels ----
@@ -1214,10 +970,10 @@ mod tests {
   }
 
   /// The pinned current fixture of one live record whose custom labels
-  /// span two caller domains: deterministic CBOR plus the ed25519
-  /// signature over the domain-separated digest of seed `[11; 32]`.
+  /// span two caller domains: deterministic CBOR plus the digest over the
+  /// canonical body.
   const GOLDEN_RESOURCE_LIVE_G9: &[u8] = &[
-    140, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
+    139, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
     104, 47, 115, 99, 104, 101, 109, 97, 115, 47, 118, 49, 47, 114, 101, 115, 111, 117, 114, 99,
     101, 45, 114, 101, 99, 111, 114, 100, 1, 120, 36, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111,
     111, 111, 111, 46, 116, 101, 99, 104, 47, 114, 101, 115, 111, 117, 114, 99, 101, 115, 47, 103,
@@ -1228,16 +984,13 @@ mod tests {
     98, 101, 108, 115, 47, 114, 101, 103, 105, 111, 110, 98, 101, 117, 25, 15, 160, 120, 26, 110,
     111, 100, 101, 45, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
     48, 49, 0, 244, 88, 32, 9, 32, 120, 189, 43, 167, 188, 141, 116, 152, 11, 89, 237, 112, 225,
-    110, 48, 237, 248, 192, 202, 186, 139, 20, 216, 104, 151, 44, 70, 252, 91, 17, 88, 64, 52, 126,
-    231, 79, 19, 164, 92, 23, 11, 14, 103, 247, 110, 107, 110, 46, 185, 215, 196, 180, 41, 20, 124,
-    97, 60, 44, 149, 52, 176, 88, 134, 192, 127, 118, 102, 1, 166, 234, 193, 22, 246, 11, 13, 73,
-    183, 73, 75, 59, 61, 246, 95, 162, 95, 35, 50, 96, 141, 14, 130, 185, 149, 170, 125, 3,
+    110, 48, 237, 248, 192, 202, 186, 139, 20, 216, 104, 151, 44, 70, 252, 91, 17,
   ];
 
-  /// The pinned current fixture of one signed removal record: same
-  /// construction as `GOLDEN_RESOURCE_LIVE_G9`.
+  /// The pinned current fixture of one removal record: same construction
+  /// as `GOLDEN_RESOURCE_LIVE_G9`.
   const GOLDEN_RESOURCE_REMOVAL_G9: &[u8] = &[
-    140, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
+    139, 120, 45, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111, 111, 111, 111, 46, 116, 101, 99,
     104, 47, 115, 99, 104, 101, 109, 97, 115, 47, 118, 49, 47, 114, 101, 115, 111, 117, 114, 99,
     101, 45, 114, 101, 99, 111, 114, 100, 1, 120, 39, 114, 97, 100, 105, 97, 116, 97, 46, 119, 111,
     111, 111, 111, 46, 116, 101, 99, 104, 47, 114, 101, 115, 111, 117, 114, 99, 101, 115, 47, 103,
@@ -1246,13 +999,10 @@ mod tests {
     101, 100, 128, 25, 19, 136, 120, 26, 110, 111, 100, 101, 45, 48, 48, 48, 48, 48, 48, 48, 48,
     48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 1, 245, 88, 32, 2, 182, 157, 207, 95, 211,
     146, 243, 115, 191, 5, 199, 96, 167, 46, 130, 193, 103, 144, 25, 156, 30, 214, 164, 8, 220,
-    205, 99, 116, 247, 39, 154, 88, 64, 234, 163, 41, 144, 159, 185, 89, 205, 106, 85, 221, 31,
-    186, 239, 251, 159, 21, 43, 116, 78, 166, 144, 167, 4, 45, 225, 17, 69, 188, 45, 181, 0, 20,
-    20, 205, 176, 213, 65, 222, 154, 232, 41, 70, 27, 128, 179, 149, 121, 61, 114, 109, 197, 19,
-    101, 53, 182, 29, 103, 185, 61, 57, 207, 207, 0,
+    205, 99, 116, 247, 39, 154,
   ];
 
-  /// Builds the signed live fixture record pinned by
+  /// Builds the live fixture record pinned by
   /// `GOLDEN_RESOURCE_LIVE_G9`.
   fn live_record() -> ResourceRecordV1 {
     let labels = LabelSet::new()
@@ -1266,7 +1016,7 @@ mod tests {
         LabelValue::parse("eu").unwrap(),
       )
       .unwrap();
-    ResourceRecordV1::sign(
+    ResourceRecordV1::new(
       ResourceName::parse("radiata.woooo.tech/resources/g9-live").unwrap(),
       LabelValue::parse("document").unwrap(),
       ResourceUri::parse("file:///tmp/g9").unwrap(),
@@ -1275,13 +1025,12 @@ mod tests {
       writer(),
       0,
       false,
-      &SigningKey::from_bytes(&SEED),
     )
     .unwrap()
   }
 
   fn removal_record() -> ResourceRecordV1 {
-    ResourceRecordV1::sign(
+    ResourceRecordV1::new(
       ResourceName::parse("radiata.woooo.tech/resources/g9-removed").unwrap(),
       LabelValue::parse("document").unwrap(),
       ResourceUri::parse("file:///tmp/g9-removed").unwrap(),
@@ -1290,21 +1039,21 @@ mod tests {
       writer(),
       1,
       true,
-      &SigningKey::from_bytes(&SEED),
     )
     .unwrap()
   }
 
   /// Current and previous fixtures round-trip canonically and preserve
-  /// their exact logical tuple versions: the older golden vector stays
-  /// byte-stable as the previous fixture, and the current fixtures pin
+  /// their exact logical tuple versions: the previous fixture is built
+  /// directly from the record constructor, and the current fixtures pin
   /// the same record shape for a live multi-domain record and a removal.
   #[test]
   fn current_and_previous_fixtures_round_trip_with_exact_versions() {
-    // Previous fixture: the older pinned bytes still decode to the
-    // identical logical record.
-    let previous = ResourceRecordV1::decode(GOLDEN_RESOURCE_RECORD_V1).unwrap();
-    assert_eq!(previous.encode().unwrap(), GOLDEN_RESOURCE_RECORD_V1);
+    // Previous fixture: the record round-trips to the identical logical
+    // record.
+    let previous = base_record();
+    let previous_decoded = ResourceRecordV1::decode(&previous.encode().unwrap()).unwrap();
+    assert_eq!(previous_decoded, previous);
     let previous_version = super::ResourceVersion::from_record(&previous);
     assert_eq!(
       previous_version.timestamp(),

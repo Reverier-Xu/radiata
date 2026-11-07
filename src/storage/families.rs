@@ -41,6 +41,10 @@ pub(crate) const CLEANUP_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/clean
 pub(crate) const NODE_DESCRIPTOR_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/node-descriptor";
 /// One multiwriter generic resource register per resource name.
 pub(crate) const RESOURCE_RECORD_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/resource-record";
+/// The durable resource change feed: one monotonic head counter plus one
+/// entry per committed resource change, in `resourceVersion` order.
+pub(crate) const RESOURCE_CHANGE_FEED_NAMESPACE: &str =
+  "radiata.woooo.tech/metadata/v1/resource-change-feed";
 /// Bounded route-trace metadata per trace.
 pub(crate) const TRACE_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/route-trace";
 /// Durable pending-transaction journal record per transaction.
@@ -94,18 +98,36 @@ mod catalog {
     Schema,
   }
 
-  /// One persisted metadata family: the owning domain and its namespace tag.
+  /// One persisted metadata family: the owning domain, its namespace tag,
+  /// and whether the reconcile plane replicates it.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   pub(crate) struct MetadataFamily {
     domain: MetadataDomain,
     namespace_tag: &'static str,
+    replicated: bool,
   }
 
   impl MetadataFamily {
+    /// A family every node converges: the reconcile plane carries its rows
+    /// between nodes, so two converged stores hold byte-identical content.
     pub(crate) const fn new(domain: MetadataDomain, namespace_tag: &'static str) -> Self {
       Self {
         domain,
         namespace_tag,
+        replicated: true,
+      }
+    }
+
+    /// A node-local family: its rows follow this store's own commit order,
+    /// so two stores that converged through different orders legitimately
+    /// hold different content and the reconcile plane never carries them.
+    /// Consumers that compare or seed stores across nodes filter on
+    /// [`Self::replicated`] instead of naming the excluded families.
+    pub(crate) const fn node_local(domain: MetadataDomain, namespace_tag: &'static str) -> Self {
+      Self {
+        domain,
+        namespace_tag,
+        replicated: false,
       }
     }
 
@@ -115,6 +137,15 @@ mod catalog {
 
     pub(crate) const fn namespace_tag(&self) -> &'static str {
       self.namespace_tag
+    }
+
+    /// Whether the reconcile plane replicates this family between nodes.
+    /// Test-only today: the cross-store comparisons are the consumers, and
+    /// production already excludes node-local families by construction (no
+    /// lane owns their namespaces).
+    #[cfg(test)]
+    pub(crate) const fn replicated(&self) -> bool {
+      self.replicated
     }
 
     /// The namespace parsed for provider use (test-only: the storage
@@ -131,8 +162,9 @@ mod catalog {
     CHECKPOINT_NAMESPACE, CLEANUP_NAMESPACE, CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE,
     INTERNAL_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE, KEY_DELETED_NAMESPACE,
     KEY_DELETION_INTENT_NAMESPACE, KEY_SEED_NAMESPACE, LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE,
-    MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE, PENDING_NAMESPACE, RESOURCE_RECORD_NAMESPACE,
-    REVOCATION_NAMESPACE, SCHEMA_NAMESPACE, TRACE_NAMESPACE,
+    MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE, PENDING_NAMESPACE,
+    RESOURCE_CHANGE_FEED_NAMESPACE, RESOURCE_RECORD_NAMESPACE, REVOCATION_NAMESPACE,
+    SCHEMA_NAMESPACE, TRACE_NAMESPACE,
   };
 
   /// Every core metadata family, in domain order and then declaration order.
@@ -152,6 +184,7 @@ mod catalog {
       MetadataFamily::new(MetadataDomain::Custody, KEY_SEED_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Node, NODE_DESCRIPTOR_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Resource, RESOURCE_RECORD_NAMESPACE),
+      MetadataFamily::node_local(MetadataDomain::Resource, RESOURCE_CHANGE_FEED_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Route, TRACE_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Receipt, PENDING_NAMESPACE),
       MetadataFamily::new(MetadataDomain::Receipt, INTERNAL_NAMESPACE),
@@ -161,8 +194,6 @@ mod catalog {
 
   #[cfg(test)]
   mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-
     use super::*;
     use crate::protocol::tag::CATEGORY_METADATA;
 
@@ -194,6 +225,7 @@ mod catalog {
         MetadataDomain::Resource,
         MetadataDomain::Route,
         MetadataDomain::Receipt,
+        MetadataDomain::Schema,
       ] {
         assert!(
           families.iter().any(|family| family.domain() == domain),
@@ -217,10 +249,7 @@ mod catalog {
           family.namespace_tag()
         );
       }
-      // A well-formed sibling of a registered tag stays unclassified. It is
-      // built from the constant so no second namespace literal enters the
-      // file: the single-source guard allows literals only on *_NAMESPACE
-      // constant declarations.
+      // A well-formed sibling of a registered tag stays unclassified.
       let absent = format!("{}-not-a-family", LOCAL_IDENTITY_NAMESPACE);
       assert_eq!(domain_lookup(&absent), None);
     }
@@ -238,78 +267,17 @@ mod catalog {
       }
     }
 
-    /// Every `*_NAMESPACE` constant declared in this file is registered
-    /// in [`metadata_families`], and every registered family tag is one
-    /// of those constants: both directions are asserted against the
-    /// declarations recovered from this file's own source, so a constant
-    /// that never reaches the registry (or a registry entry without a
-    /// constant) fails here instead of silently bypassing the all-family
-    /// storage contract.
+    /// The replication property is declared per family, not per consumer:
+    /// the resource change feed is the one node-local family, and every
+    /// other family converges through the reconcile plane.
     #[test]
-    fn namespace_constants_and_family_registry_are_identical() {
-      let source = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/storage/families.rs"
-      ))
-      .unwrap_or_else(|error| panic!("read families.rs source: {error}"));
-      let constants = namespace_constant_literals(&source);
-      assert!(
-        !constants.is_empty(),
-        "no *_NAMESPACE constants found in the families source"
-      );
-
-      let registered: BTreeSet<&str> = metadata_families()
+    fn only_the_resource_change_feed_is_node_local() {
+      let node_local: Vec<&str> = metadata_families()
         .iter()
+        .filter(|family| !family.replicated())
         .map(MetadataFamily::namespace_tag)
         .collect();
-      let declared: BTreeSet<&str> = constants.values().map(String::as_str).collect();
-      assert_eq!(
-        declared, registered,
-        "*_NAMESPACE constants and metadata_families() registry diverged"
-      );
-    }
-
-    /// `*_NAMESPACE` constant declarations recovered from this module's
-    /// own source: constant identifier to namespace literal. The scan is
-    /// whitespace-insensitive, so wrapped declarations still match. The
-    /// static-invariants guard enforces the same declaration shape from
-    /// outside the crate; this helper exists because the registry
-    /// equality must observe the declarations, not a hand-maintained
-    /// list.
-    fn namespace_constant_literals(source: &str) -> BTreeMap<String, String> {
-      const NEEDLE: &str = "_NAMESPACE:&str=\"";
-      let stripped: String = source
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .collect();
-      let mut out = BTreeMap::new();
-      let mut offset = 0;
-      while let Some(found) = stripped[offset..].find(NEEDLE) {
-        let start = offset + found;
-        let identifier: String = stripped[..start]
-          .chars()
-          .rev()
-          .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
-          .collect::<Vec<_>>()
-          .into_iter()
-          .rev()
-          .collect();
-        assert!(
-          !identifier.is_empty(),
-          "namespace constant without an identifier"
-        );
-        let literal_start = start + NEEDLE.len();
-        let Some(literal_len) = stripped[literal_start..].find('"') else {
-          break;
-        };
-        let literal = stripped[literal_start..literal_start + literal_len].to_owned();
-        assert!(
-          out.insert(identifier, literal).is_none(),
-          "duplicate namespace constant declaration"
-        );
-        offset = literal_start + literal_len;
-      }
-      out
+      assert_eq!(node_local, vec![RESOURCE_CHANGE_FEED_NAMESPACE]);
     }
 
     /// The registry lookup behind the classification guards.

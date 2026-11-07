@@ -25,7 +25,7 @@
 //!
 //! # 1. Resource versions across process boundaries
 //!
-//! Every resource is a last-writer-wins register ordered by the signed
+//! Every resource is a last-writer-wins register ordered by the
 //! [`ResourceVersion`](crate::ResourceVersion) tuple: wall-clock
 //! timestamp, writer [`NodeId`](crate::NodeId), removal flag, record
 //! digest. A plain
@@ -67,7 +67,7 @@
 //! rebase the intended change on its tuple, and commit conditionally
 //! again.
 //!
-//! Removal memory is deliberately bounded. A signed removal record is
+//! Removal memory is deliberately bounded. A removal record is
 //! evidence with a finite retention window: the retention pass drops a
 //! removal once its own timestamp ages past the window, and the
 //! removal population is capacity-bounded with the oldest evicted
@@ -390,39 +390,53 @@
 //! The routing plane delivers a packet to a destination the sender may
 //! not hold a session with. Direct delivery to a connected destination
 //! is resolved before any policy runs; the registered
-//! [`RouteNextHop`](crate::RouteNextHop) picks the single
-//! relay for everything else, at every forwarding node, under bounded
-//! work. Returning a [`NodeId`](crate::NodeId) outside
-//! [`NextHopView::peers`](crate::NextHopView::peers) fails
-//! closed at the route boundary.
+//! [`RouteNextHop`](crate::RouteNextHop) plans the route for everything
+//! else, under bounded work, and the plan is carried in the packet's
+//! route envelope so every hop follows it.
 //!
-//! The built-in [`DefaultNextHop`](crate::DefaultNextHop)
-//! relays through the live peer a trace-keyed hash ranks first — a
-//! stable shuffle per delivery attempt, loop-free, and the default: the
-//! node registers it under its well-known tag and selects it unless the
-//! configuration names another policy, so multi-hop relay works out of
-//! the box. Because a retry opens a fresh trace, each retry attempt
-//! takes a different relay path instead of repeating a failed one, so
-//! caller-level retries deliver over branching topologies where a
-//! fixed pick could keep walking into a dead-end subtree. Implement the
-//! trait to replace it (a hub-and-spoke relay, a latency-aware pick, a
-//! shard-affine route):
+//! A plan is the ordered path from the planning node to the destination:
+//! the nodes the packet is forwarded through, excluding the planning node
+//! and ending at the destination. It must be non-empty, duplicate-free,
+//! inside [`NextHopView::remaining_hops`](crate::NextHopView::remaining_hops),
+//! and start at one of [`NextHopView::peers`](crate::NextHopView::peers) —
+//! anything else fails closed at the route boundary. A plan may also stop
+//! short of the destination: the node holding its last entry then plans
+//! the remainder from itself.
+//!
+//! The built-in [`DefaultNextHop`](crate::DefaultNextHop) plans over the
+//! node's learned topology: every routed delivery the node observes
+//! records its path with a success or failure, and the policy answers
+//! with the success-rate weighted shortest path from this node to the
+//! destination — the path that has been working, around the edges that
+//! have not. A learned path is simple by construction, which is what
+//! makes the walk loop-free: the plan is computed once at the origin and
+//! every hop follows it. While nothing has been learned for a
+//! destination, the policy falls back to the live peer a trace-keyed hash
+//! ranks first — a stable shuffle per delivery attempt — so multi-hop
+//! relay works out of the box: the relay that receives that single hop
+//! plans the rest from itself. Because a retry opens a fresh trace, each
+//! retry attempt takes a different fallback relay instead of repeating a
+//! failed one. Implement the trait to replace the default (a
+//! hub-and-spoke relay, a latency-aware plan, a shard-affine route):
 //!
 //! ```
 //! use radiata::{BoxFuture, NextHopView, NodeId, Result, RouteNextHop};
 //!
 //! /// Relays every unconnected destination through the first live
-//! /// peer in canonical order — a deterministic pick spelled out as
+//! /// peer in canonical order — a deterministic plan spelled out as
 //! /// a starting point.
 //! #[derive(Debug)]
 //! struct LowestPeerFirst;
 //!
 //! impl RouteNextHop for LowestPeerFirst {
-//!     fn next_hop<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+//!     fn plan<'a>(
+//!         &'a self, view: NextHopView<'a>,
+//!     ) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
 //!         Box::pin(async move {
 //!             view.peers()
 //!                 .first()
 //!                 .cloned()
+//!                 .map(|peer| Some(vec![peer]))
 //!                 .ok_or_else(|| radiata::Error::caller("no live peer as next hop"))
 //!         })
 //!     }
@@ -439,11 +453,137 @@
 //! let mut registry = ExtensionRegistry::new();
 //! let tag = QualifiedTag::parse("example.woooo.tech/route-policies/lowest")?;
 //! // Arc::new(LowestPeerFirst) — or the built-in DefaultNextHop:
-//! let policy: Arc<dyn RouteNextHop> = Arc::new(radiata::DefaultNextHop);
+//! let policy: Arc<dyn RouteNextHop> = Arc::new(radiata::DefaultNextHop::default());
 //! registry.register_next_hop(tag.clone(), policy)?;
 //! // NodeConfig::new().with_route_policy(tag) selects it at build time;
 //! // without a selection the built-in DefaultNextHop stays the default.
 //! // NodeBuilder::extensions(registry) installs the registry.
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The node-level policy above is the node's default. A stream may also
+//! carry a routing policy of its own:
+//! [`StreamPolicy`](crate::StreamPolicy) names a
+//! [`RoutingPolicy`](crate::RoutingPolicy) tag, and admission resolves it
+//! in the same registry before the node-level policy plans the route. The
+//! built-in [`RoutingPolicy::DIRECT`](crate::RoutingPolicy::DIRECT)
+//! is the built-in defer lane: its implementation returns the trait's
+//! explicit defer signal, so such a stream keeps the node-level behavior;
+//! any other registered policy plans the route for its stream and is
+//! authoritative for it (its rejection fails the route instead of falling
+//! back). A caller policy may defer the same way to hand a stream back to
+//! the node-level policy.
+//!
+//! ```no_run
+//! # use radiata::{ExtensionRegistry, QualifiedTag, RouteNextHop, RoutingPolicy, StreamPolicy};
+//! # use std::sync::Arc;
+//! # fn demo() -> radiata::Result<()> {
+//! let mut registry = ExtensionRegistry::new();
+//! let tag = QualifiedTag::parse("example.woooo.tech/route-policies/shard")?;
+//! let policy: Arc<dyn RouteNextHop> = Arc::new(radiata::DefaultNextHop::default());
+//! registry.register_routing_policy(tag.clone(), policy)?;
+//! let stream = StreamPolicy::new(RoutingPolicy::from(tag), 8)?;
+//! // StreamPolicy::direct(8) is the same policy under the built-in tag.
+//! # let _ = stream;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Label-addressed delivery: `MatchingNodes` and the load balancer
+//!
+//! A target does not have to name a node. [`StreamTarget::MatchingNodes
+//!`](crate::StreamTarget::MatchingNodes) carries a
+//! [`Selector`](crate::Selector) instead: the members whose owned labels
+//! satisfy it stream to the sender incrementally, in canonical node order, and
+//! a registered load-balancing policy selects exactly one eligible destination
+//! from them. Core independently re-validates the pick against the
+//! authoritative descriptor store before any frame moves, so an ID
+//! outside the observed candidates fails closed at the route boundary.
+//!
+//! The built-in [`DefaultLoadBalancer`](crate::DefaultLoadBalancer) picks
+//! the first matching candidate — the default lane for label-addressed
+//! delivery, installed by the same default path as the routing policies.
+//! A different selection rule (spread the load, prefer a same-zone peer)
+//! is one registration away, and official and caller policies have no
+//! functional difference:
+//!
+//! ```
+//! use radiata::{BoxFuture, CandidateNodeReader, LoadBalancingPolicy, NodeId, Result, Selector};
+//!
+//! /// Spreads matching destinations by a stable per-selector shuffle —
+//! /// a sketch spelled out as a starting point.
+//! #[derive(Debug)]
+//! struct Shuffled;
+//!
+//! impl LoadBalancingPolicy for Shuffled {
+//!     fn select<'a>(
+//!         &'a self, selector: &'a Selector, candidates: &'a dyn CandidateNodeReader,
+//!     ) -> BoxFuture<'a, Result<NodeId>> {
+//!         Box::pin(async move {
+//!             let page = candidates.next_matching_nodes(selector, None, 64).await?;
+//!             let mut picks: Vec<NodeId> =
+//!                 page.items().iter().map(|view| view.node_id().clone()).collect();
+//!             picks.sort_by_key(|node| node.as_str().len());
+//!             picks.into_iter().next().ok_or_else(|| {
+//!                 radiata::Error::provider(
+//!                     radiata::ProviderErrorKind::Unsupported,
+//!                     radiata::ProviderErrorContext::LoadBalancingPolicy,
+//!                 )
+//!             })
+//!         })
+//!     }
+//! }
+//! ```
+//!
+//! The sender names the policy tag on the stream itself; the built-in
+//! first-match lane needs no registration at all:
+//!
+//! ```no_run
+//! # use radiata::{NodeHandle, ProtocolTag, Selector, StreamMetadata, StreamPolicy, StreamTarget};
+//! # fn demo(handle: &NodeHandle) -> radiata::Result<()> {
+//! let stream = handle.open_stream(
+//!     StreamTarget::MatchingNodes(
+//!         Selector::parse("example.woooo.tech/labels/role=worker")?,
+//!     ),
+//!     ProtocolTag::parse("example.woooo.tech/protocols/demo")?,
+//!     StreamPolicy::direct(1)?.load_balancer(
+//!         radiata::QualifiedTag::parse(radiata::DefaultLoadBalancer::TAG)?,
+//!     ),
+//!     StreamMetadata::new(),
+//! )?;
+//! # let _ = stream;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Naming the path yourself
+//!
+//! A caller that already knows the route names it in the target:
+//! [`StreamTarget::Path`](crate::StreamTarget::Path) carries the ordered
+//! hops, excluding the sender and ending at the destination. Admission
+//! validates it — non-empty, duplicate-free, inside the hop budget, every
+//! hop a known member, the first hop a live session, the last one the
+//! destination — and then every hop follows it exactly; no policy decides
+//! a hop of a caller-named path. Validation is reachability only: the
+//! origin checks what it can see, and each hop is verified by the node
+//! that has to forward to it.
+//!
+//! ```no_run
+//! # use radiata::{NodeHandle, ProtocolTag, StreamMetadata, StreamPolicy, StreamTarget};
+//! # fn demo(handle: &NodeHandle, relay: radiata::NodeId, destination: radiata::NodeId)
+//! #   -> radiata::Result<()> {
+//! let target = StreamTarget::Path {
+//!     destination: destination.clone(),
+//!     path: vec![relay, destination],
+//! };
+//! let stream = handle.open_stream(
+//!     target,
+//!     ProtocolTag::parse("example.woooo.tech/protocols/demo")?,
+//!     StreamPolicy::direct(4)?,
+//!     StreamMetadata::new(),
+//! )?;
+//! # let _ = stream;
 //! # Ok(())
 //! # }
 //! ```
@@ -456,17 +596,18 @@
 //! A forwarding hop whose downstream branch fails runs a bounded
 //! branch search over its own remaining candidates before reporting
 //! the failure upstream, so a relay that walked into a dead end
-//! mid-route heals inside the library. The first hop has no such
-//! search: the origin picks one relay and dispatches once, and on a
-//! sparse branching topology — where no stateless policy can know
-//! which neighbor leads toward the destination — a pick that walks
-//! into a dead-end subtree fails the stream right at the origin, with
-//! the typed delivery error surfacing to the sender. Caller-level
-//! retry is the supported recovery there: make critical business
-//! flows idempotent (a receiver must tolerate a duplicate delivery),
-//! re-send on a delivery failure, and let each retry's fresh trace
-//! walk a different relay path — the same branching that fails one
-//! attempt is what makes a handful of them deliver.
+//! mid-route heals inside the library (each alternative branch plans its
+//! own remainder). The first hop has no such search: the origin plans one
+//! route and dispatches once, and on a sparse branching topology — where
+//! no policy can know which neighbor leads toward the destination before
+//! anything has been learned — a plan that walks into a dead-end subtree
+//! fails the stream right at the origin, with the typed delivery error
+//! surfacing to the sender. Caller-level retry is the supported recovery
+//! there: make critical business flows idempotent (a receiver must
+//! tolerate a duplicate delivery), re-send on a delivery failure, and let
+//! each retry's fresh trace plan afresh — the same branching that fails
+//! one attempt is what makes a handful of them deliver, and every
+//! attempt's outcome is what the learned topology plans over next time.
 //!
 //! # 5. Receiving packets: `PacketConsumer`
 //!
@@ -779,6 +920,39 @@
 //! qualified tag, then submit it through `node.tasks().submit`; the
 //! returned `Task<()>` waits exactly like a core kind. The reserved
 //! builtin domain is refused, so custom kinds never shadow core ones.
+//!
+//! ## Publishing your own events
+//!
+//! The event hub also carries a caller-owned, tag-keyed channel: choose
+//! an [`EventTag`](crate::EventTag) (a qualified tag, whose built-in
+//! domain is reserved — the crate's own events are the sealed types
+//! above), then [`publish`](crate::NodeHandle::publish) opaque bytes
+//! under it and hand
+//! [`subscribe`](crate::NodeHandle::subscribe) receivers the same tag.
+//! Every item is a [`TaggedEvent`](crate::TaggedEvent) carrying the
+//! publishing tag and the payload; the core never inspects either. The
+//! channel keeps the hub's contract: bounded per-subscriber channels (a
+//! slow subscriber lags instead of blocking the publisher), no replay
+//! of publishes made before the subscription, and nothing retained
+//! across a restart — it is an in-process signaling surface, not a
+//! queue. For durable state, write it through the resource plane and
+//! let the tagged channel point at it.
+//!
+//! ```no_run
+//! # async fn demo(node: &radiata::NodeHandle) -> radiata::Result<()> {
+//! use std::sync::Arc;
+//!
+//! use radiata::{EventOptions, EventReceive, EventTag};
+//!
+//! let tag = EventTag::parse("example.com/events/secrets-rotated")?;
+//! let mut events = node.subscribe(tag.clone(), EventOptions::new())?;
+//! node.publish(tag, Arc::from(b"key-42".as_slice()))?;
+//! while let EventReceive::Item(event) = events.recv().await? {
+//!     let payload = event.payload();
+//! }
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # 9. Deploying on low-performance devices
 //!

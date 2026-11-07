@@ -37,7 +37,7 @@ use crate::{
   provider::{StorageFactory, StoreSnapshot},
   time::{HostWallClock, WallClock},
 };
-const PENDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/pending-transaction";
+pub(crate) const PENDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/pending-transaction";
 const RECORD_VERSION: u64 = 1;
 const PENDING_LIMITS: CborLimits = CborLimits::new(8, 1_024, 65_536);
 
@@ -311,6 +311,24 @@ impl ExpectationWire {
   }
 }
 
+/// The purpose bound of the pending journal: nonempty, at most this many
+/// bytes, printable ASCII. The purpose is a durable field of the journal
+/// record (and its singleton key), so its grammar is an invariant of this
+/// module.
+const MAX_PURPOSE_LEN: usize = 128;
+
+/// Validates one journal purpose against the record's own bound, with the
+/// caller's context in the typed error.
+fn validate_purpose(purpose: &str, context: &'static str) -> Result<()> {
+  if purpose.is_empty()
+    || purpose.len() > MAX_PURPOSE_LEN
+    || !purpose.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
+  {
+    return Err(Error::invalid_input(context));
+  }
+  Ok(())
+}
+
 /// A decoded pending-transaction journal record.
 ///
 /// The planned operations are the exact caller and receipt-change operations
@@ -328,7 +346,7 @@ impl PendingTransactionV1 {
     purpose: &str, transaction: &TransactionId, base_revision: &StoreRevision,
     planned_operations: &[StoreOperation],
   ) -> Result<Self> {
-    crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+    validate_purpose(purpose, "pending transaction purpose")?;
     validate_planned_operations(purpose, planned_operations)?;
     Ok(Self {
       purpose: purpose.to_owned(),
@@ -361,7 +379,7 @@ impl PendingTransactionV1 {
   }
 
   /// Canonical wire encoding of the pending-transaction record; shared
-  /// by the receipt engine and the compatibility freeze reader.
+  /// by the receipt engine and the recovery path.
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
     encode_canonical(
       &PendingTransactionWire {
@@ -380,8 +398,8 @@ impl PendingTransactionV1 {
     )
   }
 
-  /// The canonical pending-transaction decoder; the compatibility
-  /// freeze reader consumes the same fail-closed path as the engine.
+  /// The canonical pending-transaction decoder; the recovery path
+  /// consumes the same fail-closed checks as the engine.
   pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
     let wire: PendingTransactionWire =
       decode_canonical_strict(bytes, PENDING_LIMITS, "pending transaction canonical form")?;
@@ -494,7 +512,7 @@ impl MetadataStore {
     &self, snapshot: &dyn StoreSnapshot, id: TransactionId, purpose: &str,
     caller_operations: Vec<StoreOperation>, mut changes: Vec<ReceiptReferenceChange>,
   ) -> Result<PreparedTransaction> {
-    crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+    validate_purpose(purpose, "pending transaction purpose")?;
     if caller_operations
       .iter()
       .any(operation_uses_reserved_namespace)
@@ -553,7 +571,7 @@ impl MetadataStore {
     factory: &Arc<dyn StorageFactory>, receipt_retention: Duration, purpose: &str,
     clock: Arc<dyn WallClock>,
   ) -> Result<(Self, Option<ReceiptIdentity>)> {
-    crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+    validate_purpose(purpose, "pending transaction purpose")?;
     // The recovered open walks the production open path: the capability
     // check, the schema gate, and the store construction stay single-
     // sourced in `open_with_state`, so a store whose schema version this
@@ -592,7 +610,7 @@ impl MetadataStore {
   /// from the journal and reconciliation must prove the journaled
   /// transaction committed.
   pub(crate) async fn recover_pending(&self, purpose: &str) -> Result<Option<ReceiptIdentity>> {
-    crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+    validate_purpose(purpose, "pending transaction purpose")?;
     let discovered = {
       let snapshot = self.snapshot().await?;
       discover_pending(snapshot.as_ref(), purpose).await?
@@ -614,7 +632,7 @@ impl MetadataStore {
   pub(crate) async fn cleanup_pending(
     &self, purpose: &str, operation_id: TransactionId,
   ) -> Result<PendingCleanupOutcome> {
-    crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+    validate_purpose(purpose, "pending transaction purpose")?;
     let snapshot = self.snapshot().await?;
     let namespace = pending_namespace()?;
     let key = pending_key(purpose);
@@ -702,7 +720,7 @@ pub(crate) async fn discover_frozen_journal_purpose(
 pub(crate) async fn discover_pending(
   snapshot: &dyn StoreSnapshot, purpose: &str,
 ) -> Result<Option<(StoreValue, PendingTransactionV1)>> {
-  crate::provider::validate_purpose(purpose, "pending transaction purpose")?;
+  validate_purpose(purpose, "pending transaction purpose")?;
   let namespace = pending_namespace()?;
   let key = pending_key(purpose);
   let mut scan = snapshot.scan(&namespace, key.as_bytes()).await?;
@@ -816,20 +834,6 @@ pub(super) fn pending_key(purpose: &str) -> StoreKey {
 fn planned_namespace(value: &str) -> Result<StoreNamespace> {
   Ok(StoreNamespace::new(QualifiedTag::parse(value)?))
 }
-
-// ---- frozen golden vectors (byte-frozen, do not edit) ----
-
-// The frozen `0.1.0` compatibility golden of the pending-transaction
-// record, single-sourced here for the compatibility manifest
-// (`crate::compatibility`): the same journal shape as the owner golden
-// pinned by this module's test suite, but its third planned operation
-// carries a cluster-genesis delete precondition instead of the
-// merge-grant one. It compiles only under `cfg(test)`, like the
-// test-only compatibility manifest itself. The bytes are frozen;
-// changing them is a deliberate compatibility amendment, never a
-// silent edit.
-#[cfg(test)]
-pub(crate) const PENDING_RECORD_COMPAT_GOLDEN: &str = "867831726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f70656e64696e672d7472616e73616374696f6e016e6c6f63616c2d6964656e74697479781974786e2d303132333435363738396162636465666768696a6b4101848400782d726164696174612e776f6f6f6f2e746563682f6d657461646174612f76312f6c6f63616c2d6964656e746974794473656c6681008501782d726164696174612e776f6f6f6f2e746563682f6d657461646174612f76312f6c6f63616c2d6964656e746974794762696e64696e67820158200b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b4c7265636f72642d62797465738402782e726164696174612e776f6f6f6f2e746563682f6d657461646174612f76312f636c75737465722d67656e65736973436f6c6458200c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c8303781974786e2d31313131313131313131313131313131313131313158200d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d";
 
 #[cfg(test)]
 mod tests {
@@ -1162,12 +1166,12 @@ mod tests {
 
   #[test]
   fn identity_records_pending_purpose_is_bounded_printable_ascii() {
-    assert!(crate::provider::validate_purpose("", "test").is_err());
-    assert!(crate::provider::validate_purpose(&"p".repeat(129), "test").is_err());
-    assert!(crate::provider::validate_purpose("bad\tpurpose", "test").is_err());
-    assert!(crate::provider::validate_purpose("bad\u{7f}purpose", "test").is_err());
-    assert!(crate::provider::validate_purpose("node identity", "test").is_ok());
-    assert!(crate::provider::validate_purpose(&"p".repeat(128), "test").is_ok());
+    assert!(validate_purpose("", "test").is_err());
+    assert!(validate_purpose(&"p".repeat(129), "test").is_err());
+    assert!(validate_purpose("bad\tpurpose", "test").is_err());
+    assert!(validate_purpose("bad\u{7f}purpose", "test").is_err());
+    assert!(validate_purpose("node identity", "test").is_ok());
+    assert!(validate_purpose(&"p".repeat(128), "test").is_ok());
   }
 
   #[test]

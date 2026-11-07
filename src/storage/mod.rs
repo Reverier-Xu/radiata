@@ -76,6 +76,15 @@ pub(crate) struct MetadataStore {
   /// retention candidate) instead of rescanning the same retained
   /// prefix forever.
   retention_scan_cursor: receipt::RetentionScanCursor,
+  /// The metadata change signal: one `notify_waiters` per committed
+  /// metadata change a durable watcher follows, so a parked watcher waits
+  /// between commits instead of polling the durable rows. The signal is a
+  /// wake-up only — the durable rows stay the source of truth — so a
+  /// missed wake-up costs one extra read, never a lost change, and the
+  /// commit path never blocks on a consumer. The signal is deliberately
+  /// domain-neutral: the store knows nothing about which domain's watcher
+  /// parks on it.
+  metadata_notify: tokio::sync::Notify,
   /// The register-install epoch: one monotonic bump per installed
   /// resource record commit (see [`Self::note_local_write`]), so
   /// the sync driver observes local catalog changes with one atomic
@@ -215,6 +224,7 @@ impl MetadataStore {
       clock,
       receipt_retention,
       retention_scan_cursor: receipt::RetentionScanCursor::default(),
+      metadata_notify: tokio::sync::Notify::new(),
       register_epoch: std::sync::atomic::AtomicU64::new(0),
       namespace_epochs: std::sync::Mutex::new(std::collections::BTreeMap::new()),
       untracked_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -302,6 +312,21 @@ impl MetadataStore {
     self.register_epoch.load(Ordering::Relaxed)
   }
 
+  /// Wakes every parked metadata watcher after one committed change.
+  /// `notify_waiters` stores no permit and takes no lock, so the commit
+  /// path pays one wake-up and never waits for a consumer.
+  pub(crate) fn notify_metadata_change(&self) {
+    self.metadata_notify.notify_waiters();
+  }
+
+  /// The parked-wait future of one metadata watch step: the caller
+  /// enables it *before* reading the durable rows, so a commit landing
+  /// between the read and the wait is either observed by the read or
+  /// wakes the wait.
+  pub(crate) fn metadata_changed(&self) -> tokio::sync::futures::Notified<'_> {
+    self.metadata_notify.notified()
+  }
+
   /// The shared storage handle this store commits through. The default
   /// key custody wraps the same instance, so keys and metadata share one
   /// exclusive lifetime lock and one crash domain. Callers must hold the
@@ -372,8 +397,11 @@ impl MetadataStore {
       journal_proven: false,
     };
     let deadline = std::time::Instant::now() + ENTRY_WAIT_BOUND;
+    let mut settled_warned = false;
     let call = self
-      .wait_for_entry(deadline, || self.begin_commit(pending.clone()))
+      .wait_for_entry(deadline, || {
+        self.begin_commit(pending.clone(), &mut settled_warned)
+      })
       .await?;
     let result = self.provider.commit(transaction).await;
 
@@ -407,10 +435,7 @@ impl MetadataStore {
              transaction identity"
           );
           self.finish_frozen(call)?;
-          return Err(Error::provider(
-            ProviderErrorKind::StorageCorrupt,
-            ProviderErrorContext::StorageCommit,
-          ));
+          return Err(storage_corrupt(ProviderErrorContext::StorageCommit));
         }
         tracing::warn!(
           transaction = %pending.transaction,
@@ -471,10 +496,7 @@ impl MetadataStore {
             "metadata store stays frozen: reconcile aborted a journal-proven commit"
           );
           self.finish_frozen(call)?;
-          return Err(Error::provider(
-            ProviderErrorKind::StorageCorrupt,
-            ProviderErrorContext::StorageReconcile,
-          ));
+          return Err(storage_corrupt(ProviderErrorContext::StorageReconcile));
         }
         self.finish_ready(call)?;
         Ok(ReconcileOutcome::Aborted)
@@ -507,9 +529,34 @@ impl MetadataStore {
     }
   }
 
-  fn begin_commit(&self, pending: PendingCommit) -> Result<ProviderCall<'_>> {
+  /// Enters the commit slot, or refuses with `NotReady` while the slot
+  /// is taken.
+  ///
+  /// A settled freeze (`Frozen` with no provider call in flight) never
+  /// clears on its own, so the entry wait would park the whole bound with
+  /// no diagnostic: name the pending transaction once per commit attempt
+  /// (`settled_warned`), so the field report says which transaction needs
+  /// the reconcile. The in-flight case stays silent — it is a short
+  /// internal commit the wait queues behind, and a line there would repeat
+  /// on every entry retry.
+  fn begin_commit(
+    &self, pending: PendingCommit, settled_warned: &mut bool,
+  ) -> Result<ProviderCall<'_>> {
     let mut state = self.lock_state()?;
     if !matches!(*state, CommitState::Ready) {
+      if let CommitState::Frozen {
+        pending: frozen,
+        provider_call_active: false,
+      } = &*state
+        && !*settled_warned
+      {
+        *settled_warned = true;
+        tracing::warn!(
+          transaction = %frozen.transaction,
+          "metadata store is frozen on a settled commit and needs reconcile; \
+           the commit entry waits the full bound"
+        );
+      }
       return Err(Error::not_ready("metadata storage commit"));
     }
     *state = CommitState::Frozen {
@@ -577,7 +624,7 @@ impl MetadataStore {
     if receipt.transaction() != &pending.transaction
       || receipt.operation_digest() != &pending.digest
     {
-      return Err(Error::provider(ProviderErrorKind::StorageCorrupt, context));
+      return Err(storage_corrupt(context));
     }
     Ok(())
   }
@@ -675,10 +722,7 @@ impl MetadataStore {
           crate::audit::journal_resolved(purpose, false);
           return Ok(false);
         }
-        Err(Error::provider(
-          ProviderErrorKind::StorageCorrupt,
-          ProviderErrorContext::StorageReconcile,
-        ))
+        Err(storage_corrupt(ProviderErrorContext::StorageReconcile))
       }
       Err(error) => {
         // An evidence read failure is not a classification: the store
@@ -896,10 +940,9 @@ impl MetadataStore {
     }
     match self.reconcile().await? {
       ReconcileOutcome::Committed(_) | ReconcileOutcome::Aborted => Ok(()),
-      ReconcileOutcome::DigestConflict => Err(Error::provider(
-        ProviderErrorKind::StorageCorrupt,
-        ProviderErrorContext::StorageReconcile,
-      )),
+      ReconcileOutcome::DigestConflict => {
+        Err(storage_corrupt(ProviderErrorContext::StorageReconcile))
+      }
       ReconcileOutcome::Unknown => Err(Error::provider(
         ProviderErrorKind::CommitUnknown,
         ProviderErrorContext::StorageReconcile,

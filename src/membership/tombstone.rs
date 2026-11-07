@@ -20,6 +20,7 @@ use crate::{
   api::Entropy,
   identity::{lifecycle::LocalIdentityContext, trust::store as trust_store},
   runtime::RuntimeClient,
+  session::stream::{AuthorizationBoundary, SessionTable},
 };
 
 /// The tombstone arms' shared verification context: the trusted-binding
@@ -27,7 +28,7 @@ use crate::{
 /// or row batch (every arm consults both).
 pub(super) struct TombstoneEvidence {
   bindings: std::collections::BTreeMap<NodeId, crate::PublicKey>,
-  checkpoint: Option<u64>,
+  checkpoint: Option<i64>,
 }
 
 pub(super) async fn tombstone_evidence(
@@ -46,8 +47,39 @@ pub(super) async fn tombstone_evidence(
 /// sender never forwarded a record its own GC had collected; the
 /// reconciliation engines cannot forget rows, so the filter lives
 /// here).
-fn collected(checkpoint: Option<u64>, timestamp_millis: u64) -> bool {
+fn collected(checkpoint: Option<i64>, timestamp_millis: i64) -> bool {
   checkpoint.is_some_and(|watermark| timestamp_millis <= watermark)
+}
+
+/// Whether one tombstone-lane row is collected evidence: a leave or
+/// cleanup record stamped at or before the local checkpoint watermark
+/// (the same predicate the apply boundary fails open on). Revocations are
+/// never collected, and the checkpoint singleton itself never is.
+///
+/// One predicate serves the lane's scan boundary, its receive filter, its
+/// prune, and its derived-view repair, so collected evidence can never
+/// re-enter an engine by any path.
+pub(crate) fn collected_row(checkpoint: Option<i64>, key: &[u8], content: &[u8]) -> bool {
+  let collected_record = |record_stamp: Option<i64>| {
+    checkpoint.is_some_and(|watermark| record_stamp.is_some_and(|stamp| stamp <= watermark))
+  };
+  match key
+    .first()
+    .copied()
+    .and_then(crate::reconcile::wire::TombstoneKind::from_prefix)
+  {
+    Some(crate::reconcile::wire::TombstoneKind::Leave) => collected_record(
+      crate::identity::leave::LeaveRecordV1::decode(content)
+        .ok()
+        .map(|record| record.timestamp_millis()),
+    ),
+    Some(crate::reconcile::wire::TombstoneKind::Cleanup) => collected_record(
+      crate::identity::cleanup::CleanupRecordV1::decode(content)
+        .ok()
+        .map(|record| record.timestamp_millis()),
+    ),
+    _ => false,
+  }
 }
 
 /// Applies one encoded owner-signed leave record: verified against the
@@ -158,8 +190,9 @@ async fn apply_cleanup_record(
 /// before any persistence, never covered by checkpoints, and never
 /// re-adoptable away. A persisted revocation closes the authorization
 /// boundary immediately on this node too — the same boundary the local
-/// revoke effect holds (audit 2026-10-23, P1-11): any live session with
-/// the revoked identity retires, and a handshake already in flight is
+/// revoke effect holds: the durable install lands first, then the
+/// boundary's section records the subject and retires any live session
+/// with the revoked identity, and a handshake already in flight is
 /// refused at its final publication (its recovery dials race the
 /// propagation, so a session admitted before this tombstone landed must
 /// not linger either). Session retirement is independent of the
@@ -181,25 +214,25 @@ async fn apply_revocation_record(
     tracing::debug!(subject = %record.subject(), "revocation record skipped: bindings unknown");
     return Ok(());
   }
-  // The same exclusive section the local revoke effect holds (audit
-  // 2026-10-23, P1-11): the durable tombstone install, the ledger
-  // record, and the session retirement run as ONE section against
-  // session publication. A handshake whose admission predated this
-  // tombstone either published before the section ran (the retirement
-  // below removes it) or re-checks the ledger after the section and
-  // refuses to publish — the remote lane closes the in-flight window
-  // exactly like the local one. The section is short and touches no
-  // network negotiation.
-  let mut revoked = authorization.section().await;
+  // The durable tombstone install runs OUTSIDE the section: it is a
+  // fsync-bound commit, and the section must stay short. The section
+  // then covers only the ledger record and the session retirement
+  // against session publication, which still closes the in-flight
+  // window: a handshake that published before the section is removed by
+  // its retirement, and one that re-checks the ledger after the section
+  // observes the record the durable install already made true. A failed
+  // install takes no section at all and propagates as before, so a
+  // refused revocation row leaves the authorization boundary untouched.
   let transition =
     crate::identity::revocation::persist_revocation_ctx(store, entropy.as_ref(), record).await?;
+  let mut revoked = authorization.section().await;
   revoked.record(record.subject());
   crate::session::stream::retire_session(sessions, record.subject())?;
   drop(revoked);
   // The paired notification the local revoke effect emits: the
   // retirement above removed the session-table entry, so the session
   // task's own exit path cannot report the change — this lane reports
-  // it, SessionChanged first, then NodeRevoked (audit 2026-10-27, B1).
+  // it, SessionChanged first, then NodeRevoked.
   if transition.changed_authorization() {
     events.emit(crate::SessionChanged::new(record.subject().clone()));
     events.emit(crate::NodeRevoked::new(record.subject().clone()));
@@ -234,7 +267,9 @@ enum TombstoneRow {
 /// match the key it arrived under, and a leave row must carry a signature
 /// that verifies. `None` means the row is skipped with its typed reason
 /// already logged — never an error, because one poison row must not wedge
-/// the batch.
+/// the batch. Every `None` is a decided refusal (no retry can make the row
+/// decode, verify, or match its key), so the apply reports it to the
+/// receive boundary as a refused row.
 fn decode_tombstone_row(key: &[u8], content: &[u8]) -> Option<TombstoneRow> {
   let Some((prefix, subject)) = key.split_first() else {
     tracing::debug!("reconcile tombstone row skipped: no kind prefix");
@@ -326,7 +361,7 @@ fn decode_tombstone_row(key: &[u8], content: &[u8]) -> Option<TombstoneRow> {
     }
     crate::reconcile::wire::TombstoneKind::Checkpoint => {
       let checkpoint = match crate::identity::cleanup::CleanupCheckpointV1::decode(content) {
-        Ok(checkpoint) if subject == b"checkpoint" => checkpoint,
+        Ok(checkpoint) if subject == crate::identity::cleanup::CHECKPOINT_KEY => checkpoint,
         Ok(_) => {
           tracing::debug!("reconcile checkpoint row skipped: subject mismatch");
           return None;
@@ -445,39 +480,56 @@ async fn apply_revocation_row(
   }
 }
 
+/// The tombstone apply's collaborators, bundled once per apply: the
+/// plane-wide handles the per-record arms report through, plus the
+/// session/authorization pair the revocation arm's durable install and
+/// retirement serializes against. One struct keeps the apply path's
+/// argument lists to the inputs a caller actually varies (rows, source,
+/// runtime).
+pub(crate) struct TombstoneApply<'a> {
+  pub(crate) context: &'a Arc<LocalIdentityContext>,
+  pub(crate) entropy: &'a Arc<dyn Entropy>,
+  pub(crate) events: &'a Arc<crate::node::EventHub>,
+  pub(crate) revision: &'a crate::node::MemberRevisionSignal,
+  pub(crate) sessions: &'a SessionTable,
+  pub(crate) authorization: &'a AuthorizationBoundary,
+}
+
 /// The tombstone lane's reconciliation row apply: kind-prefixed keys
 /// (the wire contract's [`crate::reconcile::wire::TombstoneKind`]
 /// prefixes) dispatch to the same per-record
 /// arms the announcement payload uses, so both planes verify, persist,
 /// notify, and collect identically. `source` addresses the applied
 /// receipt to the peer that carried the rows; the derived-view repair
-/// passes `None`.
-#[allow(clippy::too_many_arguments)]
+/// passes `None`. Returns the rows the decode phase **refused** (see
+/// [`decode_tombstone_row`]): decided evidence no retry can change, so the
+/// receive boundary drops them from engine admission instead of
+/// re-delivering them forever.
 pub(crate) async fn apply_tombstone_rows(
-  context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>,
-  events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
-  sessions: &crate::session::stream::SessionTable,
-  authorization: &crate::session::stream::AuthorizationBoundary, rows: &[(Vec<u8>, Vec<u8>)],
-  source: Option<&NodeId>, runtime: Option<&RuntimeClient>,
-) -> Result<()> {
-  let store = context.store();
+  apply: &TombstoneApply<'_>, rows: &[(Vec<u8>, Vec<u8>)], source: Option<&NodeId>,
+  runtime: Option<&RuntimeClient>,
+) -> Result<crate::reconcile::lane::LaneRows> {
+  let store = apply.context.store();
   let evidence = tombstone_evidence(store).await?;
   // Row-level fault tolerance, the scan side's corrupt-row policy: one
-  // undecodable or misattributed tombstone row skips with a typed reason
-  // instead of failing the batch — a whole-batch error would wedge the
-  // derived-view repair on the same poison row forever. Store failures
-  // inside the apply arms still propagate: they are real write faults.
+  // undecodable or misattributed tombstone row is refused with a typed
+  // reason instead of failing the batch — a whole-batch error would wedge
+  // the derived-view repair on the same poison row forever. The refusal is
+  // collected for the receive boundary; store failures inside the apply
+  // arms still propagate, because they are real write faults.
+  let mut refused = crate::reconcile::lane::LaneRows::new();
   for (key, content) in rows {
     let Some(row) = decode_tombstone_row(key, content) else {
+      refused.push((key.clone(), content.clone()));
       continue;
     };
     match row {
       TombstoneRow::Leave(record) => {
         apply_leave_row(
           store,
-          entropy,
-          events,
-          revision,
+          apply.entropy,
+          apply.events,
+          apply.revision,
           &evidence,
           &record,
           source.zip(runtime),
@@ -485,38 +537,173 @@ pub(crate) async fn apply_tombstone_rows(
         .await?;
       }
       TombstoneRow::Cleanup(record) => {
-        apply_cleanup_row(store, entropy, events, revision, &evidence, &record).await?;
+        apply_cleanup_row(
+          store,
+          apply.entropy,
+          apply.events,
+          apply.revision,
+          &evidence,
+          &record,
+        )
+        .await?;
       }
       TombstoneRow::Revocation(record) => {
         apply_revocation_row(
           store,
-          entropy,
-          events,
+          apply.entropy,
+          apply.events,
           &evidence,
           &record,
-          sessions,
-          authorization,
+          apply.sessions,
+          apply.authorization,
         )
         .await?;
       }
       TombstoneRow::Checkpoint(checkpoint) => {
-        apply_checkpoint_record(store, entropy, &checkpoint).await?;
+        apply_checkpoint_record(store, apply.entropy, &checkpoint).await?;
       }
     }
   }
-  Ok(())
+  Ok(refused)
 }
 
-/// The post-round checkpoint GC: collect the
-/// leave/cleanup tombstones at or before the local checkpoint watermark.
-/// Hygiene only — a failure is logged and retried next round.
-pub(super) async fn gc_collected_tombstones(
-  store: &crate::storage::MetadataStore, entropy: &Arc<dyn Entropy>,
-) {
-  if let Err(error) =
-    crate::identity::cleanup::collect_collected_tombstones_ctx(store, entropy.as_ref()).await
-  {
-    tracing::debug!(kind = ?error.kind(), "checkpoint gc pass failed");
+/// The tombstones lane: the four terminal record families (leave, cleanup,
+/// revocation, and the cleanup checkpoint watermark) under one key space.
+#[derive(Debug)]
+pub(crate) struct TombstonesLane;
+
+impl TombstonesLane {
+  /// The lane's store namespaces, in kind order: the lane↔namespace map,
+  /// single-sourced from the wire contract's kind table (the lane
+  /// registry projects it).
+  pub(crate) const NAMESPACES: [&str; 4] = [
+    crate::reconcile::wire::TombstoneKind::Leave.namespace_tag(),
+    crate::reconcile::wire::TombstoneKind::Cleanup.namespace_tag(),
+    crate::reconcile::wire::TombstoneKind::Revocation.namespace_tag(),
+    crate::reconcile::wire::TombstoneKind::Checkpoint.namespace_tag(),
+  ];
+
+  /// The lane's immutable wire code: the frozen reconcile-wire v1 contract
+  /// the registry's wire projections read.
+  pub(crate) const CODE: u8 = 4;
+}
+
+impl crate::reconcile::lane::Lane for TombstonesLane {
+  fn id(&self) -> crate::reconcile::wire::LaneId {
+    crate::reconcile::wire::LaneId::Tombstones
+  }
+
+  fn scan<'a>(
+    &self, snapshot: &'a dyn crate::provider::StoreSnapshot,
+  ) -> crate::api::BoxFuture<'a, Result<crate::reconcile::lane::LaneRows>> {
+    Box::pin(async move {
+      use crate::reconcile::wire::TombstoneKind;
+
+      // The lane's collected-row watermark, self-served from the scan's
+      // own snapshot: the checkpoint singleton this scan reads anyway is
+      // the row the watermark derives from, so the scan and its
+      // collected-row filter judge one store instant.
+      let checkpoint = crate::identity::cleanup::latest_checkpoint_millis(snapshot).await?;
+      let mut rows = crate::reconcile::lane::LaneRows::new();
+      for kind in TombstoneKind::ALL {
+        if kind == TombstoneKind::Checkpoint {
+          // The cleanup checkpoint singleton: one row, max-wins at apply.
+          let namespace = crate::storage::families::namespace(kind.namespace_tag())?;
+          let key = crate::identity::cleanup::checkpoint_key();
+          if let Some(value) = snapshot.get(&namespace, &key).await? {
+            rows.push((kind.row_key(key.as_bytes()), value.as_bytes().to_vec()));
+          }
+          continue;
+        }
+        let namespace = crate::storage::families::namespace(kind.namespace_tag())?;
+        let mut raw = crate::reconcile::lane::LaneRows::new();
+        let mut scan = snapshot.scan(&namespace, &[]).await?;
+        while let Some(entry) = scan.next().await? {
+          let key = entry.key().as_bytes().to_vec();
+          let value = entry.value().as_bytes().to_vec();
+          if !kind.decodable(&key, &value) {
+            tracing::debug!(
+              namespace = %kind.namespace_tag(),
+              key = %String::from_utf8_lossy(&key),
+              "reconcile lane scan skipped an undecodable row"
+            );
+            continue;
+          }
+          raw.push((key, value));
+        }
+        for (key, content) in raw {
+          let row_key = kind.row_key(&key);
+          if collected_row(checkpoint, &row_key, &content) {
+            continue;
+          }
+          rows.push((row_key, content));
+        }
+      }
+      Ok(rows)
+    })
+  }
+
+  fn reclaimed(
+    &self, _key_present: bool, key: &[u8], content: &[u8],
+    _basis: &crate::reconcile::lane::SweptBasis, checkpoint: Option<i64>,
+  ) -> bool {
+    collected_row(checkpoint, key, content)
+  }
+
+  fn reads_checkpoint(&self) -> bool {
+    true
+  }
+
+  fn receive<'a>(
+    &self, ctx: &'a crate::reconcile::lane::LaneContext<'a>,
+    _basis: &'a crate::reconcile::lane::SweptBasis, rows: &'a mut crate::reconcile::lane::LaneRows,
+  ) -> crate::api::BoxFuture<'a, Result<()>> {
+    Box::pin(async move {
+      // The collected-row receive filter: a leave or cleanup record at or
+      // before the local checkpoint watermark never enters an engine (its
+      // fingerprints, its fan-out, and its repair-set candidacy alike) —
+      // re-admitting collected evidence is what made the GC rows
+      // re-propagate forever.
+      let checkpoint =
+        crate::identity::cleanup::latest_checkpoint_millis_ctx(ctx.context.store()).await?;
+      rows.retain(|(key, content)| !collected_row(checkpoint, key, content));
+      Ok(())
+    })
+  }
+
+  fn apply<'a>(
+    &self, ctx: &'a crate::reconcile::lane::LaneContext<'a>,
+    rows: &'a crate::reconcile::lane::LaneRows, source: Option<&'a NodeId>,
+    runtime: Option<&'a RuntimeClient>, sessions: &'a SessionTable,
+    authorization: &'a AuthorizationBoundary,
+  ) -> crate::api::BoxFuture<'a, Result<crate::reconcile::lane::LaneOutcome>> {
+    Box::pin(async move {
+      let refused = apply_tombstone_rows(
+        &TombstoneApply {
+          context: ctx.context,
+          entropy: ctx.entropy,
+          events: ctx.events,
+          revision: ctx.revision,
+          sessions,
+          authorization,
+        },
+        rows,
+        source,
+        runtime,
+      )
+      .await?;
+      // The refused rows are the decode-phase refusals — a row with no
+      // kind prefix, an unknown kind prefix, an undecodable record, a
+      // subject/key mismatch, or an untrusted leave signature. They are
+      // decided evidence: no re-delivery can make them decode, verify, or
+      // match their key, so the receive boundary drops them from engine
+      // admission instead of re-announcing them forever. The in-arm policy
+      // skips (a subject binding that has not converged, contention) stay
+      // out: their retry is the designed transient path and lives in the
+      // engine, so every such row stays a repair candidate until its
+      // binding lands.
+      Ok(crate::reconcile::lane::LaneOutcome { refused })
+    })
   }
 }
 
@@ -561,7 +748,7 @@ mod tests {
   /// retirement stays independent of the evidence verdict: an
   /// already-revoked identity's live session still retires.
   ///
-  /// Regression (audit 2026-10-27, B1): a revocation that changes
+  /// Regression: a revocation that changes
   /// authorization through the sync lane reports the session change too
   /// — one `SessionChanged` pairing with the one `NodeRevoked`, both for
   /// the revoked subject, in the same branch — exactly the pair the local
@@ -619,7 +806,7 @@ mod tests {
         crate::Signature::from_bytes(signature.to_bytes()),
       )
     };
-    let cleanup = |stamp: u64| {
+    let cleanup = |stamp: i64| {
       let body =
         CleanupRecordV1::encode_signed_body(&subject, &subject_key, &issuer, stamp).unwrap();
       let signature = issuer_signing.sign(&signature_message(
@@ -656,26 +843,28 @@ mod tests {
     let revision = crate::node::MemberRevisionSignal::new(revision_tx);
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     // The boundary the production wiring shares between the tombstone
-    // lane and session publication (audit 2026-10-23, P1-11).
+    // lane and session publication.
     let authorization = crate::session::stream::AuthorizationBoundary::default();
     let mut revoked_events = events.subscribe::<crate::NodeRevoked>(crate::EventOptions::new());
     let mut member_events = events.subscribe::<crate::MemberChanged>(crate::EventOptions::new());
     let mut session_events = events.subscribe::<crate::SessionChanged>(crate::EventOptions::new());
 
     // The first delivery is the real transition: one revocation event,
-    // one paired session event (B1 parity with the local revoke path),
+    // one paired session event (parity with the local revoke path),
     // and one member revision for the cleanup install.
     let first_rows = vec![
       row(3, &subject, loser.encode().unwrap()),
       row(2, &subject, cleanup(9_000).encode().unwrap()),
     ];
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &first_rows,
       None,
       None,
@@ -693,12 +882,14 @@ mod tests {
 
     // An exact replay notifies nothing and bumps nothing.
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &first_rows,
       None,
       None,
@@ -714,12 +905,14 @@ mod tests {
     // exactly one notification.
     let replacement_rows = vec![row(2, &subject, cleanup(5_000).encode().unwrap())];
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &replacement_rows,
       None,
       None,
@@ -737,12 +930,14 @@ mod tests {
     sessions.lock().unwrap().insert(subject.clone(), entry);
     let replacement_rows = vec![row(3, &subject, winner_bytes.clone())];
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &replacement_rows,
       None,
       None,
@@ -784,12 +979,12 @@ mod tests {
       .to_vec()
   }
 
-  /// Regression (audit A01): one divergent terminal record must never
+  /// Regression: one divergent terminal record must never
   /// abort a tombstone batch — the cleanup and revocation arms refuse the
   /// row (warn + continue) exactly like the leave arm, a same-binding
   /// divergent cleanup row merges to its canonical winner instead of
   /// conflicting, and rows ordered after a refused row still apply in
-  /// the same pass. Before the fix, the `?` on the apply arms wedged the
+  /// the same pass. A `?` on the apply arms would wedge the
   /// derived-view repair on the same poison row every epoch.
   #[tokio::test]
   async fn divergent_tombstone_rows_refuse_row_wise_and_never_abort_the_batch() {
@@ -851,7 +1046,7 @@ mod tests {
         crate::Signature::from_bytes(signature.to_bytes()),
       )
     };
-    let cleanup_of = |subject_key: &crate::PublicKey, stamp: u64| {
+    let cleanup_of = |subject_key: &crate::PublicKey, stamp: i64| {
       let body =
         CleanupRecordV1::encode_signed_body(&cleaned, subject_key, &issuer, stamp).unwrap();
       let signature = issuer_signing.sign(&signature_message(
@@ -922,12 +1117,14 @@ mod tests {
     let authorization = crate::session::stream::AuthorizationBoundary::default();
 
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &rows,
       None,
       None,
@@ -954,10 +1151,263 @@ mod tests {
     // The leave row ordered after the poison rows applied in the same
     // pass — the batch did not abort.
     assert!(is_left_ctx(store, &leaver).await.unwrap());
+    // The refused revocation row's failed install left the shared
+    // authorization boundary untouched: no section was taken, so the
+    // subject's session publication stays ungated by a revocation that
+    // never landed.
+    assert!(
+      !authorization.section().await.contains(&revoked),
+      "a revocation whose persist failed must not record its subject"
+    );
+  }
+
+  /// The decode-phase refusals are decided evidence: a row with no kind
+  /// prefix, an unknown kind prefix, an undecodable record, a subject/key
+  /// mismatch, and an untrusted leave signature all come back as refused
+  /// rows, so the receive boundary drops them from engine admission
+  /// instead of gossiping them forever. The valid row in the same batch
+  /// still applies and is not refused: the refusals are per row, never
+  /// batch-wide.
+  #[tokio::test]
+  async fn undecodable_and_unverifiable_rows_are_refused() {
+    use ed25519_dalek::Signer as _;
+
+    use crate::{
+      identity::{
+        cleanup::{CleanupRecordV1, known_cleanup_records_ctx},
+        leave::LeaveRecordV1,
+        signature::signature_message,
+        testing::{ScriptedKeys, SequenceEntropy, fresh_reference, open_context},
+      },
+      reconcile::lane::LaneContext,
+    };
+
+    let (_reference, factory) = fresh_reference();
+    let keys = ScriptedKeys::full_at(9_500);
+    let scripted_entropy = Arc::new(SequenceEntropy::default());
+    let entropy: Arc<dyn Entropy> = scripted_entropy.clone();
+    let context = Arc::new(
+      open_context(&factory, &keys, &scripted_entropy)
+        .await
+        .unwrap(),
+    );
+    let store = context.store();
+
+    let subject = node_at(9_510);
+    let subject_key = key_at(9_511);
+    let issuer = node_at(9_520);
+    let issuer_signing = crate::identity::testing::scripted_signing(9_521);
+    for (node, key) in [
+      (subject.clone(), subject_key.clone()),
+      (issuer.clone(), key_at(9_521)),
+    ] {
+      crate::identity::trust::store::adopt_binding_ctx(store, entropy.as_ref(), &node, &key)
+        .await
+        .unwrap();
+    }
+
+    let cleanup = |recorded: &NodeId, recorded_key: &crate::PublicKey, stamp: i64| {
+      let body =
+        CleanupRecordV1::encode_signed_body(recorded, recorded_key, &issuer, stamp).unwrap();
+      let signature = issuer_signing.sign(&signature_message(
+        crate::identity::cleanup::CLEANUP_RECORD_DOMAIN,
+        &body,
+      ));
+      CleanupRecordV1::new(
+        recorded.clone(),
+        recorded_key.clone(),
+        issuer.clone(),
+        stamp,
+        crate::Signature::from_bytes(signature.to_bytes()),
+      )
+    };
+    let row_key = |kind: u8, of: &NodeId| {
+      let mut key = Vec::with_capacity(1 + of.as_str().len());
+      key.push(kind);
+      key.extend_from_slice(of.as_str().as_bytes());
+      key
+    };
+
+    let valid = cleanup(&subject, &subject_key, 5_000).encode().unwrap();
+    let other_subject = node_at(9_530);
+    let rows = vec![
+      // No kind prefix at all.
+      (Vec::new(), b"no-kind".to_vec()),
+      // A prefix outside the closed kind table.
+      (vec![0xFF], b"unknown-kind".to_vec()),
+      // A leave row whose content does not decode.
+      (row_key(1, &subject), vec![0x00]),
+      // A cleanup row whose record names another subject.
+      (
+        row_key(2, &subject),
+        cleanup(&other_subject, &key_at(9_531), 5_000)
+          .encode()
+          .unwrap(),
+      ),
+      // A leave row whose signature does not verify.
+      (
+        row_key(1, &subject),
+        LeaveRecordV1::new(
+          subject.clone(),
+          subject_key.clone(),
+          1_000,
+          crate::Signature::from_bytes([0_u8; 64]),
+        )
+        .encode()
+        .unwrap(),
+      ),
+      // The one valid row: it applies and is not refused.
+      (row_key(2, &subject), valid),
+    ];
+    let expected_refused = rows[..5].to_vec();
+
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let authorization = crate::session::stream::AuthorizationBoundary::default();
+    let lane_context = LaneContext {
+      context: &context,
+      entropy: &entropy,
+      events: &events,
+      revision: &revision,
+    };
+    let outcome = crate::reconcile::wire::LaneId::Tombstones
+      .policy()
+      .apply(&lane_context, &rows, None, None, &sessions, &authorization)
+      .await
+      .unwrap();
+    assert_eq!(
+      outcome.refused, expected_refused,
+      "every decided refusal is reported to the receive boundary"
+    );
+    // The valid row in the same batch applied: the batch was not aborted.
+    assert!(
+      known_cleanup_records_ctx(store, 64)
+        .await
+        .unwrap()
+        .iter()
+        .any(|record| record.subject() == &subject),
+      "the valid row in the refused batch still applies"
+    );
+  }
+
+  /// The tombstone lane's durable install runs OUTSIDE the authorization
+  /// section: the section covers only the ledger record and the session
+  /// retirement. The regression this guards is the install running under
+  /// the section, which held every session publication (and the local
+  /// revoke effect) behind a fsync-bound commit.
+  #[tokio::test]
+  async fn the_revocation_install_lands_before_the_authorization_section() {
+    use ed25519_dalek::Signer as _;
+
+    use crate::identity::{
+      revocation::{REVOCATION_RECORD_DOMAIN, RevocationRecordV1, revoked_key_ctx},
+      signature::signature_message,
+      testing::{ScriptedKeys, SequenceEntropy, fresh_reference, open_context},
+    };
+
+    let (_reference, factory) = fresh_reference();
+    let keys = ScriptedKeys::full_at(9_960);
+    let scripted_entropy = Arc::new(SequenceEntropy::default());
+    let entropy: Arc<dyn Entropy> = scripted_entropy.clone();
+    let context = Arc::new(
+      open_context(&factory, &keys, &scripted_entropy)
+        .await
+        .unwrap(),
+    );
+    let store = context.store();
+
+    let subject = node_at(9_961);
+    let subject_key = key_at(9_962);
+    let issuer = node_at(9_963);
+    let issuer_signing = crate::identity::testing::scripted_signing(9_964);
+    for (node, key) in [
+      (issuer.clone(), key_at(9_964)),
+      (subject.clone(), subject_key.clone()),
+    ] {
+      crate::identity::trust::store::adopt_binding_ctx(store, entropy.as_ref(), &node, &key)
+        .await
+        .unwrap();
+    }
+
+    let body = RevocationRecordV1::encode_signed_body(&subject, &subject_key, &issuer).unwrap();
+    let signature = issuer_signing.sign(&signature_message(REVOCATION_RECORD_DOMAIN, &body));
+    let revocation = RevocationRecordV1::new(
+      subject.clone(),
+      subject_key.clone(),
+      issuer.clone(),
+      crate::Signature::from_bytes(signature.to_bytes()),
+    );
+    let mut key = Vec::with_capacity(1 + subject.as_str().len());
+    key.push(3);
+    key.extend_from_slice(subject.as_str().as_bytes());
+    let rows = vec![(key, revocation.encode().unwrap())];
+
+    let events = Arc::new(crate::node::EventHub::new());
+    let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
+    let revision = crate::node::MemberRevisionSignal::new(revision_tx);
+    let sessions: SessionTable = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let (entry, _frames) = crate::session::stream::test_entry(&crate::api::SystemEntropy);
+    sessions.lock().unwrap().insert(subject.clone(), entry);
+    let authorization = crate::session::stream::AuthorizationBoundary::default();
+
+    // Hold the boundary the way a finishing handshake does: the apply
+    // must still land its durable record, then wait for the section.
+    let held = authorization.section().await;
+    let apply = tokio::spawn({
+      let context = Arc::clone(&context);
+      let entropy = Arc::clone(&entropy);
+      let events = Arc::clone(&events);
+      let revision = revision.clone();
+      let sessions = Arc::clone(&sessions);
+      let authorization = authorization.clone();
+      async move {
+        apply_tombstone_rows(
+          &TombstoneApply {
+            context: &context,
+            entropy: &entropy,
+            events: &events,
+            revision: &revision,
+            sessions: &sessions,
+            authorization: &authorization,
+          },
+          &rows,
+          None,
+          None,
+        )
+        .await
+      }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+      while revoked_key_ctx(store, &subject).await.unwrap().is_none() {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("the durable revocation lands without the authorization section");
+    assert!(
+      !apply.is_finished(),
+      "the ledger record waits for the section instead of the install holding it"
+    );
+    assert!(
+      !held.contains(&subject),
+      "the durable install alone records nothing in the ledger"
+    );
+
+    // The section is free again: the ledger record and the retirement
+    // run behind it.
+    drop(held);
+    apply.await.unwrap().unwrap();
+    assert!(authorization.section().await.contains(&subject));
+    assert!(
+      sessions.lock().unwrap().get(&subject).is_none(),
+      "the section retires the revoked subject's live session"
+    );
   }
 
   /// The tombstone lane records its revocations in the shared
-  /// authorization boundary (audit 2026-10-23, P1-11): a subject whose
+  /// authorization boundary: a subject whose
   /// remote tombstone landed through sync must be refused at session
   /// publication exactly like a locally revoked one. A fresh install and
   /// an unchanged replay both leave the subject in the ledger (both
@@ -1036,12 +1486,14 @@ mod tests {
       ),
     ];
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &rows,
       None,
       None,
@@ -1061,12 +1513,14 @@ mod tests {
     // ledger keeps recording it, mirroring the local revoke effect's
     // fresh-commit-and-replay alike.
     apply_tombstone_rows(
-      &context,
-      &entropy,
-      &events,
-      &revision,
-      &sessions,
-      &authorization,
+      &TombstoneApply {
+        context: &context,
+        entropy: &entropy,
+        events: &events,
+        revision: &revision,
+        sessions: &sessions,
+        authorization: &authorization,
+      },
       &rows,
       None,
       None,

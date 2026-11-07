@@ -371,7 +371,7 @@ async fn leave_announces_to_connected_peers_before_rotating() {
 
   // A still-visible left member is annotated as Left, never Active: the
   // descriptor stays as verification evidence, so the status is the
-  // liveness signal (finding #9).
+  // liveness signal.
   let page = listener
     .members()
     .list(PageSpec::first(8).unwrap())
@@ -639,11 +639,10 @@ async fn redb_leave_restart_shows_only_the_replacement() {
 
 /// A restarted node must passively rejoin connectivity: its persisted
 /// descriptors behind trusted bindings seed the recovery plane once, so
-/// the node dials its known members without operator action (finding
-/// #4). No listener is opened on the restarted node — the healing is
-/// entirely its own outbound dial.
-/// Past the reconnect, the lane is the runtime recovery-evidence
-/// channel (audit A8; evidence class `E2e` in the test-support
+/// the node dials its known members without operator action. No listener is
+/// opened on the restarted node — the healing is entirely its own outbound
+/// dial. Past the reconnect, the lane is the runtime recovery-evidence
+/// channel (evidence class `E2e` in the test-support
 /// `ProducerKind` taxonomy — real nodes, real TLS transport, and a
 /// durable reopen — distinct from the `src/simulation` model's
 /// Simulation-classified evidence): both ends' public views converge
@@ -747,7 +746,7 @@ async fn restarted_node_passively_reconnects(
   // Restart on the SAME durable store: no Listen, no join, no connect —
   // the only path back is recovery seeding from the persisted evidence.
   // The storage shutdown barrier covers every execution that could hold
-  // the store's lock past the reply (audit 2026-10-27 B3), so the
+  // the store's lock past the reply, so the
   // restart opens directly with no retry.
   let restarted = NodeBuilder::new(storage.clone())
     .keys(keys.clone())
@@ -914,7 +913,7 @@ async fn leave_restart_shows_only_the_replacement(storage: Arc<dyn StorageFactor
   // the local view resolves to exactly the replacement. The previous
   // node's shutdown reply returned only after the storage execution
   // barrier drained every database-holding execution (commits and
-  // snapshots; audit 2026-10-27 B3), so the reopen is immediate and
+  // snapshots), so the reopen is immediate and
   // un-retried — a `StorageLocked` here is a regression, not a settle
   // to tolerate.
   let handle = NodeBuilder::new(Arc::clone(&storage))

@@ -1,15 +1,17 @@
-//! Built-in transport override integration lane.
+//! Caller-registered transport over an official scheme name — integration
+//! lane.
 //!
-//! Exercises the explicit built-in override surface exactly as a caller
-//! would: an in-memory hub medium implements [`radiata::TransportProvider`]
-//! and replaces the built-in WSS transport through
-//! [`radiata::ExtensionRegistry::override_builtin_transport`] on every
-//! node, so the `wss://` selector is served end to end by the caller's
-//! implementation — an in-memory bus no built-in transport could ever
-//! reach — and two real nodes complete a full secure merge addressed by
-//! the built-in URL form. The control case proves the opposite
-//! direction: with no override installed, the same flow over `tls://`
-//! is carried by the built-in transport.
+//! Proves there is no transport privilege: one in-memory hub medium
+//! implements [`radiata::TransportProvider`] and registers under the
+//! official `wss` scheme name through [`radiata::ExtensionRegistry::
+//! register_transport`] on every node. The registration lands before the
+//! registry's default path runs, so it occupies the name and the official
+//! WSS transport never installs; the `wss://` selector is then served end
+//! to end by the caller's implementation — an in-memory bus no built-in
+//! transport could ever reach — and two real nodes complete a full secure
+//! merge addressed by the official URL form. The control case proves the
+//! opposite direction: with no competing registration, the same flow over
+//! `tls://` is carried by the built-in transport.
 
 use std::{
   collections::HashMap,
@@ -17,8 +19,8 @@ use std::{
 };
 
 use radiata::{
-  Endpoint, Error, MergeCredential, NodeBuilder, NodeHandle, ProviderListener, TransportProvider,
-  TransportScheme, TransportStream,
+  AcceptedStream, Endpoint, Error, MergeCredential, NodeBuilder, NodeHandle, ProviderListener,
+  TransportName, TransportProvider, TransportStream,
 };
 use tokio::sync::mpsc;
 
@@ -27,10 +29,11 @@ mod common;
 use common::{MemoryStorageFactory, ScriptedKeys};
 
 /// Routes inbound streams from dialers to bound listeners by canonical
-/// endpoint text. A built-in override receives the built-in URL form
-/// (`wss://host:port`), so the medium keys its routing table on the
-/// canonical text and interprets the host and port itself — here the
-/// address names a hub destination instead of a network socket.
+/// endpoint text. A registration under an official scheme name receives
+/// the official URL form (`wss://host:port`), so the medium keys its
+/// routing table on the canonical text and interprets the host and port
+/// itself — here the address names a hub destination instead of a network
+/// socket.
 #[derive(Debug, Default)]
 struct Hub {
   listeners: Mutex<HashMap<String, mpsc::Sender<Box<dyn TransportStream>>>>,
@@ -141,12 +144,13 @@ impl ProviderListener for HubListener {
     self.endpoint.clone()
   }
 
-  fn accept(&self) -> radiata::BoxFuture<'_, radiata::Result<Box<dyn TransportStream>>> {
+  fn accept(&self) -> radiata::BoxFuture<'_, radiata::Result<AcceptedStream>> {
     Box::pin(async {
       let mut receiver = self.receiver.lock().await;
       receiver
         .recv()
         .await
+        .map(AcceptedStream::new)
         .ok_or_else(|| Error::caller("hub listener closed"))
     })
   }
@@ -170,16 +174,16 @@ fn init_tracing() {
 }
 
 /// Starts one node whose `wss` selector is served by the hub medium: the
-/// override is installed before start, so the builder's seeding skips the
-/// built-in WSS transport for that node.
+/// registration is installed before start, so the builder's default path
+/// skips the built-in WSS transport for that node.
 async fn start_override_node(hub: &Arc<Hub>, seed: u64) -> NodeHandle {
   init_tracing();
   let factory: Arc<dyn radiata::extension::StorageFactory> =
     Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let mut extensions = radiata::ExtensionRegistry::new();
   extensions
-    .override_builtin_transport(
-      TransportScheme::Wss,
+    .register_transport(
+      TransportName::parse("wss").unwrap(),
       Arc::new(HubTransport(Arc::clone(hub))),
     )
     .unwrap();
@@ -205,7 +209,7 @@ async fn merge_over(
     .wait()
     .await
     .unwrap();
-  // The override reports the requested address verbatim; the built-in
+  // The hub reports the requested address verbatim; the built-in
   // TLS listener resolves port zero to the OS-assigned port, so the
   // dial targets the listener's own resolved form.
   let dial = listener.endpoint().clone();
@@ -234,14 +238,16 @@ async fn merge_over(
   )
 }
 
-/// An overridden built-in selector is served by the caller's
-/// implementation: both nodes replace `wss` with the in-memory hub before
-/// start, and a full secure merge over the built-in `wss://` address form
-/// completes. The hub has no sockets, so the built-in WSS transport could
-/// not have carried any part of the session — the dial and the listen
-/// both resolved to the override.
+/// A caller registration under an official scheme name serves the
+/// official selector end to end: both nodes claim `wss` before start, the
+/// default path skips the official transport, and a full secure merge
+/// over the official `wss://` address form completes through the caller's
+/// implementation. The hub has no sockets, so the built-in WSS transport
+/// could not have carried any part of the session — the dial and the
+/// listen both resolved to the caller's transport, with no specialization
+/// in either direction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn overridden_builtin_carries_the_full_merge_over_the_caller_medium() {
+async fn caller_registration_serves_the_official_scheme_over_the_caller_medium() {
   let hub = Arc::new(Hub::default());
   let receiver = start_override_node(&hub, 30_000).await;
   let joiner = start_override_node(&hub, 40_000).await;
@@ -258,8 +264,9 @@ async fn overridden_builtin_carries_the_full_merge_over_the_caller_medium() {
   joiner.shutdown().await.unwrap();
 }
 
-/// The control direction: with no override installed, the same flow over
-/// the built-in `tls://` form is carried by the built-in TLS transport.
+/// The control direction: with no competing registration, the same flow
+/// over the built-in `tls://` form is carried by the built-in TLS
+/// transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn builtins_serve_their_selectors_when_not_overridden() {
   init_tracing();

@@ -18,11 +18,12 @@ use std::{collections::BTreeMap, fmt, sync::Mutex};
 use ed25519_dalek::{Signer as _, SigningKey};
 
 use super::{
-  custody_corrupt, fresh_secret, handle_for, operation_from_handle, validate_delete_pair,
+  created_key, custody_corrupt, fresh_secret, handle_for, operation_from_handle,
+  validate_delete_pair,
 };
 use crate::{
-  BoxFuture, CreatedKey, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
-  KeyOperationId, ProviderErrorContext, PublicKey, Result, Signature, provider::KeyProvider,
+  BoxFuture, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId,
+  ProviderErrorContext, PublicKey, Result, Signature, provider::KeyProvider,
 };
 
 /// The process-lifetime key store: all custody is lost when the value
@@ -42,11 +43,11 @@ impl EphemeralKeyStore {
     let handle = handle_for(operation)?;
     let mut records = self.lock();
     if let Some(signing) = records.get(handle.expose_provider_handle()) {
-      return Ok(KeyCreateState::Present(Self::created(&handle, signing)));
+      return Ok(KeyCreateState::Present(created_key(&handle, signing)));
     }
     let secret = fresh_secret()?;
     let signing = SigningKey::from_bytes(&secret);
-    let created = Self::created(&handle, &signing);
+    let created = created_key(&handle, &signing);
     records.insert(handle.expose_provider_handle().to_vec(), signing);
     Ok(KeyCreateState::Present(created))
   }
@@ -55,7 +56,7 @@ impl EphemeralKeyStore {
     let handle = handle_for(operation)?;
     let records = self.lock();
     match records.get(handle.expose_provider_handle()) {
-      Some(signing) => Ok(KeyCreateState::Present(Self::created(&handle, signing))),
+      Some(signing) => Ok(KeyCreateState::Present(created_key(&handle, signing))),
       // Within one process lifetime an absent record is provable; the
       // file-backed store's torn states do not exist here.
       None => Ok(KeyCreateState::Absent),
@@ -76,13 +77,6 @@ impl EphemeralKeyStore {
       .records
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner)
-  }
-
-  fn created(handle: &KeyHandle, signing: &SigningKey) -> CreatedKey {
-    CreatedKey::new(
-      handle.clone(),
-      PublicKey::from_bytes(signing.verifying_key().to_bytes()),
-    )
   }
 }
 

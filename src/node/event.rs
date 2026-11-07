@@ -5,7 +5,7 @@ use std::{
 
 use tokio::sync::broadcast;
 
-use crate::{Error, Event, Result};
+use crate::{Error, Event, EventTag, Result, operation::TaggedEvent};
 
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 
@@ -45,11 +45,15 @@ pub struct EventSubscription<E: Event> {
 /// `try_recv`, and `poll_next` share one channel position.
 enum SubscriptionState<E: Event> {
   Idle(broadcast::Receiver<E>),
-  InFlight(crate::BoxFuture<'static, (RawReceive<E>, broadcast::Receiver<E>)>),
+  InFlight(PendingReceive<E>),
   Terminated,
 }
 
 type RawReceive<E> = std::result::Result<E, broadcast::error::RecvError>;
+
+/// One parked receive future and the receiver it hands back on
+/// resolution.
+type PendingReceive<E> = crate::BoxFuture<'static, (RawReceive<E>, broadcast::Receiver<E>)>;
 
 /// Maps one raw broadcast receive to the contract item plus the terminal
 /// flag: `Closed` is terminal (yielded once, then the stream ends).
@@ -62,24 +66,39 @@ fn map_receive<E: Event>(raw: RawReceive<E>) -> (EventReceive<E>, bool) {
 }
 
 impl<E: Event> EventSubscription<E> {
-  pub async fn recv(&mut self) -> Result<EventReceive<E>> {
-    // Check the receiver out into a pending future parked back on
-    // `self` before awaiting: a cancelled `recv` then leaves the
-    // receiver owned by the subscription (the same take-and-store-back
-    // pattern as `poll_next`) instead of dropping it with this future's
-    // frame, which would silently terminate every later receive.
-    let pending = match std::mem::replace(&mut self.state, SubscriptionState::Terminated) {
-      SubscriptionState::Terminated => return Ok(EventReceive::Closed),
+  /// Parks the receive future on the subscription and hands it out: an
+  /// idle receiver is checked out into a fresh receive future, and an
+  /// already-parked one stays where it is, so a cancelled caller leaves
+  /// the receiver owned by the subscription instead of dropping it with
+  /// the caller's frame. `None` once the subscription is terminal.
+  fn park(&mut self) -> Option<&mut PendingReceive<E>> {
+    let state = std::mem::replace(&mut self.state, SubscriptionState::Terminated);
+    self.state = match state {
+      SubscriptionState::Terminated => return None,
       SubscriptionState::Idle(mut receiver) => {
-        Box::pin(async move { (receiver.recv().await, receiver) })
+        SubscriptionState::InFlight(Box::pin(async move { (receiver.recv().await, receiver) }))
       }
-      SubscriptionState::InFlight(pending) => pending,
+      SubscriptionState::InFlight(pending) => SubscriptionState::InFlight(pending),
     };
-    self.state = SubscriptionState::InFlight(pending);
-    let SubscriptionState::InFlight(pending) = &mut self.state else {
-      unreachable!("receive future parked on the subscription")
+    match &mut self.state {
+      SubscriptionState::InFlight(pending) => Some(pending),
+      // The state was just parked as `InFlight`; a terminal subscription
+      // has no future to hand out.
+      _ => None,
+    }
+  }
+
+  pub async fn recv(&mut self) -> Result<EventReceive<E>> {
+    // The receive future is parked on `self` before awaiting, so a
+    // cancelled `recv` leaves the receiver owned by the subscription
+    // instead of dropping it with this future's frame, which would
+    // silently terminate every later receive.
+    let (raw, receiver) = {
+      let Some(pending) = self.park() else {
+        return Ok(EventReceive::Closed);
+      };
+      pending.as_mut().await
     };
-    let (raw, receiver) = pending.as_mut().await;
     let (item, terminated) = map_receive(raw);
     self.state = if terminated {
       SubscriptionState::Terminated
@@ -89,6 +108,10 @@ impl<E: Event> EventSubscription<E> {
     Ok(item)
   }
 
+  /// The non-blocking receive. `Empty` is poll-level pending: while a
+  /// `Stream` poll owns the channel position, this reports `Empty` and
+  /// leaves the parked receive (and the waker it registered) untouched,
+  /// so the stream's owner still wakes on the next event.
   pub fn try_recv(&mut self) -> Result<EventReceive<E>> {
     let state = std::mem::replace(&mut self.state, SubscriptionState::Terminated);
     match state {
@@ -109,26 +132,14 @@ impl<E: Event> EventSubscription<E> {
         };
         Ok(item)
       }
-      SubscriptionState::InFlight(mut pending) => {
-        // A pending stream poll owns the channel position: observe its
-        // current readiness without consuming the caller's waker.
-        let waker = futures_util::task::noop_waker();
-        let mut context = Context::from_waker(&waker);
-        match pending.as_mut().poll(&mut context) {
-          Poll::Pending => {
-            self.state = SubscriptionState::InFlight(pending);
-            Ok(EventReceive::Empty)
-          }
-          Poll::Ready((raw, receiver)) => {
-            let (item, terminated) = map_receive(raw);
-            self.state = if terminated {
-              SubscriptionState::Terminated
-            } else {
-              SubscriptionState::Idle(receiver)
-            };
-            Ok(item)
-          }
-        }
+      SubscriptionState::InFlight(pending) => {
+        // A pending stream poll owns the channel position AND the waker
+        // it registered: polling the parked future here would re-register
+        // this call's waker and the stream's owner would never be woken.
+        // Report the poll-level empty and leave the parked future alone;
+        // the next `poll_next` (or `recv`) delivers whatever arrived.
+        self.state = SubscriptionState::InFlight(pending);
+        Ok(EventReceive::Empty)
       }
     }
   }
@@ -151,37 +162,27 @@ impl<E: Event> futures_core::Stream for EventSubscription<E> {
   type Item = EventReceive<E>;
 
   fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-    loop {
-      match &mut self.state {
-        SubscriptionState::Terminated => return Poll::Ready(None),
-        SubscriptionState::Idle(_) => {
-          let SubscriptionState::Idle(mut receiver) =
-            std::mem::replace(&mut self.state, SubscriptionState::Terminated)
-          else {
-            unreachable!("matched idle state")
-          };
-          self.state =
-            SubscriptionState::InFlight(Box::pin(async move { (receiver.recv().await, receiver) }));
-        }
-        SubscriptionState::InFlight(pending) => match pending.as_mut().poll(cx) {
-          Poll::Pending => return Poll::Pending,
-          Poll::Ready((raw, receiver)) => {
-            let (item, terminated) = map_receive(raw);
-            self.state = if terminated {
-              SubscriptionState::Terminated
-            } else {
-              SubscriptionState::Idle(receiver)
-            };
-            return Poll::Ready(Some(item));
-          }
-        },
+    let Some(pending) = self.park() else {
+      return Poll::Ready(None);
+    };
+    match pending.as_mut().poll(cx) {
+      Poll::Pending => Poll::Pending,
+      Poll::Ready((raw, receiver)) => {
+        let (item, terminated) = map_receive(raw);
+        self.state = if terminated {
+          SubscriptionState::Terminated
+        } else {
+          SubscriptionState::Idle(receiver)
+        };
+        Poll::Ready(Some(item))
       }
     }
   }
 }
 
-/// The runtime event hub: one typed subscriber set per event
-/// type. Events are transient — an emission with no live subscriber is
+/// The runtime event hub: one typed subscriber set per event type, plus
+/// one subscriber set per tag on the caller-facing tag-keyed channel.
+/// Events are transient — an emission with no live subscriber is
 /// dropped, a lagging subscriber observes `Lagged` and must re-read
 /// through the paged queries, and nothing is retained for replay after
 /// restart.
@@ -194,6 +195,11 @@ pub(crate) struct EventHub {
   subscribers: std::sync::Mutex<
     std::collections::HashMap<std::any::TypeId, Vec<Box<dyn std::any::Any + Send + Sync>>>,
   >,
+  /// The tag-keyed subscriber sets: one bounded broadcast sender per
+  /// live subscription, exactly like the typed sets.
+  tagged: std::sync::Mutex<
+    std::collections::BTreeMap<EventTag, Vec<Box<dyn std::any::Any + Send + Sync>>>,
+  >,
 }
 
 impl EventHub {
@@ -201,17 +207,11 @@ impl EventHub {
     Self::default()
   }
 
-  /// Locks the subscriber map, recovering from a poisoned lock: the map
-  /// holds only plain subscriber vectors, so a panicking emitter cannot
-  /// leave it inconsistent.
-  fn lock(
-    &self,
-  ) -> std::sync::MutexGuard<
-    '_,
-    std::collections::HashMap<std::any::TypeId, Vec<Box<dyn std::any::Any + Send + Sync>>>,
-  > {
-    self
-      .subscribers
+  /// Locks a subscriber map, recovering from a poisoned lock: the maps
+  /// hold only plain subscriber vectors, so a panicking emitter cannot
+  /// leave them inconsistent.
+  fn lock<M>(mutex: &std::sync::Mutex<M>) -> std::sync::MutexGuard<'_, M> {
+    mutex
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner())
   }
@@ -221,7 +221,7 @@ impl EventHub {
   /// subscribers.
   pub(crate) fn subscribe<E: Event>(&self, options: EventOptions) -> EventSubscription<E> {
     let (sender, receiver) = broadcast::channel(options.capacity);
-    let mut subscribers = self.lock();
+    let mut subscribers = Self::lock(&self.subscribers);
     let entries = subscribers.entry(std::any::TypeId::of::<E>()).or_default();
     Self::prune::<E>(entries);
     entries.push(Box::new(std::sync::Arc::new(sender)));
@@ -233,7 +233,7 @@ impl EventHub {
   /// Emits one event to every live subscriber of its type; a subscriber
   /// whose channel is full lags instead of blocking the emitter.
   pub(crate) fn emit<E: Event>(&self, event: E) {
-    let mut subscribers = self.lock();
+    let mut subscribers = Self::lock(&self.subscribers);
     let Some(entries) = subscribers.get_mut(&std::any::TypeId::of::<E>()) else {
       return;
     };
@@ -254,6 +254,43 @@ impl EventHub {
         .downcast_ref::<std::sync::Arc<broadcast::Sender<E>>>()
         .is_some_and(|sender| sender.receiver_count() > 0)
     });
+  }
+
+  /// Publishes one caller event to every live subscriber of its tag: the
+  /// same bounded broadcast plumbing as the typed channel, with the
+  /// [`EventTag`] as the key and the payload as opaque bytes. A publish
+  /// with no live subscriber is dropped; a subscriber whose channel is
+  /// full lags instead of blocking the publisher.
+  pub(crate) fn publish(&self, tag: &EventTag, payload: std::sync::Arc<[u8]>) {
+    let event = TaggedEvent::new(tag.clone(), payload);
+    let mut subscribers = Self::lock(&self.tagged);
+    let Some(entries) = subscribers.get_mut(tag) else {
+      return;
+    };
+    for entry in entries.iter() {
+      if let Some(sender) = entry.downcast_ref::<std::sync::Arc<broadcast::Sender<TaggedEvent>>>() {
+        // A send error means this channel has no active receivers; the
+        // transient event is gone and the next retain prunes the sender.
+        let _ = sender.send(event.clone());
+      }
+    }
+    Self::prune::<TaggedEvent>(entries);
+  }
+
+  /// Subscribes to one tag's channel with an independent bounded channel
+  /// per subscription, so one slow subscriber's lag never backpressures
+  /// publishers or other subscribers.
+  pub(crate) fn subscribe_tagged(
+    &self, tag: EventTag, options: EventOptions,
+  ) -> EventSubscription<TaggedEvent> {
+    let (sender, receiver) = broadcast::channel(options.capacity);
+    let mut subscribers = Self::lock(&self.tagged);
+    let entries = subscribers.entry(tag).or_default();
+    Self::prune::<TaggedEvent>(entries);
+    entries.push(Box::new(std::sync::Arc::new(sender)));
+    EventSubscription {
+      state: SubscriptionState::Idle(receiver),
+    }
   }
 }
 
@@ -284,8 +321,13 @@ fn event_channel<E: Event>(options: EventOptions) -> (broadcast::Sender<E>, Even
 
 #[cfg(test)]
 mod tests {
-  use super::event_channel;
-  use crate::{ErrorKind, Event, EventOptions, EventReceive, operation::private};
+  use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  };
+
+  use super::{EventHub, event_channel};
+  use crate::{ErrorKind, Event, EventOptions, EventReceive, EventTag, operation::private};
 
   #[derive(Clone, Debug, Eq, PartialEq)]
   struct TestEvent(u8);
@@ -348,9 +390,9 @@ mod tests {
   }
 
   /// Cancelling a pending `recv` must not destroy the subscription: the
-  /// receiver stays parked on the subscription (audit 2026-10-09 item
-  /// 16), a later `recv` observes events sent after the cancellation,
-  /// and the terminal close is still delivered exactly once.
+  /// receiver stays parked on the subscription, a later `recv` observes events
+  /// sent after the cancellation, and the terminal close is still delivered
+  /// exactly once.
   #[tokio::test]
   async fn event_subscription_recv_survives_cancellation() {
     let options = EventOptions::new().capacity(2).unwrap();
@@ -429,5 +471,132 @@ mod tests {
     ));
     assert!(subscription.as_mut().next().await.is_none());
     assert!(subscription.as_mut().next().await.is_none());
+  }
+
+  /// A waker that only records whether it was woken.
+  struct RecordingWaker(AtomicBool);
+
+  impl futures_util::task::ArcWake for RecordingWaker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+      arc_self.0.store(true, Ordering::SeqCst);
+    }
+  }
+
+  /// `try_recv` must leave the waker a pending stream poll registered in
+  /// place: polling the parked future with its own waker would replace it
+  /// and the stream's owner would never be woken again.
+  #[tokio::test]
+  async fn try_recv_leaves_the_stream_poll_waker_registered() {
+    let (sender, subscription) = event_channel::<TestEvent>(EventOptions::new());
+    tokio::pin!(subscription);
+    let recorder = Arc::new(RecordingWaker(AtomicBool::new(false)));
+    let waker = futures_util::task::waker(Arc::clone(&recorder));
+    let mut context = std::task::Context::from_waker(&waker);
+
+    assert!(
+      futures_core::Stream::poll_next(subscription.as_mut(), &mut context).is_pending(),
+      "an empty subscription parked instead of yielding an item"
+    );
+    assert!(matches!(
+      subscription.try_recv().unwrap(),
+      EventReceive::Empty
+    ));
+
+    sender.send(TestEvent(1)).unwrap();
+    assert!(
+      recorder.0.load(Ordering::SeqCst),
+      "try_recv replaced the waker the pending stream poll registered"
+    );
+    assert!(matches!(
+      futures_core::Stream::poll_next(subscription.as_mut(), &mut context),
+      std::task::Poll::Ready(Some(EventReceive::Item(TestEvent(1))))
+    ));
+  }
+
+  /// The terminal state is idempotent across every receive shape: after
+  /// the channel closes, `recv`, `try_recv`, and the stream each report
+  /// the terminal instead of panicking on the parked state.
+  #[tokio::test]
+  async fn a_closed_subscription_reports_the_terminal_from_every_receive_shape() {
+    use futures_util::StreamExt;
+
+    let (sender, mut subscription) = event_channel::<TestEvent>(EventOptions::new());
+    drop(sender);
+    assert!(matches!(
+      subscription.recv().await.unwrap(),
+      EventReceive::Closed
+    ));
+    assert!(matches!(
+      subscription.recv().await.unwrap(),
+      EventReceive::Closed
+    ));
+    assert!(matches!(
+      subscription.try_recv().unwrap(),
+      EventReceive::Closed
+    ));
+    assert!(subscription.next().await.is_none());
+  }
+
+  /// The tag-keyed channel round-trips the publisher's payload under the
+  /// publishing tag, isolates tags from each other, drops publishes with
+  /// no live subscriber, and keeps the bounded per-subscription lag
+  /// behavior of the typed channel.
+  #[tokio::test]
+  async fn tagged_publish_subscribe_round_trips_isolates_and_lags() {
+    let hub = EventHub::new();
+    let alpha = EventTag::parse("example.com/events/alpha").unwrap();
+    let beta = EventTag::parse("example.com/events/beta").unwrap();
+    let options = EventOptions::new().capacity(2).unwrap();
+    let mut subscription = hub.subscribe_tagged(alpha.clone(), options);
+
+    // A publish with no live subscriber is dropped, not buffered.
+    hub.publish(&beta, Arc::from([9_u8]));
+    assert!(matches!(
+      subscription.try_recv().unwrap(),
+      EventReceive::Empty
+    ));
+
+    hub.publish(&alpha, Arc::from([1_u8]));
+    hub.publish(&alpha, Arc::from([2_u8]));
+    hub.publish(&alpha, Arc::from([3_u8]));
+    // One tag's publishes never land on another tag's subscribers.
+    hub.publish(&beta, Arc::from([9_u8]));
+
+    assert!(matches!(
+      subscription.try_recv().unwrap(),
+      EventReceive::Lagged { missed: 1 }
+    ));
+    let first = subscription.recv().await.unwrap();
+    assert!(
+      matches!(&first, EventReceive::Item(event)
+        if event.tag() == &alpha && event.payload().as_ref() == [2_u8]),
+      "the round trip carries the publishing tag and payload"
+    );
+    assert!(matches!(
+      subscription.recv().await.unwrap(),
+      EventReceive::Item(_)
+    ));
+    assert!(matches!(
+      subscription.try_recv().unwrap(),
+      EventReceive::Empty
+    ));
+  }
+
+  /// Dropping the last subscription for a tag prunes its sender on the
+  /// next publish or subscription: the hub does not accumulate dead
+  /// channels.
+  #[tokio::test]
+  async fn a_fully_dropped_tag_subscription_is_pruned() {
+    let hub = EventHub::new();
+    let alpha = EventTag::parse("example.com/events/alpha").unwrap();
+    drop(hub.subscribe_tagged(alpha.clone(), EventOptions::new()));
+    hub.publish(&alpha, Arc::from([1_u8]));
+    // The pruned map re-subscribes cleanly.
+    let mut resubscribed = hub.subscribe_tagged(alpha.clone(), EventOptions::new());
+    hub.publish(&alpha, Arc::from([2_u8]));
+    assert!(matches!(
+      resubscribed.recv().await.unwrap(),
+      EventReceive::Item(_)
+    ));
   }
 }

@@ -2,12 +2,11 @@
 //! the task manager reconciles.
 //!
 //! Admission is the synchronous half — pure validation, then the task
-//! submission — and never performs IO. The effect is the verb body that
-//! used to run inline on the supervisor's select loop, moved here
-//! unchanged: same durable writes, same events, same audit lines, same
-//! typed errors. Migrating a verb therefore moves code and changes only
-//! *where* its failures surface (the task's `wait` instead of the verb
-//! call).
+//! submission — and never performs IO. The effect is the verb body,
+//! separate from the supervisor's select loop: same durable writes, same
+//! events, same audit lines, same typed errors. Migrating a verb therefore
+//! moves code and changes only *where* its failures surface (the task's `wait`
+//! instead of the verb call).
 //!
 //! [`OperationDeps`] is the node-shared handle bundle every effect reads.
 //! It is built once per incarnation in `spawn_runtime` and owned by the
@@ -23,16 +22,13 @@ use std::{
 use tokio::sync::watch;
 
 use super::{
+  dial::{connect_with_deadline, dial_member, keep_outbound_session},
   recovery::departed_exclusions,
-  supervisor::{
-    ListenerRegistry, RuntimeDependencies, connect_with_deadline, dial_member,
-    keep_outbound_session,
-  },
+  supervisor::{ListenerRegistry, RuntimeDependencies},
   task_manager::{EffectOutcome, TaskClient, TaskEffect, TaskPayload, TaskSpec},
 };
 use crate::{
   Endpoint, Error, MergeView, NodeConfig, NodeId, PublicKey, Result, RevokeOutcome, Task, TaskKind,
-  TaskOutput,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   identity::{credential::MergeCredential, lifecycle::LocalIdentityContext},
@@ -41,7 +37,11 @@ use crate::{
     SessionDriver,
     stream::{SessionPacketContext, SessionTable, retire_session},
   },
-  transport::registry::TransportTrust,
+  task::output::{
+    encode_checkpoint, encode_connect, encode_join, encode_leave, encode_listen, encode_member,
+    encode_receipt_retention, encode_recovery, encode_resource_mutation, encode_revoke,
+    encode_unit,
+  },
 };
 
 /// The node's tracked connection tasks: the kept session tasks of the
@@ -92,9 +92,8 @@ pub(crate) struct EffectPlanes {
   /// The local descriptor's lazy-publication gate: the endpoint set the
   /// descriptor was last successfully ensured against plus the
   /// single-flight flag bounding the read views' kicked publications at
-  /// one task (see [`kick_self_descriptor_publication`]; remaining
-  /// items 2026-10-10, P2-9). Module-private: only this module's ensure
-  /// and kick touch it.
+  /// one task (see [`kick_self_descriptor_publication`]). Module-private:
+  /// only this module's ensure and kick touch it.
   descriptor_publication: DescriptorPublication,
   /// The memoized departed-members exclusion set, shared with the
   /// supervisor's own pages: the checkpoint guard reads the same cache.
@@ -111,6 +110,12 @@ pub(crate) struct EffectPlanes {
   /// Requests for one immediate anti-entropy round, forwarded to the
   /// sync driver (the cursor owner) by the sync-round effect.
   pub(crate) sync_round_requests: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
+  /// The leave plane's signal to the supervisor's control loop: the
+  /// leave effect reports a failure that landed after its network
+  /// teardown began, so the node tears down fatally instead of staying
+  /// `Running` with every listener and session already down (see
+  /// [`super::lifecycle::LeaveSignal`]).
+  pub(crate) leave_signal: tokio::sync::mpsc::Sender<super::lifecycle::LeaveSignal>,
 }
 
 /// The node-shared operation handles behind every migrated mutating verb,
@@ -142,6 +147,7 @@ impl OperationDeps {
   pub(super) fn new(
     dependencies: &RuntimeDependencies, driver: SessionDriver, packet: Arc<SessionPacketContext>,
     shutdown: watch::Sender<()>,
+    leave_signal: tokio::sync::mpsc::Sender<super::lifecycle::LeaveSignal>,
   ) -> Result<Self> {
     Ok(Self {
       events: Arc::clone(&dependencies.events),
@@ -177,6 +183,7 @@ impl OperationDeps {
           ),
         )),
         sync_round_requests: dependencies.sync_round_requests.clone(),
+        leave_signal,
       }),
     })
   }
@@ -257,9 +264,9 @@ pub(crate) async fn join(
     Box::pin(async move { reconcile_join(deps, transport, receiver, credential).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Join, TaskPayload::None), effect)
+    .submit(TaskSpec::new(TaskKind::JOIN, TaskPayload::None), effect)
     .await?;
-  Ok(Task::from_parts(id, TaskKind::Join, tasks.observer.clone()))
+  Ok(Task::from_parts(id, TaskKind::JOIN, tasks.observer.clone()))
 }
 
 /// Admits one member re-connect: key trust only, no join credential. The
@@ -290,11 +297,11 @@ pub(crate) async fn connect(
     Box::pin(async move { reconcile_connect(deps, transport, receiver, peer).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Connect, payload), effect)
+    .submit(TaskSpec::new(TaskKind::CONNECT, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Connect,
+    TaskKind::CONNECT,
     tasks.observer.clone(),
   ))
 }
@@ -312,11 +319,11 @@ pub(crate) async fn disconnect(tasks: &TaskClient, peer: NodeId) -> Result<Task<
     Box::pin(async move { reconcile_disconnect(deps, peer).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Disconnect, payload), effect)
+    .submit(TaskSpec::new(TaskKind::DISCONNECT, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Disconnect,
+    TaskKind::DISCONNECT,
     tasks.observer.clone(),
   ))
 }
@@ -329,38 +336,40 @@ async fn reconcile_join(
 ) -> Result<EffectOutcome> {
   let planes = deps.planes()?;
   planes.context.require_unblocked()?;
-  crate::audit::dial_started(&receiver.to_string(), false);
-  let mut connection = connect_with_deadline(
-    &transport,
-    receiver.clone(),
-    TransportTrust::for_dial(&receiver.selector()),
-    planes.config.dial_deadline(),
-  )
-  .await?;
-  let hint = connection
-    .merge_hint()
-    .cloned()
-    .ok_or_else(|| Error::authentication_failed("join hint"))?;
-  let secret = crate::protocol::credential::CredentialSecret::from_credential(&credential);
-  let (session, view) = planes.driver.merge(&mut connection, &hint, secret).await?;
-  let peer = session.peer().clone();
-  crate::audit::dial_settled(peer.as_str(), false, true);
-  // Keep the merge session open so both sides can stream packets over it.
-  // The view returns only after the session table registers the entry, so
-  // the caller's first packet cannot race registration.
-  let connection_tasks = Arc::clone(&planes.connection_tasks);
-  keep_outbound_session(
-    connection,
-    session,
-    Arc::clone(&planes.packet),
-    planes.sessions.clone(),
-    planes.shutdown.subscribe(),
-    receiver,
-    crate::session::stream::DialClass::Caller,
-    |session_task| track_connection_task(&connection_tasks, session_task),
-  )
-  .await?;
-  Ok(EffectOutcome::new(TaskOutput::Join(view)))
+  // The join dial's peer identity is the receiver endpoint: the peer node
+  // id is only learned after the merge, so both audit lines carry the
+  // endpoint to name one identity from start to settle.
+  let peer = receiver.to_string();
+  crate::audit::dial_started(&peer, crate::audit::DialInitiator::Caller);
+  let result = async {
+    let mut connection =
+      connect_with_deadline(&transport, receiver.clone(), planes.config.dial_deadline()).await?;
+    let hint = connection
+      .merge_hint()
+      .cloned()
+      .ok_or_else(|| Error::authentication_failed("join hint"))?;
+    let secret = crate::protocol::credential::CredentialSecret::from_credential(&credential);
+    let (session, view) = planes.driver.merge(&mut connection, &hint, secret).await?;
+    // Keep the merge session open so both sides can stream packets over it.
+    // The view returns only after the session table registers the entry, so
+    // the caller's first packet cannot race registration.
+    let connection_tasks = Arc::clone(&planes.connection_tasks);
+    keep_outbound_session(
+      connection,
+      session,
+      Arc::clone(&planes.packet),
+      planes.sessions.clone(),
+      planes.shutdown.subscribe(),
+      receiver,
+      crate::session::stream::DialClass::Caller,
+      |session_task| track_connection_task(&connection_tasks, session_task),
+    )
+    .await?;
+    Ok(EffectOutcome::new(encode_join(&view)?))
+  }
+  .await;
+  crate::audit::dial_settled(&peer, crate::audit::DialInitiator::Caller, result.is_ok());
+  result
 }
 
 /// The member reconnect effect: one key-trust dial that keeps the session
@@ -384,7 +393,7 @@ async fn reconcile_connect(
     planes.config.dial_deadline(),
   )
   .await?;
-  Ok(EffectOutcome::new(TaskOutput::Connect(authenticated)))
+  Ok(EffectOutcome::new(encode_connect(&authenticated)?))
 }
 
 /// The disconnect effect: tear the peer's session down and emit the
@@ -393,7 +402,7 @@ async fn reconcile_disconnect(deps: Arc<OperationDeps>, peer: NodeId) -> Result<
   let planes = deps.planes()?;
   retire_session(&planes.sessions, &peer)?;
   deps.events().emit(crate::SessionChanged::new(peer));
-  Ok(EffectOutcome::new(TaskOutput::Disconnect(())))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 /// Spawns one kept session task into the node's tracked connection
@@ -439,11 +448,11 @@ pub(crate) async fn revoke(
     Box::pin(async move { reconcile_revoke(deps, subject, expected_key).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Revoke, payload), effect)
+    .submit(TaskSpec::new(TaskKind::REVOKE, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Revoke,
+    TaskKind::REVOKE,
     tasks.observer.clone(),
   ))
 }
@@ -461,11 +470,11 @@ pub(crate) async fn purge_revocation(tasks: &TaskClient, subject: NodeId) -> Res
     Box::pin(async move { reconcile_purge_revocation(deps, subject).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::PurgeRevocation, payload), effect)
+    .submit(TaskSpec::new(TaskKind::PURGE_REVOCATION, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::PurgeRevocation,
+    TaskKind::PURGE_REVOCATION,
     tasks.observer.clone(),
   ))
 }
@@ -483,11 +492,11 @@ pub(crate) async fn cleanup(tasks: &TaskClient, subject: NodeId) -> Result<Task<
     Box::pin(async move { reconcile_cleanup(deps, subject).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Cleanup, payload), effect)
+    .submit(TaskSpec::new(TaskKind::CLEANUP, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Cleanup,
+    TaskKind::CLEANUP,
     tasks.observer.clone(),
   ))
 }
@@ -500,19 +509,19 @@ pub(crate) async fn cleanup(tasks: &TaskClient, subject: NodeId) -> Result<Task<
 /// node); the frozen-store refusal and the member-connectivity
 /// precondition are effect-time and surface on the task's [`Task::wait`]
 /// (the precondition as [`crate::ErrorKind::NotReady`]).
-pub(crate) async fn issue_cleanup_checkpoint(tasks: &TaskClient) -> Result<Task<u64>> {
+pub(crate) async fn issue_cleanup_checkpoint(tasks: &TaskClient) -> Result<Task<i64>> {
   let effect: TaskEffect = Arc::new(|deps, _attempt| {
     Box::pin(async move { reconcile_issue_cleanup_checkpoint(deps).await })
   });
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::IssueCleanupCheckpoint, TaskPayload::None),
+      TaskSpec::new(TaskKind::ISSUE_CLEANUP_CHECKPOINT, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::IssueCleanupCheckpoint,
+    TaskKind::ISSUE_CLEANUP_CHECKPOINT,
     tasks.observer.clone(),
   ))
 }
@@ -537,13 +546,13 @@ pub(crate) async fn resolve_frozen_journal(
   });
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::ResolveFrozenJournal, TaskPayload::None),
+      TaskSpec::new(TaskKind::RESOLVE_FROZEN_JOURNAL, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::ResolveFrozenJournal,
+    TaskKind::RESOLVE_FROZEN_JOURNAL,
     tasks.observer.clone(),
   ))
 }
@@ -572,7 +581,7 @@ async fn reconcile_revoke(
     &expected_key,
   )
   .await?;
-  // The shared authorization boundary (audit 2026-10-23, P1-11): the
+  // The shared authorization boundary: the
   // durable commit, the ledger record, and the session retirement run as
   // ONE exclusive section against session publication. A handshake whose
   // admission predated this revoke either published before the section
@@ -604,10 +613,10 @@ async fn reconcile_revoke(
       .emit(crate::SessionChanged::new(subject.clone()));
     deps.events().emit(crate::NodeRevoked::new(subject.clone()));
   }
-  Ok(EffectOutcome::new(TaskOutput::Revoke(RevokeOutcome::new(
+  Ok(EffectOutcome::new(encode_revoke(&RevokeOutcome::new(
     subject,
     !transition.changed_authorization(),
-  ))))
+  ))?))
 }
 
 /// The cleanup effect: sign and persist one convergent cleanup tombstone,
@@ -634,7 +643,7 @@ async fn reconcile_cleanup(deps: Arc<OperationDeps>, subject: NodeId) -> Result<
     deps.events().emit(crate::MemberChanged::new(subject));
     planes.member_revision.bump();
   }
-  Ok(EffectOutcome::new(TaskOutput::Cleanup(())))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 /// The purge effect: clear the local revocation record (local-only,
@@ -657,7 +666,7 @@ async fn reconcile_purge_revocation(
   .await?;
   revoked.forget(&subject);
   drop(revoked);
-  Ok(EffectOutcome::new(TaskOutput::PurgeRevocation(())))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 /// The checkpoint effect: enforce the convergence precondition, then
@@ -669,9 +678,7 @@ async fn reconcile_issue_cleanup_checkpoint(deps: Arc<OperationDeps>) -> Result<
   let watermark =
     crate::identity::cleanup::issue_checkpoint_ctx(&planes.context, planes.entropy.as_ref())
       .await?;
-  Ok(EffectOutcome::new(TaskOutput::IssueCleanupCheckpoint(
-    watermark,
-  )))
+  Ok(EffectOutcome::new(encode_checkpoint(watermark)?))
 }
 
 /// The frozen-journal resolution effect: resolve the store's frozen
@@ -690,7 +697,7 @@ async fn reconcile_resolve_frozen_journal(deps: Arc<OperationDeps>) -> Result<Ef
     .store()
     .resolve_frozen_journal_uncommitted(operation)
     .await?;
-  Ok(EffectOutcome::new(TaskOutput::ResolveFrozenJournal(())))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 /// The checkpoint issue precondition: every known member other than self
@@ -730,8 +737,7 @@ async fn require_members_connected(planes: &EffectPlanes) -> Result<()> {
       }
     };
     let node = descriptor.node();
-    if descriptor.removed()
-      || node == planes.context.identity().node()
+    if node == planes.context.identity().node()
       || departed.status(node) != crate::MemberStatus::Active
     {
       continue;
@@ -752,10 +758,10 @@ async fn require_members_connected(planes: &EffectPlanes) -> Result<()> {
 
 // -- resource and node-metadata verbs ----------------------------------
 
-/// Admits one resource write intent as a signed candidate record
+/// Admits one resource write intent as a candidate record
 /// (`PutResource`): `put` passes `None` (last-writer-wins) and
 /// `put_expected` passes the compare-and-swap precondition. The effect
-/// stamps, signs, and commits the record in one conditional transaction.
+/// stamps and commits the record in one conditional transaction.
 ///
 /// Admission-time failures are the pure shape checks (a stopped node, a
 /// malformed write, a resource hook's rejection) plus the hook-composed
@@ -778,11 +784,11 @@ pub(crate) async fn put_resource(
   });
   let payload = TaskPayload::None;
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::PutResource, payload), effect)
+    .submit(TaskSpec::new(TaskKind::PUT_RESOURCE, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::PutResource,
+    TaskKind::PUT_RESOURCE,
     tasks.observer.clone(),
   ))
 }
@@ -805,11 +811,11 @@ pub(crate) async fn delete_resource(
   });
   let payload = TaskPayload::None;
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::DeleteResource, payload), effect)
+    .submit(TaskSpec::new(TaskKind::DELETE_RESOURCE, payload), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::DeleteResource,
+    TaskKind::DELETE_RESOURCE,
     tasks.observer.clone(),
   ))
 }
@@ -831,22 +837,24 @@ pub(crate) async fn patch_metadata(
   });
   let payload = TaskPayload::None;
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::PatchNodeMetadata, payload), effect)
+    .submit(
+      TaskSpec::new(TaskKind::PATCH_NODE_METADATA, payload),
+      effect,
+    )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::PatchNodeMetadata,
+    TaskKind::PATCH_NODE_METADATA,
     tasks.observer.clone(),
   ))
 }
 
-/// The local descriptor's lazy-publication coordination (remaining
-/// items 2026-10-10, P2-9): the endpoint set the descriptor was last
-/// successfully ensured against, plus the single-flight flag for the
-/// publication task the read views schedule. Together they keep the
-/// lazy path's task population bounded — a steady-state member read
-/// spawns nothing (the stamp matches), and at most ONE publication task
-/// is ever alive (the audit item 4 lesson applied to the lazy path).
+/// The local descriptor's lazy-publication coordination: the endpoint set
+/// the descriptor was last successfully ensured against, plus the
+/// single-flight flag for the publication task the read views schedule.
+/// Together they keep the lazy path's task population bounded — a
+/// steady-state member read spawns nothing (the stamp matches), and at
+/// most ONE publication task is ever alive.
 #[derive(Default)]
 struct DescriptorPublication {
   /// Whether a scheduled publication task is currently in flight.
@@ -927,11 +935,10 @@ pub(super) async fn ensure_self_descriptor(deps: &OperationDeps) -> Result<()> {
 /// population at one task).
 const DESCRIPTOR_PUBLICATION_RETRY: Duration = Duration::from_millis(100);
 
-/// Schedules the local descriptor's lazy publication OFF the
-/// supervisor's select loop (remaining items 2026-10-10, P2-9): the
-/// member read views call this instead of awaiting the ensure, so a
-/// first member read on a node that never bound a listener can no
-/// longer park every control-plane operation behind the descriptor
+/// Schedules the local descriptor's lazy publication OFF the supervisor's
+/// select loop: the member read views call this instead of awaiting the
+/// ensure, so a first member read on a node that never bound a listener
+/// can no longer park every control-plane operation behind the descriptor
 /// commit on slow storage. Bounded accounting: the endpoint-set stamp
 /// suppresses the kick in steady state, and the single-flight gate
 /// bounds the population at exactly one task. The scheduled task is
@@ -1041,10 +1048,9 @@ impl Drop for PublicationSlot {
 }
 
 /// The put effect: the moved supervisor body — stamp the host wall-clock
-/// tuple, sign through the node's key provider, and commit the whole
-/// record in one conditional transaction under the shared bounded
-/// commit-race retry. A committed winner emits exactly one
-/// [`crate::ResourceChanged`] after durability; an accepted but
+/// tuple and commit the whole record in one conditional transaction under
+/// the shared bounded commit-race retry. A committed winner emits exactly
+/// one [`crate::ResourceChanged`] after durability; an accepted but
 /// superseded candidate emits nothing, and an indeterminate commit
 /// reports `CommitUnknown` without an event. The resource hooks'
 /// `observed` fires on the accepted record after this node's own commit
@@ -1071,15 +1077,13 @@ async fn reconcile_put_resource(
     Box::pin(async move {
       // The caller's expected version is the only authority on which
       // register state the write may replace. This pre-check is the
-      // early bail (a stale observation never pays the signature); the
-      // authoritative re-verification runs inside the commit's own
-      // snapshot (`commit_expected_record_ctx`), so the asynchronous
-      // signature step between the two cannot race the precondition
-      // away — a register that moved past the expected version refuses
-      // the write instead of being silently overwritten by a tuple
-      // winner. A mismatch is final and never retried; the CAS race
-      // guard below covers only the snapshot-commit window and re-runs
-      // this check per attempt.
+      // early bail; the authoritative re-verification runs inside the
+      // commit's own snapshot (`commit_expected_record_ctx`), so the
+      // precondition cannot race away — a register that moved past the
+      // expected version refuses the write instead of being silently
+      // overwritten by a tuple winner. A mismatch is final and never
+      // retried; the CAS race guard below covers only the
+      // snapshot-commit window and re-runs this check per attempt.
       if let Some(expected) = expected {
         let stored = crate::resource::store::read_record_ctx(context.store(), write.name())
           .await?
@@ -1091,7 +1095,7 @@ async fn reconcile_put_resource(
         }
       }
       let timestamp_millis = super::resources::issue_write_stamp(&planes.resource_write_clock);
-      let record = crate::resource::ResourceRecordV1::sign_with_provider(
+      let record = crate::resource::ResourceRecordV1::new(
         write.name().clone(),
         labels.resource_type().clone(),
         labels.uri().clone(),
@@ -1100,10 +1104,7 @@ async fn reconcile_put_resource(
         writer.clone(),
         0,
         false,
-        context.keys(),
-        context.identity().handle(),
-      )
-      .await?;
+      )?;
       let accepted = crate::resource::select::resource_view(&record);
       match crate::resource::store::commit_expected_record_ctx(
         context.store(),
@@ -1154,7 +1155,7 @@ async fn reconcile_put_resource(
     view.accepted(),
   )
   .await;
-  Ok(EffectOutcome::new(TaskOutput::PutResource(view)))
+  Ok(EffectOutcome::new(encode_resource_mutation(&view)?))
 }
 
 /// The removal effect: the moved supervisor body — only when the stored
@@ -1173,9 +1174,9 @@ async fn reconcile_delete_resource(
   let context = Arc::clone(&planes.context);
   let writer = context.identity().node().clone();
   // The snapshot-exact CAS can lose a race against a concurrent internal
-  // committer, so the observation, signature, and commit re-run within
-  // a bounded retry; the caller's `expected` stays the only authority
-  // on which register state the removal may replace.
+  // committer, so the observation and commit re-run within a bounded
+  // retry; the caller's `expected` stays the only authority on which
+  // register state the removal may replace.
   // Shared reborrows so the retry closure can capture by reference and
   // stay callable (FnMut) across attempts; the outer `name` is cloned
   // per attempt and re-bound to the helper's result afterwards.
@@ -1215,10 +1216,9 @@ async fn reconcile_delete_resource(
         .removal_rank()
         .checked_add(1)
         .ok_or_else(|| Error::conflict("resource removal rank"))?;
-      // The removal signs through the same single sign-and-seal path as
-      // a put (`removed = true`): one canonical encode, one digest, and
-      // no second body construction inside `seal`.
-      let removal = crate::resource::ResourceRecordV1::sign_with_provider(
+      // The removal record is built exactly like a put's (`removed =
+      // true`): one canonical encode, one digest.
+      let removal = crate::resource::ResourceRecordV1::new(
         name.clone(),
         stored.resource_type().clone(),
         stored.resource_uri().clone(),
@@ -1227,10 +1227,7 @@ async fn reconcile_delete_resource(
         writer.clone(),
         removal_rank,
         true,
-        context.keys(),
-        context.identity().handle(),
-      )
-      .await?;
+      )?;
       if !removal.wins_over(&stored) {
         // A rolled-back host clock cannot pose as a newer winner: the
         // removal is refused and the live record stays.
@@ -1281,7 +1278,7 @@ async fn reconcile_delete_resource(
     view.accepted(),
   )
   .await;
-  Ok(EffectOutcome::new(TaskOutput::DeleteResource(view)))
+  Ok(EffectOutcome::new(encode_resource_mutation(&view)?))
 }
 
 /// The metadata-patch effect: the moved supervisor body — replace this
@@ -1307,7 +1304,7 @@ async fn reconcile_patch_metadata(
   deps.events().emit(crate::MemberChanged::new(local.clone()));
   planes.member_revision.bump();
   let view = crate::membership::member_view(&updated, crate::ConnectivityStatus::Connected)?;
-  Ok(EffectOutcome::new(TaskOutput::PatchNodeMetadata(view)))
+  Ok(EffectOutcome::new(encode_member(&view)?))
 }
 
 // -- listener, credential, recovery, retention, and sync verbs ------
@@ -1329,11 +1326,11 @@ pub(crate) async fn listen(
     Box::pin(async move { reconcile_listen(deps, transport, endpoint).await })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Listen, TaskPayload::None), effect)
+    .submit(TaskSpec::new(TaskKind::LISTEN, TaskPayload::None), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Listen,
+    TaskKind::LISTEN,
     tasks.observer.clone(),
   ))
 }
@@ -1353,13 +1350,13 @@ pub(crate) async fn stop_listener(
   });
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::StopListener, TaskPayload::None),
+      TaskSpec::new(TaskKind::STOP_LISTENER, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::StopListener,
+    TaskKind::STOP_LISTENER,
     tasks.observer.clone(),
   ))
 }
@@ -1380,13 +1377,13 @@ pub(crate) async fn issue_merge_credential(
     Arc::new(|deps, _attempt| Box::pin(async move { reconcile_credential(deps, false).await }));
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::IssueCredential, TaskPayload::None),
+      TaskSpec::new(TaskKind::ISSUE_CREDENTIAL, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::IssueCredential,
+    TaskKind::ISSUE_CREDENTIAL,
     tasks.observer.clone(),
   ))
 }
@@ -1407,13 +1404,13 @@ pub(crate) async fn rotate_merge_credential(
     Arc::new(|deps, _attempt| Box::pin(async move { reconcile_credential(deps, true).await }));
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::RotateCredential, TaskPayload::None),
+      TaskSpec::new(TaskKind::ROTATE_CREDENTIAL, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::RotateCredential,
+    TaskKind::ROTATE_CREDENTIAL,
     tasks.observer.clone(),
   ))
 }
@@ -1430,13 +1427,13 @@ pub(crate) async fn start_recovery(tasks: &TaskClient) -> Result<Task<crate::Rec
     Arc::new(|deps, _attempt| Box::pin(async move { reconcile_start_recovery(deps).await }));
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::StartRecovery, TaskPayload::None),
+      TaskSpec::new(TaskKind::START_RECOVERY, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::StartRecovery,
+    TaskKind::START_RECOVERY,
     tasks.observer.clone(),
   ))
 }
@@ -1455,13 +1452,13 @@ pub(crate) async fn apply_receipt_retention(
   });
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::ApplyReceiptRetention, TaskPayload::None),
+      TaskSpec::new(TaskKind::APPLY_RECEIPT_RETENTION, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::ApplyReceiptRetention,
+    TaskKind::APPLY_RECEIPT_RETENTION,
     tasks.observer.clone(),
   ))
 }
@@ -1479,13 +1476,13 @@ pub(crate) async fn sync_round(tasks: &TaskClient) -> Result<Task<()>> {
     Arc::new(|deps, _attempt| Box::pin(async move { reconcile_sync_round(deps).await }));
   let id = tasks
     .submit(
-      TaskSpec::new(TaskKind::SyncRound, TaskPayload::None),
+      TaskSpec::new(TaskKind::SYNC_ROUND, TaskPayload::None),
       effect,
     )
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::SyncRound,
+    TaskKind::SYNC_ROUND,
     tasks.observer.clone(),
   ))
 }
@@ -1540,8 +1537,7 @@ async fn reconcile_listen(
           // A failed TLS/prelude upgrade must not kill the listener;
           // consecutive failures back off on a bounded growing delay.
           accept_failures = accept_failures.saturating_add(1);
-          let delay = super::listeners::ACCEPT_BACKOFF_STEP
-            .saturating_mul(accept_failures.min(super::listeners::ACCEPT_BACKOFF_MAX_STEPS));
+          let delay = super::listeners::accept_backoff(accept_failures);
           tracing::debug!(
             kind = ?error.kind(),
             consecutive = accept_failures,
@@ -1606,19 +1602,22 @@ async fn reconcile_listen(
   // transports publish the endpoint their listener reports: the
   // medium owns its own address resolution, and the reported form is
   // its dialable contract.
-  let published = match endpoint.selector() {
-    crate::transport::TransportSelector::Custom(_) => bound,
-    crate::transport::TransportSelector::Builtin(_) => {
-      if endpoint.host() == bound.host() {
+  let published = if endpoint.host().is_some() {
+    // URL form: keep the advertised host (it re-resolves as the machine
+    // moves networks), take the bound port.
+    if endpoint.host() == bound.host() {
+      bound
+    } else {
+      endpoint.with_port(
         bound
-      } else {
-        endpoint.with_port(
-          bound
-            .port()
-            .ok_or_else(|| Error::internal("listener port"))?,
-        )?
-      }
+          .port()
+          .ok_or_else(|| Error::internal("listener port"))?,
+      )?
     }
+  } else {
+    // Custom form: the medium owns its own address resolution, and the
+    // reported form is its dialable contract.
+    bound
   };
   planes
     .listeners
@@ -1633,11 +1632,11 @@ async fn reconcile_listen(
   {
     endpoints.push(published.clone());
   }
-  // Eager publication at the listener transition (remaining items
-  // 2026-10-10, P2-9): the member read views no longer await the lazy
-  // ensure inline, so the listener effect publishes the descriptor
-  // here, on this effect's own lane — a read that follows the listen
-  // task's completion deterministically observes the local node.
+  // Eager publication at the listener transition: the member read views
+  // never await the lazy ensure inline, so the listener effect publishes
+  // the descriptor here, on this effect's own lane — a read that follows
+  // the listen task's completion deterministically observes the local
+  // node.
   // Best-effort by the maintenance tick's contract: a failed
   // publication defers to the read views' kick and the tick's own
   // rewrite without failing the already-bound listener.
@@ -1647,9 +1646,9 @@ async fn reconcile_listen(
       "eager descriptor publication at listen deferred to the lazy paths"
     );
   }
-  Ok(EffectOutcome::new(TaskOutput::Listen(
-    crate::ListenerView::new(id, published),
-  )))
+  Ok(EffectOutcome::new(encode_listen(
+    &crate::ListenerView::new(id, published),
+  )?))
 }
 
 /// The stop-listener effect: the shared teardown — remove the registry
@@ -1661,7 +1660,7 @@ async fn reconcile_stop_listener(
   let planes = deps.planes()?;
   super::listeners::stop_listener(&planes.listeners, &planes.published_endpoints, &listener)
     .await?;
-  Ok(EffectOutcome::new(TaskOutput::StopListener(())))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 /// The credential effect: issue (or rotate) the live join credential
@@ -1677,14 +1676,14 @@ async fn reconcile_credential(deps: Arc<OperationDeps>, rotate: bool) -> Result<
     .lock()
     .map_err(Error::join_credential_issuer)?;
   let issued = if rotate {
-    issuer.rotate(planes.entropy.as_ref(), std::time::SystemTime::now())?
+    issuer.rotate(planes.entropy.as_ref(), crate::time::now())?
   } else {
-    issuer.issue(planes.entropy.as_ref(), std::time::SystemTime::now())?
+    issuer.issue(planes.entropy.as_ref(), crate::time::now())?
   };
   Ok(if rotate {
-    EffectOutcome::credential_rotated(issued)
+    EffectOutcome::credential_rotated(issued)?
   } else {
-    EffectOutcome::credential_issued(issued)
+    EffectOutcome::credential_issued(issued)?
   })
 }
 
@@ -1703,7 +1702,7 @@ async fn reconcile_start_recovery(deps: Arc<OperationDeps>) -> Result<EffectOutc
       .events()
       .emit(crate::RecoveryChanged::new(after.clone()));
   }
-  Ok(EffectOutcome::new(TaskOutput::StartRecovery(after)))
+  Ok(EffectOutcome::new(encode_recovery(&after)?))
 }
 
 /// The receipt-retention effect: the idempotent on-demand pass — the
@@ -1714,9 +1713,7 @@ async fn reconcile_apply_receipt_retention(deps: Arc<OperationDeps>) -> Result<E
   let planes = deps.planes()?;
   planes.context.require_unblocked()?;
   let report = planes.context.store().apply_receipt_retention().await?;
-  Ok(EffectOutcome::new(TaskOutput::ApplyReceiptRetention(
-    report,
-  )))
+  Ok(EffectOutcome::new(encode_receipt_retention(&report)?))
 }
 
 /// The sync-round effect: forward one round request to the sync driver
@@ -1731,7 +1728,7 @@ async fn reconcile_sync_round(deps: Arc<OperationDeps>) -> Result<EffectOutcome>
   round_rx
     .await
     .map_err(|_| Error::shutting_down("sync round"))?;
-  Ok(EffectOutcome::new(TaskOutput::SyncRound(())))
+  Ok(EffectOutcome::new(encode_unit()?))
 }
 
 // -- the leave verb ------------------------------------------------------
@@ -1742,10 +1739,13 @@ async fn reconcile_sync_round(deps: Arc<OperationDeps>) -> Result<EffectOutcome>
 /// shuts down with the active-leave reason.
 ///
 /// Admission-time failures are the pure shape checks (a stopped node, a
-/// missing acknowledgement marker, a second leave while one is in
-/// flight — [`crate::ErrorKind::Conflict`]); the frozen-store refusal
-/// and every journal/teardown failure are effect-time and surface on the
-/// task's [`Task::wait`].
+/// missing acknowledgement marker, a second leave while one is admitted —
+/// the first leave holds its exclusivity slot until its terminal report —
+/// [`crate::ErrorKind::Conflict`]); the frozen-store refusal and every
+/// journal/teardown failure are effect-time and surface on the task's
+/// [`Task::wait`]. A failure after the network teardown began also shuts
+/// the node down with [`crate::ShutdownReason::Fatal`]: it has no
+/// listeners and no sessions left to serve with.
 pub(crate) async fn leave(
   tasks: &TaskClient, acknowledgement: crate::ReplaceIdentityAndDeleteOldCoreMetadata,
 ) -> Result<Task<crate::LeaveOutcome>> {
@@ -1757,11 +1757,11 @@ pub(crate) async fn leave(
   let effect: TaskEffect =
     Arc::new(|deps, _attempt| Box::pin(async move { reconcile_leave(deps).await }));
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::Leave, TaskPayload::None), effect)
+    .submit(TaskSpec::new(TaskKind::LEAVE, TaskPayload::None), effect)
     .await?;
   Ok(Task::from_parts(
     id,
-    TaskKind::Leave,
+    TaskKind::LEAVE,
     tasks.observer.clone(),
   ))
 }
@@ -1775,7 +1775,11 @@ pub(crate) async fn leave(
 /// silent leave, which the cleanup path covers. The task's terminal
 /// publication lands before the manager signals the supervisor's
 /// active-leave shutdown, so a `wait` caller always observes the outcome
-/// before any teardown begins.
+/// before any teardown begins. A failure before the network teardown
+/// (journal, announcement) is the caller's to retry and leaves the node
+/// running; a failure once the teardown began reports the fatal shutdown
+/// itself, because the node has no listeners and no sessions left to
+/// serve with.
 async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
   let planes = deps.planes()?;
   planes.context.require_unblocked()?;
@@ -1794,37 +1798,55 @@ async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
   .await?;
 
   // Network teardown first: no new sessions or inbound metadata while
-  // the identity is replaced and the old metadata is wiped.
-  let listener_ids: Vec<crate::identity::ListenerId> = planes
-    .listeners
-    .lock()
-    .map_err(Error::listener_registry)?
-    .keys()
-    .cloned()
-    .collect();
-  for listener in listener_ids {
-    super::listeners::stop_listener(&planes.listeners, &planes.published_endpoints, &listener)
-      .await?;
-  }
-  let peers: Vec<NodeId> = planes
-    .sessions
-    .lock()
-    .map_err(Error::session_table)?
-    .keys()
-    .cloned()
-    .collect();
-  for peer in peers {
-    retire_session(&planes.sessions, &peer)?;
-  }
+  // the identity is replaced and the old metadata is wiped. Both steps
+  // are idempotent, so a concurrent stop-listener or disconnect never
+  // fails the leave after a partial teardown. From here on the node's
+  // network is down, so a failure must drive the fatal shutdown instead
+  // of leaving the node silently `Running`.
+  let teardown = async {
+    let listener_ids: Vec<crate::identity::ListenerId> = planes
+      .listeners
+      .lock()
+      .map_err(Error::listener_registry)?
+      .keys()
+      .cloned()
+      .collect();
+    for listener in listener_ids {
+      stop_listener_for_leave(&planes.listeners, &planes.published_endpoints, &listener).await?;
+    }
+    let peers: Vec<NodeId> = planes
+      .sessions
+      .lock()
+      .map_err(Error::session_table)?
+      .keys()
+      .cloned()
+      .collect();
+    for peer in peers {
+      // Idempotent by construction: a peer with no session entry is
+      // already down, never an error.
+      retire_session(&planes.sessions, &peer)?;
+    }
 
-  crate::identity::leave::run_leave(
-    context.store(),
-    context.keys(),
-    planes.entropy.as_ref(),
-    &journaled.stored,
-    &journaled.intent,
-  )
-  .await?;
+    crate::identity::leave::run_leave(
+      context.store(),
+      context.keys(),
+      planes.entropy.as_ref(),
+      &journaled.stored,
+      &journaled.intent,
+    )
+    .await
+  }
+  .await;
+  if let Err(error) = teardown {
+    // The node cannot keep running with every listener and session down:
+    // the signal drives `finish_shutdown` with the failure's kind. The
+    // channel is capacity-one, so a refused send only means a signal
+    // already started the shutdown.
+    let _ = planes
+      .leave_signal
+      .try_send(super::lifecycle::LeaveSignal::Fatal(error.kind()));
+    return Err(error);
+  }
   let (former, replacement) = (
     journaled.intent.former_node().clone(),
     journaled.intent.replacement_node().clone(),
@@ -1833,9 +1855,25 @@ async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
     former.clone(),
     replacement.clone(),
   ));
-  Ok(EffectOutcome::new(TaskOutput::Leave(
-    crate::LeaveOutcome::new(former, replacement),
-  )))
+  Ok(EffectOutcome::new(encode_leave(
+    &crate::LeaveOutcome::new(former, replacement),
+  )?))
+}
+
+/// Stops one listener for the leave teardown. The stop-listener effect
+/// reports an unknown listener as [`crate::ErrorKind::NotFound`], but for
+/// the leave an already-removed listener is already down: a concurrent
+/// stop that won the race must not fail the leave after it tore the rest
+/// of the network down.
+async fn stop_listener_for_leave(
+  listeners: &ListenerRegistry, published_endpoints: &Arc<Mutex<Vec<Endpoint>>>,
+  listener: &crate::identity::ListenerId,
+) -> Result<()> {
+  match super::listeners::stop_listener(listeners, published_endpoints, listener).await {
+    Ok(()) => Ok(()),
+    Err(error) if error.kind() == crate::ErrorKind::NotFound => Ok(()),
+    Err(error) => Err(error),
+  }
 }
 
 #[cfg(test)]
@@ -1850,10 +1888,9 @@ mod descriptor_publication_tests {
       .collect()
   }
 
-  /// The gate's two bounds (remaining items 2026-10-10, P2-9): the
-  /// endpoint-set stamp suppresses ensure work while the published
-  /// endpoints are unchanged (a listener transition is the only
-  /// invalidation), and the single-flight flag admits exactly one
+  /// The gate's two bounds: the endpoint-set stamp suppresses ensure work
+  /// while the published endpoints are unchanged (a listener transition is
+  /// the only invalidation), and the single-flight flag admits exactly one
   /// publication task at a time.
   #[test]
   fn the_stamp_suppresses_unchanged_kicks_and_the_slot_serializes() {
@@ -1889,7 +1926,7 @@ mod lazy_publication_shutdown_tests {
   };
 
   use crate::{
-    BoxFuture, NodeConfig, NodeId, TransportScheme,
+    BoxFuture, NodeConfig, NodeId,
     extension_registry::ExtensionRegistry,
     identity::testing::{ScriptedKeys, SequenceEntropy},
     provider::{
@@ -1901,7 +1938,6 @@ mod lazy_publication_shutdown_tests {
       SYNC_ROUND_CHANNEL_CAPACITY, spawn_runtime,
     },
     storage::contract::{ReferenceFactory, required_capabilities},
-    transport::registry::{Transport, builtin_transport_tag},
   };
 
   /// The descriptor-commit park: a fault-injecting factory whose every
@@ -2003,24 +2039,7 @@ mod lazy_publication_shutdown_tests {
     let keys = ScriptedKeys::full();
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
     let mut extensions = ExtensionRegistry::new();
-    for (tag, transport) in [
-      (
-        builtin_transport_tag(TransportScheme::Tls).unwrap(),
-        Arc::new(crate::transport::tls_transport::TlsTransport::new()) as Arc<dyn Transport>,
-      ),
-      (
-        builtin_transport_tag(TransportScheme::Wss).unwrap(),
-        Arc::new(crate::transport::wss::WssTransport::new()) as Arc<dyn Transport>,
-      ),
-      (
-        builtin_transport_tag(TransportScheme::Tcp).unwrap(),
-        Arc::new(crate::transport::plain::PlainTransport::new()) as Arc<dyn Transport>,
-      ),
-    ] {
-      extensions
-        .register_builtin_transport(tag, transport)
-        .unwrap();
-    }
+    extensions.register_default().unwrap();
     let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
     let (round_tx, round_rx) = tokio::sync::mpsc::channel(SYNC_ROUND_CHANNEL_CAPACITY);
     let (packet_tx, packet_rx) = tokio::sync::mpsc::channel(PACKET_CHANNEL_CAPACITY);
@@ -2054,12 +2073,12 @@ mod lazy_publication_shutdown_tests {
     (client, connection_tasks)
   }
 
-  /// Audit A08: the lazy local-descriptor publication used to spawn
-  /// detached, outside every shutdown registry, so a member read that
-  /// kicked a publication could still be mid descriptor commit when
-  /// `shutdown()` returned — the storage exclusive lifetime lock
-  /// outlived the reply, and an immediate reopen of the same factory
-  /// failed `StorageLocked` until the stray commit finished. This
+  /// The lazy local-descriptor publication must never spawn
+  /// detached, outside every shutdown registry: a member read that
+  /// kicks a publication could otherwise still be mid descriptor commit when
+  /// `shutdown()` returns — the storage exclusive lifetime lock
+  /// outlives the reply, and an immediate reopen of the same factory
+  /// fails `StorageLocked` until the stray commit finishes. This
   /// drives the real shutdown path end to end against a store whose
   /// descriptor commit parks forever (the slow-storage commit the lazy
   /// path exists for): the kicked task must sit in the tracked
@@ -2177,5 +2196,86 @@ mod shared_table_poison_tests {
     };
     assert_eq!(error.kind(), ErrorKind::Internal);
     assert_eq!(error.context(), "join credential issuer");
+  }
+}
+
+#[cfg(test)]
+mod leave_teardown_tests {
+  use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+  };
+
+  use crate::{
+    ErrorKind, NodeConfig,
+    identity::ListenerId,
+    runtime::supervisor::{
+      ListenerRegistry,
+      test_support::{RuntimeFixture, runtime_fixture_over},
+    },
+  };
+
+  /// The leave teardown is idempotent per listener: a listener a
+  /// concurrent stop already removed is already down, so the leave
+  /// continues with the rest of the teardown instead of failing after a
+  /// partial one. The stop-listener effect still reports the same absence
+  /// typed, so the tolerance stays the leave's own.
+  #[tokio::test]
+  async fn an_already_removed_listener_does_not_fail_the_leave_teardown() {
+    let listeners: ListenerRegistry = Arc::new(Mutex::new(BTreeMap::new()));
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let listener = ListenerId::parse("listener-000000000000000000001").expect("listener id");
+    assert_eq!(
+      super::super::listeners::stop_listener(&listeners, &published, &listener)
+        .await
+        .expect_err("the stop-listener effect reports an unknown listener")
+        .kind(),
+      ErrorKind::NotFound
+    );
+    super::stop_listener_for_leave(&listeners, &published, &listener)
+      .await
+      .expect("an already-removed listener is already down");
+  }
+
+  /// The tolerance is narrow: only the idempotent `NotFound` is skipped.
+  /// A real teardown failure still fails the leave — and, once the
+  /// teardown began, reports the fatal shutdown instead of leaving the
+  /// node silently `Running` with every listener and session down.
+  #[tokio::test]
+  async fn a_leave_whose_teardown_fails_reports_the_fatal_shutdown() {
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    let RuntimeFixture {
+      dependencies,
+      mut leave_signals,
+      ..
+    } = runtime_fixture_over(
+      reference as Arc<dyn crate::provider::StorageFactory>,
+      NodeConfig::new(),
+      |_| {},
+    )
+    .await;
+    let deps = dependencies.operations.clone().expect("operation handles");
+    let listeners = Arc::clone(&deps.planes().expect("planes").listeners);
+    let _ = std::thread::spawn(move || {
+      let _guard = listeners.lock().expect("listener registry guard");
+      panic!("poison the listener registry");
+    })
+    .join();
+
+    let error = match super::reconcile_leave(deps).await {
+      Ok(_) => panic!("a poisoned listener registry must fail the leave teardown"),
+      Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(error.context(), "listener registry");
+    assert_eq!(
+      leave_signals.try_recv(),
+      Ok(super::super::lifecycle::LeaveSignal::Fatal(
+        ErrorKind::Internal
+      )),
+      "the post-teardown failure must report the fatal shutdown"
+    );
   }
 }

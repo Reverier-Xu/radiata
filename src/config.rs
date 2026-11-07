@@ -2,6 +2,48 @@ use std::{collections::BTreeSet, time::Duration};
 
 use crate::{Error, FeatureTag, Result};
 
+/// The shared zero-refusal contract for every configured bound: a zero
+/// value is a caller mistake, not a "disable" spelling, so every setter
+/// fails typed with the value's own name.
+fn reject_zero<T>(name: &'static str, value: T) -> Result<()>
+where
+  T: ZeroCheck, {
+  value.zero_checked(name)
+}
+
+/// The internal seal over the two bound shapes a config knob takes:
+/// a plain count and a duration.
+trait ZeroCheck {
+  fn zero_checked(&self, name: &'static str) -> Result<()>;
+}
+
+impl ZeroCheck for usize {
+  fn zero_checked(&self, name: &'static str) -> Result<()> {
+    if *self == 0 {
+      return Err(Error::invalid_input(name));
+    }
+    Ok(())
+  }
+}
+
+impl ZeroCheck for u32 {
+  fn zero_checked(&self, name: &'static str) -> Result<()> {
+    if *self == 0 {
+      return Err(Error::invalid_input(name));
+    }
+    Ok(())
+  }
+}
+
+impl ZeroCheck for Duration {
+  fn zero_checked(&self, name: &'static str) -> Result<()> {
+    if self.is_zero() {
+      return Err(Error::invalid_input(name));
+    }
+    Ok(())
+  }
+}
+
 /// The node configuration: every knob is a plain value, clonable so one
 /// construction site can share a calibrated config across nodes or retry
 /// a start without rebuilding it.
@@ -58,6 +100,10 @@ pub struct NodeConfig {
   // The task manager's network-class execution-slot budget: the join and
   // connect dials, which can each hold a slot for a whole dial deadline.
   task_reconcile_network_slots: usize,
+  // The task manager's extension-class execution-slot budget: the
+  // caller-registered extension kinds, which routinely await other
+  // admitted tasks through their public handle.
+  task_reconcile_extension_slots: usize,
 }
 
 impl NodeConfig {
@@ -69,9 +115,7 @@ impl NodeConfig {
   /// the member table (N × interval per round cluster-wide); a cluster
   /// keeping one interval keeps its load predictable (nonzero).
   pub fn with_anti_entropy_interval(mut self, value: Duration) -> Result<Self> {
-    if value.is_zero() {
-      return Err(Error::invalid_input("anti-entropy interval"));
-    }
+    reject_zero("anti-entropy interval", value)?;
     self.anti_entropy_interval = value;
     Ok(self)
   }
@@ -89,12 +133,8 @@ impl NodeConfig {
   /// budget. Local memory and backpressure only — it never crosses the
   /// wire, so per-device scaling is safe (both nonzero).
   pub fn with_session_queue_limits(mut self, messages: usize, bytes: usize) -> Result<Self> {
-    if messages == 0 {
-      return Err(Error::invalid_input("session queue messages"));
-    }
-    if bytes == 0 {
-      return Err(Error::invalid_input("session queue bytes"));
-    }
+    reject_zero("session queue messages", messages)?;
+    reject_zero("session queue bytes", bytes)?;
     self.session_queue_messages = messages;
     self.session_queue_bytes = bytes;
     Ok(self)
@@ -151,12 +191,13 @@ impl NodeConfig {
     Ok(self)
   }
 
-  /// Selects the node's next-hop routing policy tag: when a
-  /// routed packet's destination is not directly connected, the tag
-  /// resolves in the extension registry and the registered policy picks
-  /// the single next hop. Without a tag the node relays through the
-  /// built-in [`crate::routing::DefaultNextHop`] policy, so multi-hop
-  /// routes work out of the box; setting a tag overrides the default.
+  /// Selects the node's next-hop routing policy tag: when a routed
+  /// packet's destination is not directly connected, the tag resolves in
+  /// the extension registry and the registered policy plans the route
+  /// (the ordered path the packet follows). Without a tag the node plans
+  /// through the built-in [`crate::routing::DefaultNextHop`] policy, so
+  /// multi-hop routes work out of the box; setting a tag overrides the
+  /// default.
   pub fn with_route_policy(mut self, tag: crate::QualifiedTag) -> Self {
     self.route_policy = Some(tag);
     self
@@ -198,22 +239,30 @@ impl NodeConfig {
   /// peer-visible; both values must be nonzero (the local channel is
   /// the caller's latency floor, so a deployment that never dials may
   /// shrink `network` to `1` but never zero).
+  ///
+  /// The extension channel's budget is configured separately with
+  /// [`NodeConfig::with_task_reconcile_extension_slots`].
   pub fn with_task_reconcile_slots(mut self, local: usize, network: usize) -> Result<Self> {
-    if local == 0 {
-      return Err(Error::invalid_input("local task reconcile slots"));
-    }
-    if network == 0 {
-      return Err(Error::invalid_input("network task reconcile slots"));
-    }
+    reject_zero("local task reconcile slots", local)?;
+    reject_zero("network task reconcile slots", network)?;
     self.task_reconcile_local_slots = local;
     self.task_reconcile_network_slots = network;
     Ok(self)
   }
 
+  /// Sets the task manager's extension-class execution-slot budget: the
+  /// caller-registered extension kinds draw from their own channel so a
+  /// workflow awaiting core verbs through its handle never occupies the
+  /// local capacity its own child operations need. Purely local
+  /// admission, never peer-visible; the value must be nonzero.
+  pub fn with_task_reconcile_extension_slots(mut self, extension: usize) -> Result<Self> {
+    reject_zero("extension task reconcile slots", extension)?;
+    self.task_reconcile_extension_slots = extension;
+    Ok(self)
+  }
+
   pub fn with_receipt_retention(mut self, value: Duration) -> Result<Self> {
-    if value.is_zero() {
-      return Err(Error::invalid_input("receipt retention"));
-    }
+    reject_zero("receipt retention", value)?;
     self.receipt_retention = value;
     Ok(self)
   }
@@ -231,18 +280,13 @@ impl NodeConfig {
   /// uniform across a cluster; raise it when peers may be offline
   /// longer than the window (an offline peer that misses a removal
   /// inside the window can still resurrect the older live record).
-  /// Both values must be nonzero: a zero window would drop every removal
-  /// on the first sweep, and a zero cap would evict the whole removal
-  /// population.
+  /// The window must be nonzero: a zero window would drop every removal
+  /// on the first sweep. A zero `cap` means **no population cap** — the
+  /// sweep keeps every removal until its own window expires.
   pub fn with_resource_removal_retention(
     mut self, retention: Duration, cap: usize,
   ) -> Result<Self> {
-    if retention.is_zero() {
-      return Err(Error::invalid_input("resource removal retention"));
-    }
-    if cap == 0 {
-      return Err(Error::invalid_input("resource removal cap"));
-    }
+    reject_zero("resource removal retention", retention)?;
     self.resource_removal_retention = retention;
     self.resource_removal_cap = cap;
     Ok(self)
@@ -256,9 +300,7 @@ impl NodeConfig {
   /// the authentication deadline, which starts only after the connect
   /// returns.
   pub fn with_dial_deadline(mut self, value: Duration) -> Result<Self> {
-    if value.is_zero() {
-      return Err(Error::invalid_input("dial deadline"));
-    }
+    reject_zero("dial deadline", value)?;
     self.dial_deadline = value;
     Ok(self)
   }
@@ -272,9 +314,7 @@ impl NodeConfig {
   /// keep it uniform across a cluster and tighten it only for
   /// uniformly fast deployments.
   pub fn with_authentication_deadline(mut self, value: Duration) -> Result<Self> {
-    if value.is_zero() {
-      return Err(Error::invalid_input("authentication deadline"));
-    }
+    reject_zero("authentication deadline", value)?;
     self.authentication_deadline = value;
     Ok(self)
   }
@@ -288,9 +328,7 @@ impl NodeConfig {
   /// a stuck hop would hang to the transitive liveness bound of the
   /// sessions on the path.
   pub fn with_relay_hop_deadline(mut self, value: Duration) -> Result<Self> {
-    if value.is_zero() {
-      return Err(Error::invalid_input("relay hop deadline"));
-    }
+    reject_zero("relay hop deadline", value)?;
     self.relay_hop_deadline = value;
     Ok(self)
   }
@@ -409,6 +447,12 @@ impl NodeConfig {
     self.task_reconcile_network_slots
   }
 
+  /// The extension-class execution-slot budget consumed by the task
+  /// manager's admission channel (nonzero by construction).
+  pub(crate) const fn task_reconcile_extension_slots(&self) -> usize {
+    self.task_reconcile_extension_slots
+  }
+
   pub fn require_feature(mut self, value: FeatureTag) -> Result<Self> {
     if !self.required_features.insert(value) {
       return Err(Error::conflict("required feature"));
@@ -423,21 +467,21 @@ impl Default for NodeConfig {
       // One second, not 250 ms: the anti-entropy cadence is a fixed
       // per-node cost paid N-wide every tick, and 64 nodes × 4 ticks/s
       // saturated a two-vcpu runner until the data plane's relay acks
-      // starved (incident C). Convergence at one tick/s stays far
-      // inside the sync SLOs; fast deployments may tighten it.
+      // starved. Convergence at one tick/s stays far inside the sync
+      // SLOs; fast deployments may tighten it.
       anti_entropy_interval: Duration::from_secs(1),
       dial_deadline: Duration::from_secs(10),
       // 30 s, not 10 s: the deadline covers the join-mode admission
       // commit, and on slow flash one commit costs hundreds of
       // milliseconds — a few concurrent joins pushed the tail of a
-      // burst past 10 s so joins failed persistently (the incident-B
-      // shape). The default must be safe on the slowest supported
-      // device; fast deployments tighten it, never the reverse.
+      // burst past 10 s so joins failed persistently. The default must
+      // be safe on the slowest supported device; fast deployments tighten
+      // it, never the reverse.
       authentication_deadline: Duration::from_secs(30),
       // Five seconds per hop: long enough for a slow hop to answer,
       // short enough that a long relay attempt fails its stuck branch
       // and moves on instead of hanging to the transitive liveness
-      // bound (the incident-C shape).
+      // bound.
       relay_hop_deadline: Duration::from_secs(5),
       recovery: RecoveryConfig::default(),
       session_queue_messages: 256,
@@ -465,14 +509,15 @@ impl Default for NodeConfig {
       required_features: BTreeSet::new(),
       merge_admission: MergeAdmissionLimits::default(),
       connection_degree: 0,
-      // Two plus two: the historical single semaphore held four permits,
-      // and the split keeps that total while giving each class its own
-      // channel — local work keeps a two-slot floor even while every
-      // network slot sits inside a dial deadline (the starvation
-      // incident behind the split). Deployments that dial heavily may
-      // grow `network`; a deployment that never dials may shrink it.
+      // Two plus two: one shared semaphore of four permits would let a
+      // dial hold every slot, so the split keeps that total while giving each
+      // class its own channel — local work keeps a two-slot floor even while
+      // every network slot sits inside a dial deadline. Deployments that dial
+      // heavily may grow `network`; a deployment that never dials may shrink
+      // it.
       task_reconcile_local_slots: 2,
       task_reconcile_network_slots: 2,
+      task_reconcile_extension_slots: 2,
     }
   }
 }
@@ -493,8 +538,8 @@ pub(crate) struct AdmissionPoolLimits {
 /// (holders of a trusted binding — the self-healing path) are budgeted
 /// by the cluster scale: `max(16, 4 × expected_members)` per source and
 /// `max(256, 4 × expected_members)` per node per minute, so a whole
-/// site reconnecting behind one address never starves its tail (the
-/// incident-B shape). Tokens refill continuously at `burst / window`
+/// site reconnecting behind one address never starves its tail. Tokens
+/// refill continuously at `burst / window`
 /// per second.
 #[derive(Clone, Copy, Debug)]
 pub struct MergeAdmissionLimits {
@@ -509,9 +554,7 @@ impl MergeAdmissionLimits {
   /// join pool stays fixed (strangers do not scale with the cluster);
   /// only the member pool grows with the expected member count.
   pub fn for_cluster(expected_members: usize) -> Result<Self> {
-    if expected_members == 0 {
-      return Err(Error::invalid_input("expected members"));
-    }
+    reject_zero("expected members", expected_members)?;
     Ok(Self::scaled(expected_members))
   }
 
@@ -537,18 +580,10 @@ impl MergeAdmissionLimits {
     mut self, source_burst: u32, source_window: Duration, global_burst: u32,
     global_window: Duration,
   ) -> Result<Self> {
-    if source_burst == 0 {
-      return Err(Error::invalid_input("join source burst"));
-    }
-    if global_burst == 0 {
-      return Err(Error::invalid_input("join global burst"));
-    }
-    if source_window.is_zero() {
-      return Err(Error::invalid_input("join source window"));
-    }
-    if global_window.is_zero() {
-      return Err(Error::invalid_input("join global window"));
-    }
+    reject_zero("join source burst", source_burst)?;
+    reject_zero("join global burst", global_burst)?;
+    reject_zero("join source window", source_window)?;
+    reject_zero("join global window", global_window)?;
     self.join_source = (source_burst, source_window);
     self.join_global = (global_burst, global_window);
     Ok(self)
@@ -561,18 +596,10 @@ impl MergeAdmissionLimits {
     mut self, source_burst: u32, source_window: Duration, global_burst: u32,
     global_window: Duration,
   ) -> Result<Self> {
-    if source_burst == 0 {
-      return Err(Error::invalid_input("member source burst"));
-    }
-    if global_burst == 0 {
-      return Err(Error::invalid_input("member global burst"));
-    }
-    if source_window.is_zero() {
-      return Err(Error::invalid_input("member source window"));
-    }
-    if global_window.is_zero() {
-      return Err(Error::invalid_input("member global window"));
-    }
+    reject_zero("member source burst", source_burst)?;
+    reject_zero("member global burst", global_burst)?;
+    reject_zero("member source window", source_window)?;
+    reject_zero("member global window", global_window)?;
     self.member_source = (source_burst, source_window);
     self.member_global = (global_burst, global_window);
     Ok(self)
@@ -611,15 +638,9 @@ pub struct TraceMetadataLimits {
 
 impl TraceMetadataLimits {
   pub fn new(active: usize, terminal: usize, retention: Duration) -> Result<Self> {
-    if active == 0 {
-      return Err(Error::invalid_input("active trace metadata"));
-    }
-    if terminal == 0 {
-      return Err(Error::invalid_input("terminal trace metadata"));
-    }
-    if retention.is_zero() {
-      return Err(Error::invalid_input("trace metadata retention"));
-    }
+    reject_zero("active trace metadata", active)?;
+    reject_zero("terminal trace metadata", terminal)?;
+    reject_zero("trace metadata retention", retention)?;
     Ok(Self {
       active,
       terminal,
@@ -660,6 +681,11 @@ impl Default for TraceMetadataLimits {
 /// connected node never dials. `fan_out` caps how many members one
 /// recovery round dials in parallel, and the backoff pair bounds the
 /// retry cadence.
+///
+/// The backoff pair is **second-granular**: the controller's schedule is
+/// whole seconds, so a sub-second component would be silently truncated
+/// (500 ms → 1 s, 1.5 s → 1 s). A fractional value is rejected at
+/// construction instead of becoming a different cadence at runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryConfig {
   fan_out: usize,
@@ -668,18 +694,22 @@ pub struct RecoveryConfig {
 }
 
 impl RecoveryConfig {
+  /// Builds one recovery policy: a nonzero fan-out, a nonzero initial
+  /// backoff no greater than the maximum, and both backoffs in whole
+  /// seconds.
   pub fn new(fan_out: usize, initial_backoff: Duration, maximum_backoff: Duration) -> Result<Self> {
     if fan_out == 0 {
       return Err(Error::invalid_input("recovery fan-out"));
     }
-    if initial_backoff.is_zero() {
-      return Err(Error::invalid_input("initial recovery backoff"));
-    }
-    if maximum_backoff.is_zero() {
-      return Err(Error::invalid_input("maximum recovery backoff"));
-    }
+    reject_zero("initial recovery backoff", initial_backoff)?;
+    reject_zero("maximum recovery backoff", maximum_backoff)?;
     if initial_backoff > maximum_backoff {
       return Err(Error::invalid_input("recovery policy"));
+    }
+    for value in [initial_backoff, maximum_backoff] {
+      if value.subsec_nanos() != 0 {
+        return Err(Error::invalid_input("recovery backoff granularity"));
+      }
     }
     Ok(Self {
       fan_out,
@@ -707,9 +737,8 @@ impl Default for RecoveryConfig {
       // Sixteen, not sixty-four: the any-one-route contract needs exactly
       // one route, and on two slow cores a sixty-four-dial burst starved
       // its own tail past the authentication deadline so every dial in
-      // the burst failed and the isolated member never healed (incident
-      // B). Sixteen converges in a step or two under the same
-      // starvation.
+      // the burst failed and the isolated member never healed. Sixteen
+      // converges in a step or two under the same starvation.
       fan_out: 16,
       // Two seconds, not one: with identical backoff sequences many
       // devices recovering from one shared event retry in lockstep and
@@ -726,7 +755,7 @@ impl Default for RecoveryConfig {
 mod tests {
   use std::time::Duration;
 
-  use super::NodeConfig;
+  use super::{NodeConfig, RecoveryConfig};
   use crate::ErrorKind;
 
   /// The liveness setter stores every accepted policy shape: fully
@@ -843,6 +872,8 @@ mod tests {
       .with_resource_removal_retention(Duration::from_secs(3_600), 1_024)
       .unwrap()
       .with_task_reconcile_slots(4, 8)
+      .unwrap()
+      .with_task_reconcile_extension_slots(3)
       .unwrap();
     assert_eq!(configured.dial_deadline(), Duration::from_millis(250));
     assert_eq!(
@@ -858,6 +889,7 @@ mod tests {
     assert_eq!(configured.resource_removal_cap(), 1_024);
     assert_eq!(configured.task_reconcile_local_slots(), 4);
     assert_eq!(configured.task_reconcile_network_slots(), 8);
+    assert_eq!(configured.task_reconcile_extension_slots(), 3);
 
     for error in [
       NodeConfig::new()
@@ -876,34 +908,60 @@ mod tests {
         .with_resource_removal_retention(Duration::ZERO, 1)
         .unwrap_err(),
       NodeConfig::new()
-        .with_resource_removal_retention(Duration::from_secs(1), 0)
-        .unwrap_err(),
-      NodeConfig::new()
         .with_task_reconcile_slots(0, 2)
         .unwrap_err(),
       NodeConfig::new()
         .with_task_reconcile_slots(2, 0)
+        .unwrap_err(),
+      NodeConfig::new()
+        .with_task_reconcile_extension_slots(0)
         .unwrap_err(),
     ] {
       assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
   }
 
+  /// The three execution-slot channels ship the same two-slot default:
+  /// the historical four-permit total split across the core classes plus
+  /// the extension channel's own two lanes.
+  #[test]
+  fn task_reconcile_slots_default_to_two_per_class() {
+    let config = NodeConfig::new();
+    assert_eq!(config.task_reconcile_local_slots(), 2);
+    assert_eq!(config.task_reconcile_network_slots(), 2);
+    assert_eq!(config.task_reconcile_extension_slots(), 2);
+  }
+
+  /// A zero removal cap is the documented "no population cap" shape:
+  /// the sweep's candidate heap stays empty and the removal population
+  /// is bounded only by each record's own window.
+  #[test]
+  fn a_zero_removal_cap_means_no_population_cap() {
+    let config = NodeConfig::new()
+      .with_resource_removal_retention(Duration::from_secs(3_600), 0)
+      .unwrap();
+    assert_eq!(config.resource_removal_cap(), 0);
+    assert_eq!(
+      config.resource_removal_retention(),
+      Duration::from_secs(3_600)
+    );
+  }
+
   /// The library ships exactly one profile — the defaults — and it must
   /// be safe on the slowest supported device (the mixed-cluster rule:
   /// timing constants are peer-visible, so there is no second, named
   /// low-power profile). Every recalibrated value traces to a
-  /// transport-chaos incident or a slow-device bound.
+  /// transport-chaos scenario or a slow-device bound.
   #[test]
   fn liveness_defaults_are_the_slow_device_calibration() {
     let config = NodeConfig::new();
-    // Incident C: 64 nodes x 4 anti-entropy ticks/s starved a two-vcpu
+    // 64 nodes x 4 anti-entropy ticks/s starve a two-vcpu
     // runner's data plane; one tick/s keeps the O(N x interval) load
     // bounded while converging far inside the sync SLOs.
     assert_eq!(config.anti_entropy_interval(), Duration::from_secs(1));
-    // Incident B, deadline half: slow-flash admission commits pushed
-    // concurrent join tails past the old 10 s deadline into persistent
-    // join failure.
+    // Deadline half: slow-flash admission commits push
+    // concurrent join tails past a 10 s deadline into persistent
+    // join failure, so the default covers the slowest supported device.
     assert_eq!(config.authentication_deadline(), Duration::from_secs(30));
     // Duty-cycled peers skip several 20 s pings before the 60 s
     // keepalive timeout closes them, and a 90 s idle tolerates a slow
@@ -911,7 +969,7 @@ mod tests {
     assert_eq!(config.session_idle_timeout(), Duration::from_secs(90));
     assert_eq!(config.keepalive_interval(), Duration::from_secs(20));
     assert_eq!(config.keepalive_timeout(), Duration::from_secs(60));
-    // Incident B: the recovery plane's own defaults (fan-out sixteen,
+    // The recovery plane's own defaults (fan-out sixteen,
     // two-second initial backoff) are asserted in the recovery
     // controller's tests; here only the ordering invariant repeats:
     assert!(config.recovery().fan_out() >= 1);
@@ -964,5 +1022,26 @@ mod tests {
         .unwrap_err();
       assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
+  }
+
+  /// The recovery backoff pair is second-granular: the controller's
+  /// schedule is whole seconds, so a sub-second value would silently
+  /// truncate to a different cadence (500 ms → 1 s, 1.5 s → 1 s). Both
+  /// halves are rejected at the constructor; the smallest whole-second
+  /// policy stays valid and reads back exactly.
+  #[test]
+  fn recovery_backoff_rejects_sub_second_granularity() {
+    for (initial_backoff, maximum_backoff) in [
+      (Duration::from_millis(500), Duration::from_secs(5)),
+      (Duration::from_millis(1_500), Duration::from_secs(5)),
+      (Duration::from_secs(1), Duration::from_millis(1_500)),
+      (Duration::from_nanos(1), Duration::from_secs(1)),
+    ] {
+      let error = RecoveryConfig::new(1, initial_backoff, maximum_backoff).unwrap_err();
+      assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+    let whole = RecoveryConfig::new(1, Duration::from_secs(1), Duration::from_secs(2)).unwrap();
+    assert_eq!(whole.initial_backoff_seconds(), 1);
+    assert_eq!(whole.maximum_backoff_seconds(), 2);
   }
 }

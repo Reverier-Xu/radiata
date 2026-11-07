@@ -2,9 +2,11 @@ use std::{fmt, str::FromStr, sync::Arc};
 
 use sha2::{Digest as ShaDigest, Sha256};
 
-use crate::{BoxFuture, Digest, Error, PublicKey, QualifiedTag, Result, Signature, TransactionId};
+use crate::{
+  BoxFuture, Digest, Error, PublicKey, QualifiedTag, Result, Signature, TransactionId,
+  identity::{id::canonical_id, validate_id},
+};
 
-const KEY_OPERATION_PREFIX: &str = "keyop";
 const STORE_VALUE_DOMAIN: &[u8] = b"radiata/store-value/v1\0";
 const STORE_TRANSACTION_DOMAIN: &[u8] = b"radiata/store-transaction/v1\0";
 
@@ -48,45 +50,12 @@ impl KeyCapabilities {
   }
 }
 
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct KeyOperationId(String);
+canonical_id!(KeyOperationId, "keyop", "key operation id");
 
 impl KeyOperationId {
-  pub fn parse(value: &str) -> Result<Self> {
-    crate::identity::validate_id(value, KEY_OPERATION_PREFIX, "key operation id")?;
-    Ok(Self(value.to_owned()))
-  }
-
   pub(crate) fn generate(entropy: &dyn crate::api::Entropy) -> Result<Self> {
-    let value = crate::identity::id::random_prefixed_id(KEY_OPERATION_PREFIX, entropy)?;
+    let value = crate::identity::id::random_prefixed_id("keyop", entropy)?;
     Ok(Self(value))
-  }
-
-  pub fn as_str(&self) -> &str {
-    &self.0
-  }
-}
-
-impl FromStr for KeyOperationId {
-  type Err = Error;
-
-  fn from_str(value: &str) -> Result<Self> {
-    Self::parse(value)
-  }
-}
-
-impl fmt::Debug for KeyOperationId {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter
-      .debug_tuple("KeyOperationId")
-      .field(&self.0)
-      .finish()
-  }
-}
-
-impl fmt::Display for KeyOperationId {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter.write_str(&self.0)
   }
 }
 
@@ -217,11 +186,6 @@ pub struct StoreRequirements {
   ordered_scan: bool,
   reconciliation: bool,
   exclusive_lifetime_lock: bool,
-  /// Forward infrastructure: no production adapter advertises the
-  /// transactional-migration bit and no production requirement names it,
-  /// so the bit exists only where tests and fuzzing exercise it.
-  #[cfg(any(test, fuzzing))]
-  transactional_migration: bool,
 }
 
 impl StoreRequirements {
@@ -232,8 +196,6 @@ impl StoreRequirements {
       ordered_scan: true,
       reconciliation: true,
       exclusive_lifetime_lock: true,
-      #[cfg(any(test, fuzzing))]
-      transactional_migration: false,
     }
   }
 
@@ -257,18 +219,6 @@ impl StoreRequirements {
     self.exclusive_lifetime_lock
   }
 
-  #[cfg(any(test, fuzzing))]
-  pub fn requires_transactional_migration(&self) -> bool {
-    self.transactional_migration
-  }
-
-  #[cfg(any(test, fuzzing))]
-  #[cfg_attr(fuzzing, allow(dead_code))]
-  pub(crate) const fn transactional_migration(mut self, required: bool) -> Self {
-    self.transactional_migration = required;
-    self
-  }
-
   #[cfg(all(test, not(unix)))]
   pub(crate) const fn with_required_durability(mut self, level: DurabilityLevel) -> Self {
     self.required_durability = level;
@@ -283,11 +233,6 @@ pub struct StoreCapabilities {
   ordered_scan: bool,
   reconciliation: bool,
   exclusive_lifetime_lock: bool,
-  /// Forward infrastructure: no production adapter advertises the
-  /// transactional-migration bit, so the bit exists only where tests and
-  /// fuzzing exercise it.
-  #[cfg(any(test, fuzzing))]
-  transactional_migration: bool,
 }
 
 impl StoreCapabilities {
@@ -298,8 +243,6 @@ impl StoreCapabilities {
       ordered_scan: false,
       reconciliation: false,
       exclusive_lifetime_lock: false,
-      #[cfg(any(test, fuzzing))]
-      transactional_migration: false,
     }
   }
 
@@ -336,12 +279,6 @@ impl StoreCapabilities {
     self
   }
 
-  #[cfg(any(test, fuzzing))]
-  pub fn transactional_migration(mut self, supported: bool) -> Self {
-    self.transactional_migration = supported;
-    self
-  }
-
   pub fn durability(&self) -> DurabilityLevel {
     self.durability
   }
@@ -362,35 +299,13 @@ impl StoreCapabilities {
     self.exclusive_lifetime_lock
   }
 
-  #[cfg(any(test, fuzzing))]
-  pub fn has_transactional_migration(&self) -> bool {
-    self.transactional_migration
-  }
-
   pub(crate) const fn satisfies(&self, requirements: &StoreRequirements) -> bool {
     durability_satisfies(self.durability, requirements.required_durability)
       && (!requirements.conditional_batch || self.conditional_batch)
       && (!requirements.ordered_scan || self.ordered_scan)
       && (!requirements.reconciliation || self.reconciliation)
       && (!requirements.exclusive_lifetime_lock || self.exclusive_lifetime_lock)
-      && transactional_migration_satisfied(self, requirements)
   }
-}
-
-/// The gated capability clause: production requirements cannot name the
-/// transactional-migration bit, so the clause exists only under the gate.
-#[cfg(any(test, fuzzing))]
-const fn transactional_migration_satisfied(
-  capabilities: &StoreCapabilities, requirements: &StoreRequirements,
-) -> bool {
-  !requirements.transactional_migration || capabilities.transactional_migration
-}
-
-/// With the gate off the bit cannot be required or advertised, so the
-/// clause is vacuously true.
-#[cfg(not(any(test, fuzzing)))]
-const fn transactional_migration_satisfied(_: &StoreCapabilities, _: &StoreRequirements) -> bool {
-  true
 }
 
 const fn durability_satisfies(actual: DurabilityLevel, required: DurabilityLevel) -> bool {
@@ -898,8 +813,7 @@ pub trait Storage: fmt::Debug + Send + Sync + 'static {
 
   /// Flushes every in-flight execution to durability before returning:
   /// implementations must resolve only once no spawned commit or read
-  /// execution still holds the backend (audit 2026-10-23 P1-10, extended
-  /// to snapshot readers in audit 2026-10-27 B3). The node shutdown
+  /// execution still holds the backend. The node shutdown
   /// relies on this barrier: the reply returns only after flush
   /// resolves, so reopening the same backend cannot race a landing
   /// execution. The wait is deliberately unbounded — it awaits
@@ -921,7 +835,7 @@ fn digest_store_value(value: &[u8]) -> Digest {
 /// operation digest. This is the single definition behind every storage
 /// adapter; the storage-contract reference oracle deliberately keeps its
 /// own derivation of the expectation table (see
-/// `src/storage/contract/reference.rs`, audit A9) so the oracle and the
+/// `src/storage/contract/reference.rs`) so the oracle and the
 /// adapters cannot drift in lockstep. Without a storage-backend feature
 /// there are no callers, which is intentionally allowed.
 #[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
@@ -970,7 +884,7 @@ fn expectation_matches(digest: Option<Digest>, expected: &StoreExpectation) -> b
 /// `Some` is the decided outcome. The lookups are per-site closures so
 /// every storage adapter keeps its exact read order and error contexts
 /// (the reference oracle re-derives this order on its own, see
-/// `src/storage/contract/reference.rs`, audit A9): `receipt` resolves one
+/// `src/storage/contract/reference.rs`): `receipt` resolves one
 /// transaction id to its stored receipt (the replay source and, derived
 /// from it, the `ForgetReceipt` digest expectation), `current_revision`
 /// resolves the current store revision, and `entry` resolves one record
@@ -1014,7 +928,7 @@ pub(crate) fn commit_precheck(
 /// Classifies one stored-receipt lookup into the three-way
 /// [`ReconcileOutcome`], the single reconcile verdict behind every
 /// storage adapter (the reference oracle keeps its own derivation, see
-/// `src/storage/contract/reference.rs`, audit A9): a receipt carrying the
+/// `src/storage/contract/reference.rs`): a receipt carrying the
 /// exact digest is [`ReconcileOutcome::Committed`], the same transaction
 /// id under a different digest is [`ReconcileOutcome::DigestConflict`],
 /// and no receipt is [`ReconcileOutcome::Aborted`]. The lookup itself
@@ -1104,26 +1018,6 @@ fn update_length(hasher: &mut Sha256, value: usize) {
   hasher.update((value as u128).to_be_bytes());
 }
 
-/// The shared intent-purpose bound: nonempty, bounded, printable ASCII
-/// purposes live in both the identity intent records and the pending
-/// transaction journal, so the grammar and its limit are defined once
-/// here and both sides validate through [`validate_purpose`].
-pub(crate) const MAX_PURPOSE_LEN: usize = 128;
-
-/// The intent-purpose grammar (single source): nonempty, bounded, and
-/// printable ASCII, with the caller's context in the typed error. Both
-/// the identity intent records and the storage pending journal validate
-/// purposes through this one gate so the two bounds cannot drift.
-pub(crate) fn validate_purpose(purpose: &str, context: &'static str) -> Result<()> {
-  if purpose.is_empty()
-    || purpose.len() > MAX_PURPOSE_LEN
-    || !purpose.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
-  {
-    return Err(Error::invalid_input(context));
-  }
-  Ok(())
-}
-
 #[cfg(test)]
 mod tests {
   use std::sync::Arc;
@@ -1202,7 +1096,6 @@ mod tests {
       ordered_scan: true,
       reconciliation: true,
       exclusive_lifetime_lock: true,
-      transactional_migration: true,
     };
 
     assert_eq!(
@@ -1213,7 +1106,6 @@ mod tests {
     assert!(requirements.requires_ordered_scan());
     assert!(requirements.requires_reconciliation());
     assert!(requirements.requires_exclusive_lifetime_lock());
-    assert!(requirements.requires_transactional_migration());
   }
 
   #[test]

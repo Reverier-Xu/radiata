@@ -63,13 +63,15 @@ impl JournalPurpose {
 
 const ED25519_ALGORITHM: &str = "radiata.woooo.tech/crypto/ed25519";
 
-const LOCAL_IDENTITY_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/local-identity";
-const KEY_CREATION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-creation-intent";
-const IDENTITY_BINDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/identity-binding";
-const CREDENTIAL_USE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/credential-use";
-const MERGE_GRANT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/merge-grant";
-const KEY_DELETION_INTENT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-deletion-intent";
-const KEY_DELETED_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-deleted";
+pub(crate) const LOCAL_IDENTITY_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/local-identity";
+pub(crate) const KEY_CREATION_INTENT_SCHEMA: &str =
+  "radiata.woooo.tech/schemas/v1/key-creation-intent";
+pub(crate) const IDENTITY_BINDING_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/identity-binding";
+pub(crate) const CREDENTIAL_USE_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/credential-use";
+pub(crate) const MERGE_GRANT_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/merge-grant";
+pub(crate) const KEY_DELETION_INTENT_SCHEMA: &str =
+  "radiata.woooo.tech/schemas/v1/key-deletion-intent";
+pub(crate) const KEY_DELETED_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/key-deleted";
 
 pub(crate) use crate::storage::families::{
   CREDENTIAL_USE_NAMESPACE, IDENTITY_BINDING_NAMESPACE, KEY_CREATION_INTENT_NAMESPACE,
@@ -79,6 +81,11 @@ pub(crate) use crate::storage::families::{
 
 const SINGLETON_KEY: &[u8] = b"self";
 const RECORD_LIMITS: CborLimits = CborLimits::new(1, 16, 1_024);
+
+/// Canonical-decoder bounds shared by every flat issuer-signed tombstone
+/// record (the revocation, leave, and cleanup records): one map-entry
+/// budget, eight inter-array values, 1 KiB body.
+pub(crate) const FLAT_RECORD_LIMITS: CborLimits = CborLimits::new(1, 8, 1_024);
 
 pub(crate) fn metadata_namespace(tag: &str) -> Result<StoreNamespace> {
   crate::storage::families::namespace(tag)
@@ -361,8 +368,8 @@ where
 /// records cap would study the same over-window prefix every pass and
 /// never consider it. Returns exactly the collectible records.
 pub(crate) fn scan_collectible_records<'a, T>(
-  store: &'a MetadataStore, namespace: StoreNamespace, watermark: u64, cap: usize,
-  skip: fn(&StoreKey) -> bool, decode: fn(&[u8]) -> Result<T>, stamp: fn(&T) -> u64,
+  store: &'a MetadataStore, namespace: StoreNamespace, watermark: i64, cap: usize,
+  skip: fn(&StoreKey) -> bool, decode: fn(&[u8]) -> Result<T>, stamp: fn(&T) -> i64,
 ) -> BoxFuture<'a, Result<Vec<T>>>
 where
   T: Send + 'a, {
@@ -497,7 +504,7 @@ pub(crate) struct CollectibleTombstone {
   /// The terminal record's store key inside its family.
   pub(crate) key: StoreKey,
   /// The signed removal stamp compared against the checkpoint watermark.
-  pub(crate) stamp_millis: u64,
+  pub(crate) stamp_millis: i64,
   /// The subject whose pinned binding the collection retires.
   pub(crate) subject: NodeId,
   /// The exact key the record pins.
@@ -518,7 +525,7 @@ pub(crate) struct CollectibleTombstone {
 /// next pass (hygiene, never security). Holds the writer permit across
 /// the sweep like every identity phase.
 pub(crate) async fn collect_tombstones_before(
-  store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, watermark: u64,
+  store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, watermark: i64,
   entries: &[CollectibleTombstone],
 ) -> Result<usize> {
   let _permit = store.write_permit().await;
@@ -707,6 +714,23 @@ impl LocalIdentityV1 {
   }
 }
 
+/// The purpose bound of the key intent records: nonempty, at most this
+/// many bytes, printable ASCII. The purpose is a durable field of these
+/// records, so its grammar is an invariant of this module.
+const MAX_PURPOSE_LEN: usize = 128;
+
+/// Validates one intent purpose against the record's own bound, with the
+/// caller's context in the typed error.
+fn validate_purpose(purpose: &str, context: &'static str) -> Result<()> {
+  if purpose.is_empty()
+    || purpose.len() > MAX_PURPOSE_LEN
+    || !purpose.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
+  {
+    return Err(Error::invalid_input(context));
+  }
+  Ok(())
+}
+
 canonical_record! {
   wire KeyCreationIntentWire for KeyCreationIntentV1 vis [pub(crate)] {
     schema KEY_CREATION_INTENT_SCHEMA,
@@ -739,7 +763,7 @@ impl KeyCreationIntentV1 {
     operation: KeyOperationId, intended_node: NodeId, purpose: String, transaction: TransactionId,
     base_revision: StoreRevision,
   ) -> Result<Self> {
-    crate::provider::validate_purpose(&purpose, "key creation intent purpose")?;
+    validate_purpose(&purpose, "key creation intent purpose")?;
     Ok(Self {
       operation,
       intended_node,
@@ -826,7 +850,7 @@ impl KeyDeletionIntentV1 {
     operation: KeyOperationId, handle: KeyHandle, purpose: String, transaction: TransactionId,
     base_revision: StoreRevision,
   ) -> Result<Self> {
-    crate::provider::validate_purpose(&purpose, "key deletion intent purpose")?;
+    validate_purpose(&purpose, "key deletion intent purpose")?;
     Ok(Self {
       operation,
       handle,
@@ -1143,12 +1167,9 @@ impl MergeGrantV1 {
 
 // The hex literals below are the single source of the frozen identity
 // record vectors: the golden suite in this module pins constructors and
-// decoders to these bytes, and the `0.1.0` compatibility manifest
-// (`crate::compatibility`) references the same constants, so the two
-// suites cannot drift apart. They compile only under `cfg(test)`, like
-// the test-only compatibility manifest itself. The bytes are frozen;
-// changing one is a deliberate compatibility amendment, never a silent
-// edit.
+// decoders to these bytes. They compile only under `cfg(test)`. The
+// bytes are frozen; changing one is a deliberate compatibility
+// amendment, never a silent edit.
 
 #[cfg(test)]
 pub(crate) const LOCAL_IDENTITY_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6c6f63616c2d6964656e7469747901781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a17821726164696174612e776f6f6f6f2e746563682f63727970746f2f65643235353139781b6b65796f702d353030303030303030303030303030303030303030506f70617175652d68616e646c652d3031";
@@ -1160,9 +1181,6 @@ pub(crate) const IDENTITY_BINDING_GOLDEN: &str = "85782e726164696174612e776f6f6f
 pub(crate) const CREDENTIAL_USE_GOLDEN: &str = "87782c726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f63726564656e7469616c2d75736501781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c350d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
 #[cfg(test)]
 pub(crate) const MERGE_GRANT_GOLDEN: &str = "887829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6d657267652d6772616e740150d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4781a6e6f64652d3130303030303030303030303030303030303030305820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1781a6e6f64652d32303030303030303030303030303030303030303050c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c35840ec05240b0a1a205f4e52e9ef3d4bf18aed07f901110c65f564b40f4672df7afd13e961eafd674ad47c86d93ef086daa568745b6adca6a8ee7b8c6af93428fe0a";
-#[cfg(test)]
-pub(crate) const KEY_DELETED_GOLDEN: &str = "847829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6b65792d64656c6574656401781b6b65796f702d6161616161616161616161616161616161616161615270726f76696465722d68616e646c652d3031";
-
 #[cfg(test)]
 mod tests {
   use std::{collections::VecDeque, sync::Mutex};
@@ -1992,7 +2010,7 @@ mod tests {
   /// of delivery order: a fresh record installs once, the exact record is
   /// idempotent, the decider's winner replaces the loser through the
   /// exact-digest conditional put, and the decider's own fail-closed
-  /// binding error surfaces as Conflict without mutation (audit A01).
+  /// binding error surfaces as Conflict without mutation.
   #[tokio::test]
   async fn convergent_terminal_record_replaces_the_decided_winner_deterministically() {
     use crate::{

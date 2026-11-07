@@ -2,8 +2,7 @@
 //! retry, the post-commit outcome mapping, and the writer's monotonic
 //! resource-write stamp clock. The put and removal effects themselves
 //! live in [`super::task_effects`] (`reconcile_put_resource`,
-//! `reconcile_delete_resource`) and compose these helpers exactly the
-//! way the old supervisor methods did.
+//! `reconcile_delete_resource`) and compose these helpers.
 
 use crate::{Error, Result, node::EventHub};
 
@@ -88,7 +87,7 @@ pub(super) fn resource_mutation_outcome(
 /// to the digest tie-break, and the writer's own second write could
 /// lose to its first). Both the put and the removal paths issue through
 /// this clock.
-pub(crate) type ResourceWriteClock = std::sync::Arc<std::sync::atomic::AtomicU64>;
+pub(crate) type ResourceWriteClock = std::sync::Arc<std::sync::atomic::AtomicI64>;
 
 /// Issues the next resource-write stamp from the writer's issue clock:
 /// strictly greater than every stamp previously issued through this
@@ -96,7 +95,7 @@ pub(crate) type ResourceWriteClock = std::sync::Arc<std::sync::atomic::AtomicU64
 /// folded back into the clock, so successive issues inside one
 /// millisecond keep advancing by one instead of colliding on
 /// `previous + 1` and falling to the register's digest tie-break.
-pub(super) fn issue_write_stamp(clock: &ResourceWriteClock) -> u64 {
+pub(super) fn issue_write_stamp(clock: &ResourceWriteClock) -> i64 {
   issue_write_stamp_since(clock, crate::time::now_millis())
 }
 
@@ -108,9 +107,9 @@ pub(super) fn issue_write_stamp(clock: &ResourceWriteClock) -> u64 {
 /// compare-and-swap: a fetch-max / compute / fetch-max interleaving let
 /// two concurrent writers observe the same previous stamp between the
 /// two steps and both issue it. Saturation is defined: a clock already
-/// at `u64::MAX` cannot advance, so every issue saturates at
-/// `u64::MAX`.
-fn issue_write_stamp_since(clock: &ResourceWriteClock, observed: u64) -> u64 {
+/// at `i64::MAX` cannot advance, so every issue saturates at
+/// `i64::MAX`.
+fn issue_write_stamp_since(clock: &ResourceWriteClock, observed: i64) -> i64 {
   let mut previous = clock.load(std::sync::atomic::Ordering::Relaxed);
   loop {
     let stamp = previous.saturating_add(1).max(observed);
@@ -136,7 +135,7 @@ mod resource_stamp_tests {
 
   #[test]
   fn stamps_advance_inside_one_millisecond() {
-    let clock = std::sync::atomic::AtomicU64::new(0);
+    let clock = std::sync::atomic::AtomicI64::new(0);
     let clock = std::sync::Arc::new(clock);
     // Three issues inside the same observed millisecond: the second
     // issue advances past the first without moving the clock, so the
@@ -151,7 +150,7 @@ mod resource_stamp_tests {
 
   #[test]
   fn stamps_ride_through_wall_clock_regressions() {
-    let clock = std::sync::atomic::AtomicU64::new(0);
+    let clock = std::sync::atomic::AtomicI64::new(0);
     let clock = std::sync::Arc::new(clock);
     let _ = issue_write_stamp_since(&clock, 5_000);
     // A rolled-back observation issues above the last stamp, never below.
@@ -168,16 +167,16 @@ mod resource_stamp_tests {
   fn concurrent_writers_never_issue_the_same_stamp() {
     const WRITERS: usize = 8;
     const ISSUES_PER_WRITER: usize = 2_000;
-    const OBSERVED: u64 = 1_000;
-    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let stamps: Vec<u64> = std::thread::scope(|scope| {
+    const OBSERVED: i64 = 1_000;
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let stamps: Vec<i64> = std::thread::scope(|scope| {
       let handles: Vec<_> = (0..WRITERS)
         .map(|_| {
           let clock = std::sync::Arc::clone(&clock);
           scope.spawn(move || {
             (0..ISSUES_PER_WRITER)
               .map(|_| issue_write_stamp_since(&clock, OBSERVED))
-              .collect::<Vec<u64>>()
+              .collect::<Vec<i64>>()
           })
         })
         .collect();
@@ -191,21 +190,21 @@ mod resource_stamp_tests {
     // Exactly the contiguous sequence starting at the observed wall
     // clock: no duplicates (the race this pins) and no gaps.
     for (index, stamp) in stamps.iter().enumerate() {
-      assert_eq!(*stamp, OBSERVED + index as u64);
+      assert_eq!(*stamp, OBSERVED + index as i64);
     }
     assert_eq!(
       clock.load(std::sync::atomic::Ordering::Relaxed),
-      OBSERVED + (WRITERS * ISSUES_PER_WRITER) as u64 - 1
+      OBSERVED + (WRITERS * ISSUES_PER_WRITER) as i64 - 1
     );
   }
 
-  // The defined saturation behavior: a clock already at `u64::MAX`
+  // The defined saturation behavior: a clock already at `i64::MAX`
   // cannot advance, so issues saturate instead of wrapping.
   #[test]
   fn a_saturated_clock_issues_the_saturation_stamp() {
-    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-    assert_eq!(issue_write_stamp_since(&clock, u64::MAX), u64::MAX);
-    assert_eq!(issue_write_stamp_since(&clock, u64::MAX), u64::MAX);
-    assert_eq!(clock.load(std::sync::atomic::Ordering::Relaxed), u64::MAX);
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MAX));
+    assert_eq!(issue_write_stamp_since(&clock, i64::MAX), i64::MAX);
+    assert_eq!(issue_write_stamp_since(&clock, i64::MAX), i64::MAX);
+    assert_eq!(clock.load(std::sync::atomic::Ordering::Relaxed), i64::MAX);
   }
 }

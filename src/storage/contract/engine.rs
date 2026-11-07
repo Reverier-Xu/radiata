@@ -248,8 +248,8 @@ async fn storage_contract_retention_sweep_forgets_only_past_deadline_anchored_re
 
   // Nothing is anchored, so the sweep forgets nothing.
   let report = store.apply_receipt_retention().await.unwrap();
-  assert_eq!(report.forgotten, 0);
-  assert!(!report.remaining);
+  assert_eq!(report.forgotten(), 0);
+  assert!(!report.remaining());
 
   // Anchoring starts the retention clock; inside the window the sweep
   // retains.
@@ -261,15 +261,15 @@ async fn storage_contract_retention_sweep_forgets_only_past_deadline_anchored_re
     ReceiptCleanupOutcome::Anchored(_)
   ));
   let report = store.apply_receipt_retention().await.unwrap();
-  assert_eq!(report.forgotten, 0);
-  assert!(!report.remaining);
+  assert_eq!(report.forgotten(), 0);
+  assert!(!report.remaining());
 
   // Past the deadline the same explicit pass forgets, and a repeat pass
   // is an idempotent no-op.
   clock.set(UNIX_EPOCH + Duration::from_secs(200));
   let report = store.apply_receipt_retention().await.unwrap();
-  assert_eq!(report.forgotten, 1);
-  assert!(!report.remaining);
+  assert_eq!(report.forgotten(), 1);
+  assert!(!report.remaining());
   assert_eq!(
     store
       .snapshot()
@@ -286,7 +286,7 @@ async fn storage_contract_retention_sweep_forgets_only_past_deadline_anchored_re
     FORGOTTEN_MARKER_VALUE
   );
   let report = store.apply_receipt_retention().await.unwrap();
-  assert_eq!(report.forgotten, 0);
+  assert_eq!(report.forgotten(), 0);
 }
 
 #[tokio::test]
@@ -1397,11 +1397,6 @@ async fn storage_contract_reference_provider_holds_exclusive_lock_for_storage_li
   let factory = ReferenceFactory::new(required_capabilities());
   let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
 
-  let unsupported = factory
-    .open(StoreRequirements::metadata().transactional_migration(true))
-    .await
-    .unwrap_err();
-  assert_eq!(unsupported.kind(), crate::ErrorKind::UnsupportedCapability);
   let locked = factory
     .open(StoreRequirements::metadata())
     .await

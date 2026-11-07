@@ -107,6 +107,10 @@ macro_rules! canonical_id {
   };
 }
 
+// The canonical identifier generator, importable by the other modules
+// that own one identifier family (`provider::KeyOperationId`).
+pub(crate) use canonical_id;
+
 canonical_id!(NodeId, "node", "node id");
 canonical_id!(TraceId, "trace", "trace id");
 canonical_id!(TransactionId, "txn", "transaction id");
@@ -184,11 +188,18 @@ generated_id!(SessionId, "session");
 pub struct OperationId([u8; 16]);
 
 impl OperationId {
-  pub(crate) const fn from_bytes(value: [u8; 16]) -> Self {
+  /// Rebuilds one operation id from its exact 16-byte representation.
+  ///
+  /// The bytes are the whole value: this is the only construction path
+  /// outside the crate, so a caller can round-trip an id it observed
+  /// without the crate's generation policy (entropy source, draw width)
+  /// becoming part of the public contract.
+  pub const fn from_bytes(value: [u8; 16]) -> Self {
     Self(value)
   }
 
-  pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
+  /// The exact 16-byte representation of this operation id.
+  pub const fn as_bytes(&self) -> &[u8; 16] {
     &self.0
   }
 

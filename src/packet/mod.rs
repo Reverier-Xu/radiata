@@ -35,18 +35,70 @@ use crate::{
   extension_registry::ExtensionRegistry, runtime::RuntimeClient,
 };
 
-/// The caller-selected routing policy for one stream.
+/// The caller-selected routing policy for one stream: the canonical tag
+/// of a policy registered in the node's
+/// [`ExtensionRegistry`](crate::ExtensionRegistry). The tag resolves at
+/// admission, so an unregistered policy fails typed there instead of
+/// silently falling back.
 ///
-/// Typed so the compiler rejects unknown or misspelled policies at build
-/// time; the direct exact-node policy is the only routing policy, and
-/// selection among label-matching members goes through
+/// The built-in [`RoutingPolicy::DIRECT`] policy never relays: a stream
+/// under it is delivered over the authenticated session to the exact
+/// destination node, and the node's configured route policy plans the
+/// route when the destination is not directly connected (the pre-policy
+/// behavior). Any other registered policy plans the route for its stream
+/// itself, and its plan is carried in the packet's route envelope.
+/// Selection among label-matching members is a separate concern:
 /// [`StreamTarget::MatchingNodes`] with the registered load balancer.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RoutingPolicy {
-  /// Delivers directly over the authenticated session to the exact
-  /// destination node.
-  Direct,
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RoutingPolicy(QualifiedTag);
+
+impl RoutingPolicy {
+  /// The built-in direct policy: the stream carries no relay policy of
+  /// its own, so the node's configured route policy keeps planning the
+  /// route to a destination that is not directly connected.
+  pub const DIRECT: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/route-policies/direct",
+  ));
+
+  /// Parses one routing-policy tag: any canonical qualified tag. The
+  /// built-in policies live under the built-in domain's
+  /// `route-policies` category; a caller-defined policy is any tag under
+  /// a caller-owned domain — exactly the registration key of the
+  /// caller's [`crate::RouteNextHop`] implementation.
+  pub fn parse(value: &str) -> Result<Self> {
+    Ok(Self(QualifiedTag::parse(value)?))
+  }
+
+  /// The canonical tag text.
+  pub fn as_str(&self) -> &str {
+    self.0.as_str()
+  }
+
+  /// The policy's qualified tag: the extension registry's lookup key.
+  pub const fn tag(&self) -> &QualifiedTag {
+    &self.0
+  }
+}
+
+impl From<QualifiedTag> for RoutingPolicy {
+  fn from(tag: QualifiedTag) -> Self {
+    Self(tag)
+  }
+}
+
+impl fmt::Display for RoutingPolicy {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str(self.as_str())
+  }
+}
+
+impl fmt::Debug for RoutingPolicy {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_tuple("RoutingPolicy")
+      .field(&self.as_str())
+      .finish()
+  }
 }
 
 /// The maximum number of metadata entries in one stream.
@@ -59,9 +111,14 @@ pub(crate) const METADATA_MAX_BYTES: usize = 32 * 1_024;
 /// public limit; core chunks large caller writes stay constant-memory.
 pub(crate) const MAX_CHUNK_BYTES: usize = 32 * 1_024;
 
-/// A stream destination: an exact authenticated node, or one node selected
+/// The maximum number of hops one caller-named path may carry. Admission
+/// validates every hop, so the bound keeps that work finite independently
+/// of the caller's hop budget.
+pub(crate) const STREAM_PATH_MAX_HOPS: usize = 64;
+
+/// A stream destination: an exact authenticated node, one node selected
 /// by the registered load balancer from the members whose owned labels
-/// match the selector.
+/// match the selector, or an ordered path the caller names itself.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamTarget {
@@ -70,6 +127,38 @@ pub enum StreamTarget {
   /// Delivers to the single node a registered load-balancing policy
   /// selects among the label-matching members.
   MatchingNodes(crate::Selector),
+  /// Delivers along the caller's ordered path: `path` lists the nodes the
+  /// stream is forwarded through, excluding this node and ending at
+  /// `destination`. Admission validates the path and then every hop
+  /// follows it exactly; no routing policy decides a hop of it.
+  Path {
+    /// The final node of `path`: the stream's destination.
+    destination: NodeId,
+    /// The ordered hops from the origin to `destination`, ending at
+    /// `destination`.
+    path: Vec<NodeId>,
+  },
+}
+
+/// Validates the caller-named path shape before any delivery work: it
+/// must be non-empty, duplicate-free, end at the destination, and carry at
+/// most `max_hops` relays — that is, at most `max_hops + 1` entries, since
+/// the origin's dispatch consumes no budget and arrival is checked before
+/// it — inside the core path bound. Admission then validates reachability:
+/// every hop must be a known member, and the first hop a live session this
+/// node can send over.
+pub(crate) fn validate_caller_path(
+  destination: &NodeId, path: &[NodeId], max_hops: u32,
+) -> Result<()> {
+  crate::routing::validate_path_shape(
+    path,
+    STREAM_PATH_MAX_HOPS.min(crate::routing::path_entry_bound(max_hops)),
+    "stream path",
+  )?;
+  if path.last() != Some(destination) {
+    return Err(Error::invalid_input("stream path"));
+  }
+  Ok(())
 }
 
 /// The caller-selected routing policy for one stream.
@@ -81,16 +170,10 @@ pub struct StreamPolicy {
 }
 
 impl StreamPolicy {
-  /// Selects a routing policy and a nonzero hop budget.
-  ///
-  /// The built-in direct policy is the only routing policy: the
-  /// exhaustive match below makes any future `RoutingPolicy` variant a
-  /// compile error here until its routing semantics are defined, so an
-  /// unroutable policy can never be constructed silently.
+  /// Selects a routing policy and a nonzero hop budget. The policy tag is
+  /// resolved against the extension registry at admission, so a tag no
+  /// registration names fails there instead of silently routing direct.
   pub fn new(routing_policy: RoutingPolicy, max_hops: u32) -> Result<Self> {
-    match routing_policy {
-      RoutingPolicy::Direct => {}
-    }
     if max_hops == 0 {
       return Err(Error::invalid_input("stream hop budget"));
     }
@@ -99,6 +182,12 @@ impl StreamPolicy {
       load_balancing: None,
       max_hops,
     })
+  }
+
+  /// The built-in direct policy with a nonzero hop budget: the
+  /// convenience form of [`StreamPolicy::new`] for the common case.
+  pub fn direct(max_hops: u32) -> Result<Self> {
+    Self::new(RoutingPolicy::DIRECT, max_hops)
   }
 
   /// Selects a load-balancing policy for matching-node targets. Exact-node
@@ -207,6 +296,7 @@ impl Stream for StaticBody {
 pub struct OutboundStream {
   trace_id: TraceId,
   target: StreamTarget,
+  routing_policy: RoutingPolicy,
   load_balancer: Option<QualifiedTag>,
   max_hops: u32,
   protocol: ProtocolTag,
@@ -216,14 +306,15 @@ pub struct OutboundStream {
 
 impl OutboundStream {
   pub(crate) fn new(
-    trace_id: TraceId, target: StreamTarget, load_balancer: Option<QualifiedTag>, max_hops: u32,
-    protocol: ProtocolTag, metadata: StreamMetadata, runtime: RuntimeClient,
+    trace_id: TraceId, target: StreamTarget, policy: StreamPolicy, protocol: ProtocolTag,
+    metadata: StreamMetadata, runtime: RuntimeClient,
   ) -> Self {
     Self {
       trace_id,
       target,
-      load_balancer,
-      max_hops,
+      routing_policy: policy.routing_policy().clone(),
+      load_balancer: policy.load_balancing_policy().cloned(),
+      max_hops: policy.max_hops(),
       protocol,
       metadata,
       runtime,
@@ -239,7 +330,9 @@ impl OutboundStream {
   /// Streams the body and waits only for the destination's current-process
   /// admission acknowledgement: the returned [`DeliveryAck`]
   /// proves authenticated admission to the destination's bounded incoming
-  /// stream, never durable retention, processing, or success.
+  /// stream, never durable retention, processing, or success. No timeout
+  /// is built in: callers compose `tokio::time::timeout` when they need
+  /// one.
   pub fn send_sync<S>(self, body: S) -> BoxFuture<'static, Result<DeliveryAck>>
   where
     S: Stream<Item = Result<Arc<[u8]>>> + Send + 'static, {
@@ -261,7 +354,9 @@ impl OutboundStream {
 
   /// Starts streaming in the background and returns the route handle
   /// immediately. Delivery progress and terminal state are observable
-  /// through the `GetRoute` query.
+  /// through the `GetRoute` query once the admission task has run: the
+  /// route record is inserted when admission completes, so an immediate
+  /// query may still observe `NotFound`.
   pub fn send_async<S>(self, body: S) -> Result<RouteHandle>
   where
     S: Stream<Item = Result<Arc<[u8]>>> + Send + 'static, {
@@ -278,6 +373,7 @@ impl OutboundStream {
     let inner = OutboundRequest {
       trace_id: self.trace_id,
       target: self.target,
+      routing_policy: self.routing_policy,
       load_balancer: self.load_balancer,
       max_hops: self.max_hops,
       protocol: self.protocol,
@@ -330,8 +426,10 @@ impl PacketReplyContext {
 }
 
 /// An admitted incoming packet stream handed to the registered
-/// [`crate::PacketConsumer`]. Endpoints are the session-authenticated node
-/// IDs; the body preserves wire order.
+/// [`crate::PacketConsumer`]. `source` is the origin the frame claims and
+/// `destination` is this node; each hop authenticates its immediate
+/// predecessor, so the origin identity is hop-attested, not end-to-end.
+/// The body preserves wire order.
 pub struct IncomingStream {
   source: NodeId,
   destination: NodeId,
@@ -399,9 +497,11 @@ impl IncomingStream {
   ///
   /// The reply carries a single-hop budget: it is delivered directly
   /// whenever the source is directly connected, and it may pass through
-  /// at most one relay. This is the convenience variant for the common
-  /// request/reply hop; a reply whose source sits more than one relay
-  /// away needs [`Self::derive_return_stream_with_hops`].
+  /// at most one relay (a path of the relay plus the source, which is
+  /// exactly what a one-relay budget carries). This is the convenience
+  /// variant for the common request/reply hop; a reply whose source sits
+  /// more than one relay away needs
+  /// [`Self::derive_return_stream_with_hops`].
   pub fn derive_return_stream(
     &self, protocol: ProtocolTag, metadata: StreamMetadata,
   ) -> Result<OutboundStream> {
@@ -418,8 +518,9 @@ impl IncomingStream {
   /// `max_hops` is the number of relays the reply may traverse (at least
   /// one, rejected as `InvalidInput` otherwise). The routing plane still
   /// delivers directly whenever the source is directly connected and
-  /// consults the node's next-hop policy only for the remaining hops, so
-  /// the same call is correct on direct and relayed return paths. Use
+  /// plans the route through the node's next-hop policy only for a
+  /// destination that is not, so the same call is correct on direct and
+  /// relayed return paths. Use
   /// this variant when the source of the incoming stream is not a direct
   /// peer — a request that arrived over a relay chain must be answered
   /// over one — and keep [`Self::derive_return_stream`] when the source
@@ -466,11 +567,13 @@ impl IncomingStream {
   }
 
   /// The one derivation both reply variants share: the registry gate and
-  /// the reply's target, trace, and budget wiring.
+  /// the reply's target, trace, and budget wiring. A reply carries the
+  /// built-in direct routing policy: it is addressed to the exact
+  /// authenticated source, so no stream-level relay policy applies.
   fn derive_reply(
     &self, protocol: ProtocolTag, metadata: StreamMetadata, max_hops: u32,
   ) -> Result<OutboundStream> {
-    if !self.reply.registry.has_protocol(&protocol) {
+    if !self.reply.registry.has_protocol(&protocol)? {
       return Err(Error::unsupported("packet protocol"));
     }
     if max_hops == 0 {
@@ -479,8 +582,7 @@ impl IncomingStream {
     Ok(OutboundStream::new(
       self.trace_id.clone(),
       StreamTarget::Exact(self.source.clone()),
-      None,
-      max_hops,
+      StreamPolicy::direct(max_hops)?,
       protocol,
       metadata,
       self.reply.runtime.clone(),
@@ -618,6 +720,10 @@ pub(crate) type RoutedAckOutcome = Result<RoutedAck, ErrorKind>;
 pub(crate) struct OutboundRequest {
   pub(crate) trace_id: TraceId,
   pub(crate) target: StreamTarget,
+  /// The stream's routing policy tag: resolved in the extension registry
+  /// at admission, before the node-level route policy decides a first
+  /// hop.
+  pub(crate) routing_policy: RoutingPolicy,
   pub(crate) load_balancer: Option<QualifiedTag>,
   pub(crate) max_hops: u32,
   pub(crate) protocol: ProtocolTag,
@@ -643,7 +749,7 @@ pub(crate) enum StreamItem {
   /// A relay-synthesized truncated terminal: the sending leg died
   /// mid-stream. Ends the body prefix without the completed sentinel,
   /// so the body stream surfaces exactly one typed `StreamInterrupted`
-  /// — the same shape as a dropped channel (audit 2026-10-09 item 11).
+  /// — the same shape as a dropped channel.
   Interrupted,
 }
 
@@ -699,7 +805,7 @@ impl RouteRecord {
       selected_node: Some(selected_node),
       state: RouteState::Routing,
       bytes_forwarded: 0,
-      updated_at: SystemTime::now(),
+      updated_at: crate::time::now(),
       internal: false,
     }
   }
@@ -718,19 +824,19 @@ impl RouteRecord {
       selected_node: None,
       state: RouteState::Routing,
       bytes_forwarded: 0,
-      updated_at: SystemTime::now(),
+      updated_at: crate::time::now(),
       internal: false,
     }
   }
 
   pub(crate) fn update(&mut self, state: RouteState) {
     self.state = state;
-    self.updated_at = SystemTime::now();
+    self.updated_at = crate::time::now();
   }
 
   pub(crate) fn forward(&mut self, bytes: u64) {
     self.bytes_forwarded = self.bytes_forwarded.saturating_add(bytes);
-    self.updated_at = SystemTime::now();
+    self.updated_at = crate::time::now();
   }
 
   pub(crate) fn view(&self) -> RouteStatusView {
@@ -746,11 +852,14 @@ impl RouteRecord {
   }
 }
 
-/// Maps a wire admission rejection kind back to a typed error. The wire
-/// ack status decodes to exactly the kinds matched here; any other kind
-/// can only reach this function through a local invariant violation, and
-/// fails closed with an internal error instead of silently reading as a
-/// stream interruption.
+/// Maps one admission-outcome kind back to the typed error a synchronous
+/// sender observes. Two sources feed it: the wire ack status's own kinds
+/// (`AckStatus::to_kind` yields unsupported, overloaded, or
+/// stream-interrupted) and the local pre-admission rejections the pump
+/// reports before any frame moves (route-unavailable, shutting-down, and
+/// a selector or policy's own kind). The four kinds mapped explicitly
+/// keep their typed error; every other kind fails closed as an internal
+/// error instead of silently reading as a stream interruption.
 pub(crate) fn ack_error(kind: ErrorKind) -> Error {
   match kind {
     ErrorKind::Unsupported => Error::unsupported("packet protocol"),
@@ -769,7 +878,7 @@ mod tests {
 
   use super::{
     IncomingStream, METADATA_MAX_BYTES, METADATA_MAX_ENTRIES, PacketReplyContext, RoutingPolicy,
-    StreamItem, StreamMetadata, StreamPolicy, StreamTarget, channel_body,
+    StreamItem, StreamMetadata, StreamPolicy, StreamTarget, ack_error, channel_body,
   };
   use crate::{ErrorKind, QualifiedTag};
 
@@ -826,7 +935,7 @@ mod tests {
   #[test]
   fn return_stream_variants_differ_only_in_the_hop_budget() {
     let (source, destination) = (node(1), node(2));
-    let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/reply-test").unwrap();
+    let protocol = crate::ProtocolTag::parse("example.org/protocols/reply-test").unwrap();
     let packet = incoming(&source, &destination, &protocol);
 
     let direct = packet
@@ -849,7 +958,7 @@ mod tests {
   /// could never be delivered.
   #[test]
   fn derive_return_stream_with_hops_rejects_a_zero_budget() {
-    let protocol = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/reply-test").unwrap();
+    let protocol = crate::ProtocolTag::parse("example.org/protocols/reply-test").unwrap();
     let packet = incoming(&node(1), &node(2), &protocol);
     let error = packet
       .derive_return_stream_with_hops(protocol, StreamMetadata::new(), 0)
@@ -857,33 +966,53 @@ mod tests {
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
   }
 
+  /// The admission-outcome mapping is pinned for every kind the delivery
+  /// path produces: the wire ack kinds and the local pre-admission
+  /// rejections keep their typed error, and any other kind fails closed
+  /// as an internal error instead of reading as a stream interruption.
+  #[test]
+  fn ack_error_maps_every_reachable_admission_kind() {
+    for (kind, expected) in [
+      (ErrorKind::Unsupported, ErrorKind::Unsupported),
+      (ErrorKind::Overloaded, ErrorKind::Overloaded),
+      (ErrorKind::RouteUnavailable, ErrorKind::RouteUnavailable),
+      (ErrorKind::StreamInterrupted, ErrorKind::StreamInterrupted),
+      (ErrorKind::ShuttingDown, ErrorKind::Internal),
+      (ErrorKind::Internal, ErrorKind::Internal),
+    ] {
+      assert_eq!(ack_error(kind).kind(), expected);
+    }
+  }
+
   /// Both variants share the registry gate: a reply may only carry a
   /// protocol this node registered for admission.
   #[test]
   fn derive_return_stream_with_hops_keeps_the_protocol_registry_gate() {
-    let registered = crate::ProtocolTag::parse("radiata.woooo.tech/protocols/reply-test").unwrap();
+    let registered = crate::ProtocolTag::parse("example.org/protocols/reply-test").unwrap();
     let packet = incoming(&node(1), &node(2), &registered);
-    let unregistered =
-      crate::ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered").unwrap();
+    let unregistered = crate::ProtocolTag::parse("example.org/protocols/unregistered").unwrap();
     let error = packet
       .derive_return_stream_with_hops(unregistered, StreamMetadata::new(), 4)
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
   }
 
-  /// The direct policy is the only routable policy: `RoutingPolicy` is
-  /// `#[non_exhaustive]` with exactly one variant today, so no non-direct
-  /// value can even be constructed. The invariant is enforced twice — by
-  /// the type system (no other variant exists to build) and by the
-  /// exhaustive `match` in `StreamPolicy::new`, which turns any future
-  /// variant into a compile error at the construction gate until its
-  /// routing semantics are defined. This test pins the direct path: the
-  /// policy is accepted and carried unchanged.
+  /// The built-in direct policy is a canonical tag under the built-in
+  /// domain, and the stream policy carries it unchanged: the tag is the
+  /// registry key the admission plane resolves.
   #[test]
   fn stream_policy_accepts_the_direct_routing_policy() {
-    let policy = StreamPolicy::new(RoutingPolicy::Direct, 4).unwrap();
-    assert_eq!(policy.routing_policy(), &RoutingPolicy::Direct);
+    let policy = StreamPolicy::direct(4).unwrap();
+    assert_eq!(policy.routing_policy(), &RoutingPolicy::DIRECT);
+    assert_eq!(
+      policy.routing_policy().as_str(),
+      "radiata.woooo.tech/route-policies/direct"
+    );
     assert_eq!(policy.max_hops(), 4);
+    assert_eq!(
+      RoutingPolicy::parse(policy.routing_policy().as_str()).unwrap(),
+      RoutingPolicy::DIRECT
+    );
   }
 
   fn key(name: &str) -> QualifiedTag {
@@ -980,7 +1109,7 @@ mod tests {
   /// A relay-synthesized interrupted terminal (a mid-stream death on the
   /// sending leg) truncates the body with exactly one typed error — the
   /// same shape as the dropped channel above — instead of completing it
-  /// normally (audit 2026-10-09 item 11).
+  /// normally.
   #[tokio::test]
   async fn channel_body_interrupted_terminal_is_one_typed_interruption() {
     let (sender, receiver) = tokio::sync::mpsc::channel(4);

@@ -53,9 +53,9 @@ mod view;
 #[doc(hidden)]
 pub mod fuzz_adapters;
 
-/// The frozen `0.1.0` compatibility manifest. Test-only: every
-/// golden vector is consumed through the compatibility and migration
-/// suites; the production wire/record encoders stay the single owners.
+/// Behavioral wire-compatibility checks. Test-only: the previous-shape
+/// node descriptor pin and the fail-closed assertions; the production
+/// wire/record encoders stay the single owners of their formats.
 #[cfg(test)]
 mod compatibility;
 
@@ -77,30 +77,36 @@ pub use node::{
 };
 pub use operation::{
   Event, IdentityReplaced, MemberChanged, NodeRevoked, RecoveryChanged, ResourceChanged,
-  ResourceOrigin, ResourceWrite, RouteChanged, SessionChanged, TaskChanged,
+  ResourceOrigin, ResourceWrite, RouteChanged, SessionChanged, TaggedEvent, TaskChanged,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,
   RoutingPolicy, StreamMetadata, StreamPolicy, StreamTarget,
 };
-pub use protocol::{FeatureDefinition, FeatureTag, ProtocolTag, QualifiedTag, TransportTag};
+pub use protocol::{
+  EventTag, FeatureDefinition, FeatureTag, ProtocolTag, QualifiedTag, TransportTag,
+};
 pub use provider::{
   CommitOutcome, CommitReceipt, CreatedKey, DurabilityLevel, KeyCapabilities, KeyCreateState,
   KeyDeleteState, KeyHandle, KeyOperationId, ReconcileOutcome, StoreCapabilities, StoreEntry,
   StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRequirements, StoreRevision,
   StoreTransaction, StoreValue, store_scan_stream,
 };
-pub use resource::{ResourceLabels, ResourceName, ResourceUri, ResourceVersion};
+pub use resource::{
+  ResourceLabels, ResourceName, ResourceUri, ResourceVersion,
+  feed::{ResourceChange, ResourceChangeKind, ResourceFeedError, ResourceWatch},
+};
 pub use routing::{
-  CandidateNodeReader, DefaultNextHop, LoadBalancingPolicy, NextHopView, RouteNextHop, Selector,
+  CandidateNodeReader, DefaultLoadBalancer, DefaultNextHop, LoadBalancingPolicy, NextHopView,
+  RouteNextHop, Selector,
 };
 pub use task::{
   ActionHook, CredentialIssued, CustomTaskSpec, ReconcileContext, ReconcileDecision, ResourceHook,
   Task, TaskError, TaskKind, TaskOutput, TaskPhase, TaskReconciler, TaskStatus, TaskTransition,
 };
 pub use transport::{
-  Endpoint, PageCursor, ProviderListener, TransportName, TransportProvider, TransportScheme,
-  TransportSelector, TransportStream,
+  AcceptedStream, Endpoint, PageCursor, ProviderListener, TransportAdmission, TransportName,
+  TransportProvider, TransportScheme, TransportStream,
 };
 pub use view::{
   ConnectionDegreeState, ConnectionDegreeView, ConnectivityStatus,

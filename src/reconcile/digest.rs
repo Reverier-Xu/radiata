@@ -7,8 +7,7 @@
 //! audit that motivated the plane measured same-content rows cancelling
 //! under a pure content hash: two distinct rows that share content bytes
 //! but not a key must never XOR-cancel each other out of a fingerprint
-//! (the `item_hash` semantics of
-//! `docs/research/06-architecture-proposal.md` §2).
+//! (the `item_hash` semantics).
 //!
 //! This function is a **frozen wire-contract constant**, pinned by the
 //! golden vectors below: every peer's range fingerprints are only
@@ -16,9 +15,9 @@
 //! truncation. Changing any byte of the contract — preimage shape,
 //! hash, or truncation — desynchronizes every fingerprint in a cluster
 //! and is a new wire version, not an edit. The digest width (64 bits) is
-//! likewise a row-format constant: the proposal §10 risk table records
-//! the 128-bit upgrade reservation, which would land as a new wire
-//! version alongside the existing one, never as an in-place widening.
+//! likewise a row-format constant: the design risk table records the
+//! 128-bit upgrade reservation, which would land as a new wire version
+//! alongside the existing one, never as an in-place widening.
 
 use minicbor::{Decode, Encode, bytes::ByteVec};
 use sha2::{Digest as ShaDigest, Sha256};
@@ -106,8 +105,7 @@ mod tests {
   }
 
   /// Same content under distinct keys digests distinctly, so two such
-  /// rows can never XOR-cancel out of a fingerprint — the audit's
-  /// `item_hash` pathology.
+  /// rows can never XOR-cancel out of a fingerprint.
   #[test]
   fn reconcile_digest_separates_same_content_under_distinct_keys() {
     let left = item_digest(b"a", b"payload").unwrap();

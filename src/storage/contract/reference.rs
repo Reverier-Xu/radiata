@@ -294,8 +294,8 @@ impl StoreScan for ReferenceScan<'_> {
 }
 
 // Oracle verdicts, deliberately independent of the production helpers
-// `crate::provider::commit_precheck`/`classify_receipt`/`condition_matches`
-// (audit 2026-10-27 A9): those helpers are the single implementation
+// `crate::provider::commit_precheck`/`classify_receipt`/`condition_matches`:
+// those helpers are the single implementation
 // behind the redb/json adapters, so a reference provider that calls them
 // inherits every production drift and stops being an oracle — the
 // adapter contract lanes would compare the adapters against a copy of

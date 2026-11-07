@@ -25,17 +25,24 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
+use super::{
+  table::{RouteTable, update_route},
+  trace::TraceSink,
+};
 use crate::{
   ErrorKind, NodeId, Result, SessionId, TraceId,
-  extension_registry::ExtensionRegistry,
+  node::EventHub,
   packet::{
-    AckOutcome,
+    AckOutcome, RouteState,
     wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
-  session::stream::{BoundedSender, SessionFrame, SessionTable},
+  session::{
+    pending::PendingAdmissions,
+    stream::{BoundedSender, SessionFrame, SessionTable},
+  },
 };
 
 /// One pending outbound admission on a session: a synchronous waiter at
@@ -57,27 +64,25 @@ pub(crate) enum PendingAck {
   },
 }
 
-/// The per-session pending-admission map keyed by trace id.
-pub(crate) type PendingAcks = Arc<std::sync::Mutex<HashMap<TraceId, PendingAck>>>;
-
 /// The untried candidates of a discovering hop: the open frame is
-/// re-encoded per attempt with the SAME envelope state (the attempt is
-/// an alternative branch at this hop, not extra depth), so a failed
-/// subtree costs one re-dispatch here instead of an exponential
-/// re-walk from the origin.
+/// re-encoded per attempt with the same envelope state and an emptied
+/// path (the attempt is an alternative branch at this hop, not extra
+/// depth, and the branch plans its own remainder), so a failed subtree
+/// costs one re-dispatch here instead of an exponential re-walk from the
+/// origin.
 #[derive(Clone)]
 pub(crate) struct RetryState {
   pub(crate) open: OpenFrame,
   pub(crate) context: crate::routing::RouteContext,
   pub(crate) candidates: Vec<NodeId>,
-  pub(crate) downstream_acks: PendingAcks,
+  pub(crate) downstream_acks: PendingAdmissions,
 }
 
 /// The exact session incarnation one forwarded hop attaches to: the
 /// authenticated peer plus that session's server-allocated id. A
 /// replacement session for the same peer is therefore a different
 /// identity, so a retired generation can neither close nor steer the
-/// replacement's hops (audit P1-4).
+/// replacement's hops.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionIdentity {
   peer: NodeId,
@@ -91,7 +96,7 @@ pub(crate) struct SessionIdentity {
 /// resolves — the hop itself keeps carrying the attribution afterwards,
 /// so a post-admission acknowledgement from the same downstream session
 /// (a mid-stream failure) is still steered instead of being dropped as a
-/// superseded branch's latecomer (audit P1-8).
+/// superseded branch's latecomer.
 #[derive(Clone)]
 pub(crate) enum HopPhase {
   /// Discovering a live downstream branch (pre-admission DFS): the retry
@@ -146,7 +151,7 @@ pub(crate) struct ForwardingHop {
   /// one-shot admission waiter the hop deadline removes when the attempt
   /// expires, and the entry a failure acknowledgement consumes so it cannot
   /// relay the failure upstream past this hop's own retry.
-  pub(crate) downstream_acks: PendingAcks,
+  pub(crate) downstream_acks: PendingAdmissions,
   /// The exact upstream session that feeds this hop: teardown cleanup binds
   /// to this identity, never to the peer alone.
   pub(crate) upstream_session: SessionIdentity,
@@ -192,23 +197,20 @@ pub(crate) fn contains(table: &ForwardingTable, trace_id: &TraceId) -> bool {
   locked(table).contains_key(trace_id)
 }
 
-/// The default bound on concurrently forwarded routes. A session-layer
-/// routing bound, deliberately independent of the trace metadata budget.
-pub(crate) const FORWARDING_ROUTE_CAPACITY_DEFAULT: usize = 8_192;
-
 /// Validates and relays one routed open whose destination is another node:
-/// the envelope is re-checked against the session-authenticated holder, the
-/// node's next-hop policy picks exactly one downstream session, and a relay
-/// entry is registered so the destination's acknowledgement travels back
-/// upstream. Returns `true` when the frame was fully handled (including any
-/// typed rejection relayed upstream). The argument list mirrors the hop's
-/// collaborators; no subset forms a meaningful grouping.
+/// the envelope is re-checked against the session-authenticated holder,
+/// the next hop is the head of the carried path (or, when the path is
+/// exhausted, the head of the plan this hop computes), and a relay entry
+/// is registered so the destination's acknowledgement travels back
+/// upstream. Returns `true` when the frame was fully handled (including
+/// any typed rejection relayed upstream). The argument list mirrors the
+/// hop's collaborators; no subset forms a meaningful grouping.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open(
   local: &NodeId, peer: &NodeId, source: &SessionIdentity, open: OpenFrame,
   upstream: &BoundedSender, sessions: &SessionTable, forwarding: &ForwardingTable,
-  registry: &ExtensionRegistry, route_policy: &crate::QualifiedTag, forwarding_capacity: usize,
-  relay_hop_deadline: Duration,
+  registry: &crate::routing::RoutingRegistry, route_policy: &crate::QualifiedTag,
+  forwarding_capacity: usize, relay_hop_deadline: Duration,
 ) -> bool {
   let envelope = crate::routing::RouteContext::from_frame(
     open.trace_id.clone(),
@@ -220,38 +222,39 @@ pub(crate) async fn open(
   // handling and surfaces the empty set as a typed route rejection
   // downstream instead of propagating an error.
   let peers = crate::sync_common::alive_peers(sessions).unwrap_or_default();
-  // Loop-free candidates: a next hop already in the visited chain (or
-  // the source/current holder) can only cycle back — the checked
-  // receive would reject the pick after the policy chose it, so a
-  // deterministic minimum-id policy would fail closed on every attempt
-  // (observed live on a ring topology). Excluding the chain here makes
-  // strictly forward progress structural: the candidate set shrinks
-  // with every hop.
+  // The branch candidates of this hop: the alive peers minus the visited
+  // chain, the source, and the current holder. They are the fallback
+  // plan's eligible first hops and the alternative branches of a failed
+  // attempt, so strictly forward progress stays structural: the candidate
+  // set shrinks with every hop.
   let candidates = loop_free_candidates(
     envelope.source(),
     envelope.current(),
     envelope.visited(),
     &peers,
   );
-  let mut chosen = if open.destination != *local {
+  // The plan runs only when the carried path is exhausted: the unlearned
+  // fallback, and the alternative branch of a re-dispatch. A carried path
+  // is followed without consulting any policy.
+  let mut planned = if envelope.path().is_empty() {
     Some(
-      select_next_hop(
+      plan_path(
         registry,
         route_policy,
         &open.trace_id,
         &open.destination,
         local,
         &candidates,
+        envelope.remaining_hops(),
       )
       .await,
     )
   } else {
     None
   };
-  match envelope.receive(local, peer, |_| {
-    chosen
-      .take()
-      .unwrap_or_else(|| Err(crate::Error::route_unavailable("route policy")))
+  match envelope.receive(local, peer, |_| match planned.take() {
+    Some(result) => result,
+    None => Err(crate::Error::route_unavailable("route policy")),
   }) {
     Ok(crate::routing::RouteProgress::Continue { context, next_hop }) => {
       if locked(forwarding).len() >= forwarding_capacity {
@@ -362,7 +365,7 @@ pub(crate) async fn relay_end(table: &ForwardingTable, frame: EndFrame) -> bool 
 /// The binding is the exact upstream session identity, never the peer: a
 /// replacement session for the same peer owns its own hops, so the retired
 /// generation's teardown can no longer interrupt the routes the winner just
-/// registered (audit P1-4).
+/// registered.
 pub(crate) async fn close_for_session(table: &ForwardingTable, upstream: &SessionIdentity) {
   let candidates: Vec<TraceId> = locked(table)
     .iter()
@@ -431,25 +434,23 @@ async fn relay_open(
     return reject_open(upstream, &open.trace_id);
   }
   {
-    let mut acks = match downstream_acks.lock() {
-      Ok(acks) => acks,
-      Err(_) => return reject_open(upstream, &open.trace_id),
-    };
-    if acks.contains_key(&open.trace_id) {
-      return reject_open(upstream, &open.trace_id);
-    }
     // The downstream session's admission bound applies to relayed opens
-    // too: beyond it the hop fails closed with typed backpressure.
-    if acks.len() >= crate::session::stream::MAX_PENDING_ADMISSIONS {
-      send_status(upstream, &open.trace_id, AckStatus::Overloaded);
-      return;
-    }
-    acks.insert(
-      open.trace_id.clone(),
+    // too: beyond it the hop fails closed with typed backpressure, and a
+    // duplicate routed open for one trace is the protocol violation the
+    // branch search reports upstream.
+    match downstream_acks.try_reserve_admission(
+      &open.trace_id,
       PendingAck::Relay {
         upstream: upstream.clone(),
       },
-    );
+    ) {
+      Ok(()) => {}
+      Err(ErrorKind::Overloaded) => {
+        send_status(upstream, &open.trace_id, AckStatus::Overloaded);
+        return;
+      }
+      Err(_) => return reject_open(upstream, &open.trace_id),
+    }
   }
   let body = match wire::encode_open(&OpenFrame {
     trace_id: open.trace_id.clone(),
@@ -457,7 +458,7 @@ async fn relay_open(
     destination: open.destination.clone(),
     protocol: open.protocol.clone(),
     metadata: open.metadata.clone(),
-    route: Some(context.hop_state()),
+    route: Some(context.hop.clone()),
   }) {
     Ok(body) => body,
     Err(_) => {
@@ -505,10 +506,12 @@ async fn relay_open(
       // attempt's timer; see [`arm_hop_deadline`]).
       deadline: None,
       // The untried branches of this hop: a failure acknowledgement from
-      // downstream re-dispatches here before surfacing upstream.
+      // downstream re-dispatches here before surfacing upstream. The
+      // re-dispatch carries no path — the alternative branch plans its
+      // own remainder from itself.
       phase: HopPhase::Discovering(Box::new(RetryState {
         open: open.clone(),
-        context: context.clone(),
+        context: context.clone().replanned(),
         candidates: candidates
           .iter()
           .filter(|candidate| *candidate != next_hop)
@@ -635,36 +638,36 @@ pub(crate) async fn on_downstream_failure(
     };
     let downstream_acks = entry.pending_acks.clone();
     let downstream_session = SessionIdentity::new(candidate.clone(), entry.session_id().clone());
-    let queued = (|| {
-      let mut acks = downstream_acks.lock().ok()?;
-      if acks.contains_key(trace_id) || acks.len() >= crate::session::stream::MAX_PENDING_ADMISSIONS
-      {
-        return None;
-      }
-      acks.insert(
-        trace_id.clone(),
+    // Re-encode the open with the same envelope state and no path: the
+    // retry is an alternative branch at this hop, not extra depth, and the
+    // branch plans its own remainder.
+    let body = wire::encode_open(&OpenFrame {
+      trace_id: trace_id.clone(),
+      source: retry.open.source.clone(),
+      destination: retry.open.destination.clone(),
+      protocol: retry.open.protocol.clone(),
+      metadata: retry.open.metadata.clone(),
+      route: Some(retry.context.hop.clone()),
+    })
+    .ok();
+    let Some(body) = body else {
+      continue;
+    };
+    // The candidate's admission bound and the trace's duplicate rule
+    // apply to the re-dispatch exactly as to the first attempt: a
+    // candidate that cannot carry the entry right now counts as a failed
+    // attempt.
+    if downstream_acks
+      .try_reserve_admission(
+        trace_id,
         PendingAck::Relay {
           upstream: upstream.clone(),
         },
-      );
-      // Re-encode the open with the SAME envelope state: the retry is
-      // an alternative branch at this hop, not extra depth.
-      let context = retry.context.hop_state();
-      wire::encode_open(&OpenFrame {
-        trace_id: trace_id.clone(),
-        source: retry.open.source.clone(),
-        destination: retry.open.destination.clone(),
-        protocol: retry.open.protocol.clone(),
-        metadata: retry.open.metadata.clone(),
-        route: Some(context),
-      })
-      .ok()
-    })();
-    let Some(body) = queued else {
-      // The candidate cannot carry the frame right now: count it as a
-      // failed attempt and continue the search.
+      )
+      .is_err()
+    {
       continue;
-    };
+    }
     // The pending entry and the open frame share one lifetime under the
     // hop's own budget here too: a candidate whose queue stays saturated
     // past the budget counts as a failed attempt — the parked send is
@@ -686,19 +689,18 @@ pub(crate) async fn on_downstream_failure(
     }
     if let Some(hop) = locked(forwarding).get_mut(trace_id) {
       hop.downstream = entry.frames.clone();
-      hop.downstream_acks = Arc::clone(&downstream_acks);
+      hop.downstream_acks = downstream_acks.clone();
       // Stream ownership follows the attempt: the hop's attribution now
       // binds to the new branch's session identity.
       hop.downstream_session = downstream_session;
       // The re-armed retry must consume its OWN attempt's pending entry:
       // the live map is the new branch's, so a failure (or deadline) from
       // this attempt removes exactly the entry it inserted — never a
-      // superseded branch's already-consumed map (audit 2026-10-09
-      // item 13). Note the inherent swap window: a same-branch ack that
-      // lands between send_waiting returning and this table update is
-      // misattributed and dropped; the hop deadline then re-dispatches,
-      // so the window is fail-closed and self-healing.
-      retry.downstream_acks = Arc::clone(&downstream_acks);
+      // superseded branch's already-consumed map. Note the inherent swap
+      // window: a same-branch ack that lands between send_waiting returning and
+      // this table update is misattributed and dropped; the hop deadline then
+      // re-dispatches, so the window is fail-closed and self-healing.
+      retry.downstream_acks = downstream_acks.clone();
       hop.phase = HopPhase::Discovering(retry);
     }
     // The re-dispatched branch gets its own full hop budget.
@@ -718,27 +720,39 @@ pub(crate) async fn on_downstream_failure(
   }
 }
 
-async fn select_next_hop(
-  registry: &ExtensionRegistry, route_policy: &crate::QualifiedTag, trace: &TraceId,
-  destination: &NodeId, local: &NodeId, peers: &[NodeId],
-) -> Result<NodeId> {
+/// Plans this hop's route when the carried path is exhausted: a connected
+/// destination is one hop, otherwise the registered route policy plans the
+/// path (the built-in policy answers from the learned topology, or with
+/// one trace-keyed relay hop while nothing has been learned). The plan is
+/// validated at this boundary before it is carried.
+async fn plan_path(
+  registry: &crate::routing::RoutingRegistry, route_policy: &crate::QualifiedTag, trace: &TraceId,
+  destination: &NodeId, local: &NodeId, peers: &[NodeId], remaining_hops: u32,
+) -> Result<Vec<NodeId>> {
   if peers.contains(destination) {
-    return Ok(destination.clone());
+    return Ok(vec![destination.clone()]);
   }
-  // A tag naming no registered policy fails closed: with the builder's
-  // built-in registration this only happens for a caller tag that was
-  // never registered on this node.
-  let hop =
-    crate::routing::resolve_next_hop(registry, route_policy, trace, destination, local, peers)
-      .await?
-      .ok_or_else(|| crate::Error::route_unavailable("route policy"))?;
-  if peers.contains(&hop) {
-    Ok(hop)
-  } else {
-    // A next hop without a live session cannot carry the frame; policies
-    // returning such nodes fail closed at this boundary.
-    Err(crate::Error::route_unavailable("route hop"))
+  // A tag naming no registered policy fails closed: with the default
+  // registration this only happens for a caller tag that was never
+  // registered on this node.
+  let path = crate::routing::resolve_plan(
+    registry,
+    route_policy,
+    trace,
+    destination,
+    local,
+    peers,
+    remaining_hops,
+  )
+  .await?
+  .ok_or_else(|| crate::Error::route_unavailable("route policy"))?;
+  crate::routing::validate_planned_path(&path, remaining_hops)?;
+  if !path.first().is_some_and(|first| peers.contains(first)) {
+    // A plan that leaves along a node without a live session cannot carry
+    // the frame; policies returning such paths fail closed here.
+    return Err(crate::Error::route_unavailable("route hop"));
   }
+  Ok(path)
 }
 
 /// Whether an acknowledgement arriving on the session that owns `acks`
@@ -751,15 +765,15 @@ async fn select_next_hop(
 /// its live attempt's standing waiter, so a latecomer from a branch the
 /// hop already abandoned (a failed or deadline-expired attempt) cannot
 /// consume the live attempt's entry, clear its retry arm, or flip its
-/// route record (audit 2026-10-09 item 13). An admitted hop needs
+/// route record. An admitted hop needs
 /// nothing further — its one-shot admission waiter was consumed when
 /// admission resolved, and the downstream session it certified owns
 /// the stream's flow-control events for the stream's whole life, so a
-/// legitimate late failure from it still steers (audit P1-8). Lock
+/// legitimate late failure from it still steers. Lock
 /// order matches `on_downstream_failure`: the forwarding table guard
 /// never outlives this call and the acks lock nests inside it.
 pub(crate) fn ack_from_current_downstream(
-  table: &ForwardingTable, acks: &PendingAcks, trace_id: &TraceId,
+  table: &ForwardingTable, acks: &PendingAdmissions, trace_id: &TraceId,
 ) -> bool {
   let guard = locked(table);
   let Some(hop) = guard.get(trace_id) else {
@@ -767,18 +781,11 @@ pub(crate) fn ack_from_current_downstream(
     // acknowledgement path stays attribution-free by construction.
     return true;
   };
-  if !Arc::ptr_eq(acks, &hop.downstream_acks) {
+  if !acks.is_same_map(&hop.downstream_acks) {
     return false;
   }
   match hop.phase {
-    HopPhase::Discovering(_) => matches!(
-      acks.lock().ok().and_then(|acks| {
-        acks
-          .get(trace_id)
-          .map(|entry| matches!(entry, PendingAck::Relay { .. }))
-      }),
-      Some(true)
-    ),
+    HopPhase::Discovering(_) => acks.holds_relay(trace_id),
     HopPhase::Admitted => true,
     HopPhase::Redispatching => false,
   }
@@ -788,8 +795,8 @@ pub(crate) fn ack_from_current_downstream(
 /// session upstream with its status preserved: the one-shot admission
 /// waiter was consumed when admission resolved, so the hop itself — the
 /// stream's owner for its whole life — carries the later flow-control
-/// events (a mid-stream failure) instead of the pending-map entry
-/// (audit P1-8). No-op for every other trace: the origin's
+/// events (a mid-stream failure) instead of the pending-map entry.
+/// No-op for every other trace: the origin's
 /// `resolve_ack` already handled it through its own waiter, and a
 /// discovering hop's acknowledgements still relay through the standing
 /// entry. Best-effort like every other acknowledgement relay: a
@@ -812,6 +819,161 @@ pub(crate) fn relay_admitted_ack(table: &ForwardingTable, ack: &AckFrame) {
       .upstream
       .try_send(SessionFrame::new(PacketKind::Ack, body));
   }
+}
+
+/// The routing-plane handles one session read loop hands to the
+/// acknowledgement decision: the forwarding table, the session table, the
+/// origin's route records, the typed event hub, the durable trace sink,
+/// and the local identity. The bundle carries only what attribution and
+/// reporting need; the read loop builds it from its session context.
+pub(crate) struct SessionAckContext<'a> {
+  pub(crate) forwarding: &'a ForwardingTable,
+  pub(crate) sessions: &'a SessionTable,
+  pub(crate) routes: &'a RouteTable,
+  pub(crate) events: &'a EventHub,
+  pub(crate) trace: Option<&'a TraceSink>,
+  pub(crate) local: &'a NodeId,
+  pub(crate) relay_hop_deadline: Duration,
+}
+
+/// The read loop's acknowledgement decision, one home for the whole
+/// routing-plane policy an inbound acknowledgement drives:
+/// attribution (late acknowledgements from superseded branches are
+/// dropped), discovering-hop branch re-dispatch, admitted marking,
+/// pending-admission resolution, and the terminal-failure flip of the
+/// route record plus its event and durable trace revision.
+pub(crate) async fn on_session_ack(
+  context: &SessionAckContext<'_>, ack: AckFrame, acks: &PendingAdmissions,
+) {
+  // Acknowledgement attribution: an
+  // acknowledgement steers a forwarded hop only when it arrives on
+  // that hop's current downstream attempt. A late acknowledgement
+  // from a superseded branch (the hop deadline expired or the
+  // attempt failed and the open was re-dispatched elsewhere) is
+  // dropped: it must not consume the live attempt's pending
+  // entry, clear its retry arm, or flip its route record.
+  if !ack_from_current_downstream(context.forwarding, acks, &ack.trace_id) {
+    debug!(
+      trace_id = %ack.trace_id,
+      status = ?ack.status,
+      "late acknowledgement from a superseded branch dropped"
+    );
+  } else if ack.status != AckStatus::Admitted && owns_discovering(context.forwarding, &ack.trace_id)
+  {
+    // A failure for a trace this node is still discovering (it
+    // forwarded the open and the destination has not admitted it
+    // yet) belongs to this hop's branch search: the failed
+    // attempt's pending entry is consumed and the next untried
+    // branch is re-dispatched, instead of relaying the failure
+    // upstream. Every other acknowledgement resolves the session's
+    // pending admission exactly as before.
+    on_downstream_failure(
+      context.forwarding,
+      &ack.trace_id,
+      context.sessions,
+      context.relay_hop_deadline,
+    )
+    .await;
+  } else {
+    if ack.status == AckStatus::Admitted {
+      mark_admitted(context.forwarding, &ack.trace_id);
+    }
+    if !resolve_ack(&ack, acks) {
+      // The one-shot admission waiter is gone. An origin's
+      // waiter is simply finished; an admitted forwarding hop
+      // instead owns the stream for its whole life and carries
+      // the report upstream itself — a legitimate mid-stream
+      // failure from the bound downstream session must not be
+      // dropped as a superseded branch's latecomer.
+      relay_admitted_ack(context.forwarding, &ack);
+    }
+    // A late failure for an admitted stream (a downstream hop
+    // died mid-flight) still terminates the origin's route
+    // observation. This writer races the origin pump's
+    // end-of-stream `Delivered`, and the route table's monotonic
+    // terminal machine converges them deterministically: the
+    // failure overrides a recorded `Delivered`, and once recorded
+    // it refuses every later update — so, when the report
+    // reaches this node, the origin's record ends
+    // `Failed(StreamInterrupted)` under either ordering.
+    if ack.status == AckStatus::Failed {
+      // The pre-read decides what this flip owns: a record that
+      // was not yet `Failed` transitions here, so subscribers get
+      // the `RouteChanged` nudge the refused pump tail no longer
+      // emits. The durable twin mirrors exactly the flip: the
+      // revision fires only for caller traffic with an origin-side
+      // identity — an already-failed record is final, a relay hop
+      // or a destination rejection carries no identity to persist,
+      // and internal control traffic stays out of the durable
+      // trace store on this path too — so the same trace id's
+      // durable terminal ends `Failed(StreamInterrupted)` under
+      // either writer ordering instead of keeping the pump tail's
+      // `Delivered` for the whole retention window.
+      let prior = context.routes.lock().ok().and_then(|table| {
+        let record = table.get(&ack.trace_id)?;
+        if matches!(record.state, RouteState::Failed(_)) {
+          None
+        } else {
+          Some((record.selected_node.clone(), record.internal))
+        }
+      });
+      update_route(context.routes, &ack.trace_id, |record| {
+        record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
+      });
+      if let Some((destination, internal)) = prior {
+        context
+          .events
+          .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
+            ack.trace_id.clone(),
+          )));
+        if let (Some(trace), Some(destination)) = (context.trace, destination.filter(|_| !internal))
+        {
+          trace.revise_terminal_failure(
+            ack.trace_id.clone(),
+            context.local.clone(),
+            destination,
+            ErrorKind::StreamInterrupted,
+          );
+        }
+      }
+    }
+  }
+}
+
+/// Resolves one pending outbound admission. The admitting node is this
+/// session's authenticated peer, so the acknowledgement can name it for
+/// the synchronous sender's `DeliveryAck`. Returns whether a pending
+/// entry was resolved: an admitted forwarding hop's waiter was already
+/// consumed when admission resolved, and its later flow-control events
+/// relay upstream through the hop itself instead.
+fn resolve_ack(ack: &AckFrame, acks: &PendingAdmissions) -> bool {
+  let Some(entry) = acks.take(&ack.trace_id) else {
+    return false;
+  };
+  match entry {
+    PendingAck::Wait { notify, .. } => {
+      // The single AckStatus→kind mapping lives on the wire type; `Admitted`
+      // carries the admission time and every rejection its typed kind.
+      let outcome = match ack.status.to_kind() {
+        None => Ok(crate::time::from_millis(ack.admitted_at_millis)),
+        Some(kind) => Err(kind),
+      };
+      trace!(trace_id = %ack.trace_id, ?ack.status, "admission ack resolved");
+      let _ = notify.send(outcome);
+    }
+    PendingAck::Relay { upstream } => {
+      // Relay the destination's acknowledgement to the previous hop with
+      // its status preserved.
+      if let Ok(body) = wire::encode_ack(&AckFrame {
+        trace_id: ack.trace_id.clone(),
+        status: ack.status,
+        admitted_at_millis: ack.admitted_at_millis,
+      }) {
+        upstream.try_send(SessionFrame::new(PacketKind::Ack, body));
+      }
+    }
+  }
+  true
 }
 
 /// Removes the entry (the caller already holds the hop's relay lock, so no
@@ -838,10 +1000,8 @@ pub(crate) fn register(
   Ok(())
 }
 
-fn remove_pending(acks: &PendingAcks, trace_id: &TraceId) {
-  if let Ok(mut acks) = acks.lock() {
-    acks.remove(trace_id);
-  }
+fn remove_pending(acks: &PendingAdmissions, trace_id: &TraceId) {
+  acks.withdraw(trace_id);
 }
 
 /// Removes `trace_id`'s pending entry only if it is still a relay: an
@@ -849,11 +1009,8 @@ fn remove_pending(acks: &PendingAcks, trace_id: &TraceId) {
 /// task's removal then reports nothing to expire. A poisoned map
 /// conservatively reports nothing — the session teardown owns the
 /// entries in that case.
-fn take_expired_relay(acks: &PendingAcks, trace_id: &TraceId) -> bool {
-  match acks.lock() {
-    Ok(mut acks) => matches!(acks.remove(trace_id), Some(PendingAck::Relay { .. })),
-    Err(_) => false,
-  }
+fn take_expired_relay(acks: &PendingAdmissions, trace_id: &TraceId) -> bool {
+  acks.take_expired(trace_id)
 }
 
 /// Arms the explicit per-hop budget for one forwarded open: after
@@ -867,11 +1024,11 @@ fn take_expired_relay(acks: &PendingAcks, trace_id: &TraceId) -> bool {
 /// and aborts the sleeping task, so a resolved attempt leaks no
 /// short-lived timer for the rest of the budget.
 fn arm_hop_deadline(
-  forwarding: &ForwardingTable, downstream_acks: &PendingAcks, sessions: &SessionTable,
+  forwarding: &ForwardingTable, downstream_acks: &PendingAdmissions, sessions: &SessionTable,
   trace_id: &TraceId, relay_hop_deadline: Duration,
 ) {
   let table = Arc::clone(forwarding);
-  let downstream_acks = Arc::clone(downstream_acks);
+  let downstream_acks = downstream_acks.clone();
   let sessions = Arc::clone(sessions);
   let armed_for = trace_id.clone();
   let trace_id = trace_id.clone();
@@ -897,12 +1054,10 @@ fn arm_hop_deadline(
 }
 
 /// The loop-free next-hop candidates for one forwarded open: the alive
-/// peers minus the visited chain, the source, and the current holder —
-/// any other choice is rejected by the envelope's own loop check after
-/// the policy picks it, so deterministic policies (minimum id) would
-/// fail closed on every attempt instead of progressing. Excluding the
-/// chain here makes strictly forward progress structural: the candidate
-/// set shrinks with every hop.
+/// peers minus the visited chain, the source, and the current holder. They
+/// are the eligible first hops of a fallback plan and the alternative
+/// branches of a failed attempt, so strictly forward progress stays
+/// structural: the candidate set shrinks with every hop.
 fn loop_free_candidates(
   source: &NodeId, current: &NodeId, visited: &[NodeId], peers: &[NodeId],
 ) -> Vec<NodeId> {
@@ -1008,7 +1163,9 @@ mod tests {
     ForwardingHop {
       upstream,
       downstream,
-      downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+      downstream_acks: super::PendingAdmissions::new(
+        crate::session::stream::MAX_PENDING_ADMISSIONS,
+      ),
       upstream_session: identity(upstream_peer, 1),
       downstream_session: identity(downstream_peer, 2),
       relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1155,7 +1312,7 @@ mod tests {
   /// explicit typed end downstream and leaves the table; no reopen path
   /// continues a body, and the synthesized end carries the interruption
   /// discriminant so the destination cannot mistake a truncated body for
-  /// a complete one (audit 2026-10-09 item 11).
+  /// a complete one.
   #[tokio::test]
   async fn feeding_session_end_terminates_every_downstream_leg() {
     let table = new_table();
@@ -1177,7 +1334,7 @@ mod tests {
     assert!(!super::contains(&table, &trace(5)));
     // Both downstream legs received the typed interruption end — never a
     // normal completion — so the destination surfaces a truncated body
-    // instead of a silently complete one (audit 2026-10-09 item 11).
+    // instead of a silently complete one.
     for mut drain in downstreams {
       let frame = drain.recv().await.unwrap();
       assert_eq!(frame.kind, PacketKind::End);
@@ -1198,7 +1355,7 @@ mod tests {
     assert!(super::contains(&table, &trace(6)));
   }
 
-  /// Regression (audit P1-4): a retired session generation's teardown must
+  /// Regression: a retired session generation's teardown must
   /// not close the routes a replacement session for the same peer just
   /// registered. The winner's hop is registered first — the barrier — and
   /// only then is the old generation's cleanup released; the winner's route
@@ -1224,9 +1381,9 @@ mod tests {
       super::ForwardingHop {
         upstream: winner_upstream,
         downstream: winner_downstream,
-        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
-          std::collections::HashMap::new(),
-        )),
+        downstream_acks: super::PendingAdmissions::new(
+          crate::session::stream::MAX_PENDING_ADMISSIONS,
+        ),
         upstream_session: winner.clone(),
         downstream_session: identity(7, 3),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1244,9 +1401,9 @@ mod tests {
       super::ForwardingHop {
         upstream: old_upstream,
         downstream: old_downstream,
-        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
-          std::collections::HashMap::new(),
-        )),
+        downstream_acks: super::PendingAdmissions::new(
+          crate::session::stream::MAX_PENDING_ADMISSIONS,
+        ),
         upstream_session: old.clone(),
         downstream_session: identity(7, 3),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1301,9 +1458,9 @@ mod tests {
       super::ForwardingHop {
         upstream: upstream_tx,
         downstream: downstream_tx,
-        downstream_acks: std::sync::Arc::new(std::sync::Mutex::new(
-          std::collections::HashMap::new(),
-        )),
+        downstream_acks: super::PendingAdmissions::new(
+          crate::session::stream::MAX_PENDING_ADMISSIONS,
+        ),
         upstream_session: feeder.clone(),
         downstream_session: identity(7, 1),
         relay_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1384,7 +1541,7 @@ mod retry_tests {
 
   fn hop_with_retry(
     upstream: crate::session::stream::BoundedSender,
-    downstream: crate::session::stream::BoundedSender, downstream_acks: super::PendingAcks,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: super::PendingAdmissions,
     candidates: Vec<crate::NodeId>,
   ) -> ForwardingHop {
     let trace_id = trace(99);
@@ -1404,7 +1561,7 @@ mod retry_tests {
           metadata: crate::StreamMetadata::new(),
           route: None,
         },
-        context: crate::routing::RouteContext::new(trace_id, node(1), node(9), 8),
+        context: crate::routing::RouteContext::new(trace_id, node(1), node(9), Vec::new(), 8),
         candidates,
         downstream_acks,
       })),
@@ -1432,13 +1589,16 @@ mod retry_tests {
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
     let _upstream_keep = upstream_tx.clone();
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
-    let failed_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
-    failed_acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let failed_acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    failed_acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     let candidates = vec![good_id.clone()];
     register(
       &table,
@@ -1454,7 +1614,7 @@ mod retry_tests {
     let frame = good_rx.recv().await.expect("redispatched open");
     assert_eq!(frame.kind, crate::protocol::wire::PacketKind::Open);
     // The failed branch's pending entry was consumed...
-    assert!(!failed_acks.lock().unwrap().contains_key(&trace(99)));
+    assert!(!failed_acks.contains(&trace(99)));
     // ...the hop switched legs and stays discovering...
     let live_entry;
     {
@@ -1463,16 +1623,15 @@ mod retry_tests {
       assert!(matches!(hop.phase, super::HopPhase::Discovering(_)));
       // ...and the re-armed retry carries the NEW branch's map, so the
       // next failure (or deadline) consumes exactly the live attempt's
-      // entry — never the superseded branch's already-consumed map
-      // (audit 2026-10-09 item 13).
+      // entry — never the superseded branch's already-consumed map.
       let super::HopPhase::Discovering(retry) = &hop.phase else {
         panic!("retry stays armed");
       };
       assert!(
-        std::sync::Arc::ptr_eq(&retry.downstream_acks, &hop.downstream_acks),
+        retry.downstream_acks.is_same_map(&hop.downstream_acks),
         "the re-armed retry consumes its own attempt's pending map"
       );
-      live_entry = hop.downstream_acks.lock().unwrap().contains_key(&trace(99));
+      live_entry = hop.downstream_acks.contains(&trace(99));
     }
     assert!(
       live_entry,
@@ -1491,14 +1650,16 @@ mod retry_tests {
 
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
-    let failed_acks: super::PendingAcks =
-      Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    failed_acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let failed_acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    failed_acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     register(
       &table,
       trace(99),
@@ -1515,7 +1676,7 @@ mod retry_tests {
     assert_eq!(ack.status, crate::packet::wire::AckStatus::Failed);
     assert!(!super::contains(&table, &trace(99)));
     // The failed attempt's pending entry was consumed on the way out.
-    assert!(failed_acks.lock().unwrap().is_empty());
+    assert!(failed_acks.is_empty());
   }
 
   /// Once the destination admits a branch, the hop is a pure relay: a
@@ -1526,7 +1687,8 @@ mod retry_tests {
     assert!(!owns_discovering(&table, &trace(99)));
     let (upstream_tx, _upstream_rx) = test_queue(16, usize::MAX);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
-    let acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    let acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     register(
       &table,
       trace(99),
@@ -1556,13 +1718,16 @@ mod retry_tests {
 
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
-    let acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
-    acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     register(
       &table,
       trace(99),
@@ -1580,7 +1745,7 @@ mod retry_tests {
       .expect("redispatched open after the hop budget");
     assert_eq!(frame.kind, crate::protocol::wire::PacketKind::Open);
     // ...the expired pending entry was consumed...
-    assert!(!acks.lock().unwrap().contains_key(&trace(99)));
+    assert!(!acks.contains(&trace(99)));
     // ...and nothing failed upstream (the search continues silently).
     assert!(upstream_rx.recv().now_or_never().is_none());
   }
@@ -1601,7 +1766,7 @@ mod retry_tests {
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(Default::default()));
     let entropy = entropy();
     let (entry, mut downstream_rx) = test_entry(entropy.as_ref());
-    let downstream_acks = Arc::clone(&entry.pending_acks);
+    let downstream_acks = entry.pending_acks.clone();
     let next_hop = node(7);
     // Saturate the downstream queue: the open's waiting send parks. The
     // filler count is remembered so the drain below removes exactly what
@@ -1618,7 +1783,8 @@ mod retry_tests {
     let forwarding = new_table();
     let budget = Duration::from_millis(500);
     let trace_id = trace(99);
-    let context = crate::routing::RouteContext::new(trace_id.clone(), node(1), node(9), 8);
+    let context =
+      crate::routing::RouteContext::new(trace_id.clone(), node(1), node(9), Vec::new(), 8);
     let open = crate::packet::wire::OpenFrame {
       trace_id: trace_id.clone(),
       source: node(1),
@@ -1661,7 +1827,7 @@ mod retry_tests {
     assert_eq!(ack.status, crate::packet::wire::AckStatus::Failed);
     // The pending entry is consumed and no hop was registered for the
     // abandoned dispatch.
-    assert!(!downstream_acks.lock().unwrap().contains_key(&trace_id));
+    assert!(!downstream_acks.contains(&trace_id));
     assert!(!super::contains(&forwarding, &trace_id));
     // The abandoned branch never receives the open: drain every filler
     // that saturated the queue, wait past several wake backstops, and
@@ -1688,7 +1854,7 @@ mod retry_tests {
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(Default::default()));
     let entropy = entropy();
     let (entry, mut downstream_rx) = test_entry(entropy.as_ref());
-    let downstream_acks = Arc::clone(&entry.pending_acks);
+    let downstream_acks = entry.pending_acks.clone();
     // Saturate the candidate's queue: the re-dispatched open parks.
     let mut saturated = 0;
     while entry.frames.send(filler()).await.is_ok() {
@@ -1697,13 +1863,16 @@ mod retry_tests {
     sessions.lock().unwrap().insert(node(7), entry);
 
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let failed_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
-    failed_acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let failed_acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    failed_acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     let table = new_table();
     register(
       &table,
@@ -1729,8 +1898,8 @@ mod retry_tests {
     assert!(!super::contains(&table, &trace(99)));
     // Both the failed attempt's entry and the expired candidate's entry
     // were consumed...
-    assert!(failed_acks.lock().unwrap().is_empty());
-    assert!(!downstream_acks.lock().unwrap().contains_key(&trace(99)));
+    assert!(failed_acks.is_empty());
+    assert!(!downstream_acks.contains(&trace(99)));
     // ...and the abandoned candidate never receives the open, even after
     // its queue drains.
     for _ in 0..saturated {
@@ -1756,13 +1925,16 @@ mod retry_tests {
     let table = new_table();
     let sessions: SessionTable = Arc::new(std::sync::Mutex::new(Default::default()));
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
-    acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     register(
       &table,
       trace(99),
@@ -1808,7 +1980,7 @@ mod retry_tests {
     // Nothing expired afterwards: far past the budget the entry survives
     // and no failure went upstream.
     tokio::time::advance(Duration::from_secs(10)).await;
-    assert!(acks.lock().unwrap().contains_key(&trace(99)));
+    assert!(acks.contains(&trace(99)));
     assert!(upstream_rx.recv().now_or_never().is_none());
 
     // The typed-failure resolution owns its timer the same way: the
@@ -1817,13 +1989,16 @@ mod retry_tests {
     // taken out first so the fresh registration cannot conflict.
     super::locked(&table).remove(&trace(99));
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
-    acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     register(
       &table,
       trace(99),
@@ -1861,7 +2036,7 @@ mod retry_tests {
     assert_eq!(ack.status, crate::packet::wire::AckStatus::Failed);
   }
 
-  /// Acknowledgement attribution (audit 2026-10-09 item 13): only the
+  /// Acknowledgement attribution: only the
   /// hop's current downstream attempt — the same pending map, still
   /// holding the trace's live relay entry — may steer the hop. A late
   /// acknowledgement from the abandoned branch (a different map, or the
@@ -1871,16 +2046,20 @@ mod retry_tests {
   #[test]
   fn ack_attribution_requires_the_current_downstreams_live_entry() {
     let table = new_table();
-    let live_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    let live_acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let (upstream_tx, _upstream_rx) = test_queue(16, usize::MAX);
-    live_acks.lock().unwrap().insert(
-      trace(99),
-      super::PendingAck::Relay {
-        upstream: upstream_tx,
-      },
-    );
+    live_acks
+      .try_reserve_admission(
+        &trace(99),
+        super::PendingAck::Relay {
+          upstream: upstream_tx,
+        },
+      )
+      .unwrap();
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
-    let stale_acks: super::PendingAcks = Arc::new(std::sync::Mutex::new(Default::default()));
+    let stale_acks: super::PendingAdmissions =
+      super::PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     register(
       &table,
       trace(99),
@@ -1907,7 +2086,7 @@ mod retry_tests {
     ));
     // The current map after its entry was consumed (the attempt was
     // already abandoned) is not: the re-dispatch owns the next entry.
-    live_acks.lock().unwrap().remove(&trace(99));
+    live_acks.withdraw(&trace(99));
     assert!(!super::ack_from_current_downstream(
       &table,
       &live_acks,

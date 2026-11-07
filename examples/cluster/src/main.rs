@@ -113,14 +113,9 @@ async fn main() {
       Arc::new(FirstMatch),
     )
     .expect("register load balancer");
-  // The built-in next-hop policy relays label-selected sends through a
-  // connected peer when the selected destination is not adjacent.
-  extensions
-    .register_next_hop(
-      radiata::QualifiedTag::parse(radiata::DefaultNextHop::TAG).unwrap(),
-      Arc::new(radiata::DefaultNextHop),
-    )
-    .expect("register route policy");
+  // The built-in next-hop policy is installed by the builder's default
+  // pass with the node's learned topology; the config's route policy tag
+  // selects it for label-selected sends.
 
   let node = NodeBuilder::new(storage)
     .config(

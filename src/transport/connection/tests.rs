@@ -54,7 +54,14 @@ async fn tls_transport_merge_hint_round_trips_inside_the_tls_channel() {
     let hint = hint.clone();
     async move {
       let (tcp, _) = listener.accept().await.unwrap();
-      Connection::accept_tls_ws(tcp, config, rules(), Some(&hint)).await
+      Connection::accept_tls_ws(
+        tcp,
+        config,
+        rules(),
+        crate::transport::TransportAdmission::PeerAddressed,
+        Some(&hint),
+      )
+      .await
     }
   });
 
@@ -161,7 +168,14 @@ async fn loopback_pair_with(
   let address = listener.local_addr().unwrap();
   let server = tokio::spawn(async move {
     let (tcp, _) = listener.accept().await.unwrap();
-    Connection::accept_tls_ws(tcp, config, rules(), None).await
+    Connection::accept_tls_ws(
+      tcp,
+      config,
+      rules(),
+      crate::transport::TransportAdmission::PeerAddressed,
+      None,
+    )
+    .await
   });
 
   let tcp = TcpStream::connect(address).await.unwrap();
@@ -206,7 +220,6 @@ fn framed(stream: WebSocketStream<TlsStream<TcpStream>>) -> Connection {
     merge_hint: None,
     peer_addr: None,
     attributable: true,
-    pong_last_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
   }
 }
 
@@ -670,14 +683,10 @@ async fn tls_transport_split_burst_after_round_trip_delivers_all_messages() {
   }
 }
 
-/// Pongs surface as keepalive wakes (never swallowed) and refresh the
-/// shared liveness stamp: the session read loop's reflection depends on
-/// both halves of that contract.
+/// Pongs surface as keepalive wakes (never swallowed): the session read
+/// loop stamps its activity mark on every pong wake.
 #[tokio::test]
-async fn pongs_surface_as_events_and_refresh_the_liveness_stamp() {
-  use std::sync::atomic::{AtomicU64, Ordering};
-
-  let stamp = Arc::new(AtomicU64::new(0));
+async fn pongs_surface_as_keepalive_wakes() {
   let pong = || WsMessage::Pong(tokio_tungstenite::tungstenite::Bytes::from_static(b"ka"));
   let mut stream = futures_util::stream::iter(vec![
     Ok(pong()),
@@ -689,26 +698,143 @@ async fn pongs_surface_as_events_and_refresh_the_liveness_stamp() {
     )),
   ]);
 
-  let first = super::next_message(&mut stream, rules(), &stamp)
+  let first = super::next_message(&mut stream, rules())
     .await
     .unwrap()
     .unwrap();
   assert!(matches!(first, super::Received::Pong));
-  let second = super::next_message(&mut stream, rules(), &stamp)
+  let second = super::next_message(&mut stream, rules())
     .await
     .unwrap()
     .unwrap();
   assert!(matches!(second, super::Received::Pong));
-  assert_ne!(
-    stamp.load(Ordering::Relaxed),
-    0,
-    "a pong must refresh the liveness stamp"
-  );
 
   // The message following the pongs arrives intact.
-  let third = super::next_message(&mut stream, rules(), &stamp)
+  let third = super::next_message(&mut stream, rules())
     .await
     .unwrap()
     .unwrap();
   assert_eq!(third.expect_message().body, b"payload");
+}
+
+/// A transient transport IO failure during the TLS handshake is the
+/// provider's `Io` kind, never an authentication failure: the socket died,
+/// nothing about the peer's identity was decided.
+#[tokio::test]
+async fn tls_transport_maps_a_transient_io_handshake_failure_to_io() {
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let address = listener.local_addr().unwrap();
+  let server = tokio::spawn(async move {
+    // Accept the TCP connection and drop it before the TLS handshake can
+    // complete: the dialer observes a transport fault, not a bad peer.
+    let (tcp, _) = listener.accept().await.unwrap();
+    drop(tcp);
+  });
+
+  let tcp = TcpStream::connect(address).await.unwrap();
+  let error =
+    Connection::connect_tls_ws(tcp, merge_client_config().unwrap(), server_name(), rules())
+      .await
+      .unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::Io);
+  server.await.unwrap();
+}
+
+/// The accept side classifies the same transient fault identically: a dialer
+/// that connects and drops mid-handshake is a transport IO failure.
+#[tokio::test]
+async fn tls_transport_maps_a_transient_io_accept_failure_to_io() {
+  let config = server_config(&certificate(53)).unwrap();
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let address = listener.local_addr().unwrap();
+  let dialer = tokio::spawn(async move {
+    let tcp = TcpStream::connect(address).await.unwrap();
+    drop(tcp);
+  });
+
+  let (tcp, _) = listener.accept().await.unwrap();
+  let error = Connection::accept_tls_ws(
+    tcp,
+    config,
+    rules(),
+    crate::transport::TransportAdmission::PeerAddressed,
+    None,
+  )
+  .await
+  .unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::Io);
+  dialer.await.unwrap();
+}
+
+/// The handshake classifier itself: a socket-level failure and a plain
+/// `io::Error` are transport IO under the caller's connect/accept context,
+/// while a rustls protocol/verification error stays the typed
+/// authentication failure.
+#[test]
+fn tls_handshake_error_classifies_io_against_verification() {
+  let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+  let error = super::tls_handshake_error(
+    &io,
+    crate::ProviderErrorContext::TransportConnect,
+    "tls connect",
+  );
+  assert_eq!(error.kind(), ErrorKind::Io);
+  assert_eq!(error.context(), "transport connect");
+
+  let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "tls handshake eof");
+  let error = super::tls_handshake_error(
+    &eof,
+    crate::ProviderErrorContext::TransportAccept,
+    "tls accept",
+  );
+  assert_eq!(error.kind(), ErrorKind::Io);
+  assert_eq!(error.context(), "transport accept");
+
+  let verification =
+    std::io::Error::new(std::io::ErrorKind::InvalidData, rustls::Error::DecryptError);
+  let error = super::tls_handshake_error(
+    &verification,
+    crate::ProviderErrorContext::TransportConnect,
+    "tls connect",
+  );
+  assert_eq!(error.kind(), ErrorKind::AuthenticationFailed);
+  assert_eq!(error.context(), "tls connect");
+}
+
+/// The WebSocket upgrade classifier: an underlying IO failure is the
+/// provider's `Io` kind under the caller's context, and every other
+/// tungstenite failure stays unclassified so the caller keeps its
+/// malformed-upgrade rejection.
+#[test]
+fn ws_io_error_classifies_only_transport_failures() {
+  use tokio_tungstenite::tungstenite::{Error as WsError, error::ProtocolError};
+
+  let io = WsError::Io(std::io::Error::new(
+    std::io::ErrorKind::ConnectionReset,
+    "reset",
+  ));
+  let error = super::ws_io_error(&io, crate::ProviderErrorContext::TransportAccept)
+    .expect("an IO upgrade failure is a transport fault");
+  assert_eq!(error.kind(), ErrorKind::Io);
+  assert_eq!(error.context(), "transport accept");
+
+  let protocol = WsError::Protocol(ProtocolError::HandshakeIncomplete);
+  assert!(
+    super::ws_io_error(&protocol, crate::ProviderErrorContext::TransportConnect).is_none(),
+    "a malformed upgrade is not a transport IO failure"
+  );
+}
+
+/// A transient IO failure during the WebSocket upgrade is the provider's
+/// `Io` kind, never the malformed-upgrade rejection: the peer disappeared
+/// mid-handshake.
+#[tokio::test]
+async fn ws_upgrade_maps_a_transient_io_failure_to_io() {
+  let (client, server) = tokio::io::duplex(1_024);
+  drop(server);
+  let error = match ws::connect(client, "example.test:443").await {
+    Ok(_) => panic!("a closed peer cannot complete the upgrade"),
+    Err(error) => error,
+  };
+  assert_eq!(error.kind(), ErrorKind::Io);
 }

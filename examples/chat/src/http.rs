@@ -251,7 +251,7 @@ async fn send_wire(
   // typical depth: a 32-node chain relay needs 31 hops (an 8-hop budget
   // never delivered across it), and routes are loop-free by validation,
   // so a generous budget costs nothing beyond one check per hop.
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 128).map_err(|error| error.to_string())?;
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 128).map_err(|error| error.to_string())?;
   let chunk: Arc<[u8]> = Arc::from(payload.into_boxed_slice());
   let body = futures_util::stream::iter([Ok(chunk)]);
   state
@@ -939,9 +939,27 @@ async fn tasks(state: State<SharedState>) -> Result<Json<Value>, (StatusCode, Js
   while let Some(page) = next {
     let view = state.node.tasks().list(page).await.map_err(internal)?;
     tasks.extend(view.items().iter().map(|task| {
+      // The stable short kind name: the tag's kebab-case name segment in
+      // PascalCase ("radiata.woooo.tech/tasks/put-resource" renders as
+      // "PutResource"), the spelling the acceptance suite pins.
+      let kind = task
+        .kind()
+        .as_str()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('-')
+        .map(|part| {
+          let mut chars = part.chars();
+          match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+          }
+        })
+        .collect::<String>();
       json!({
         "id": task.id().to_string(),
-        "kind": format!("{:?}", task.kind()),
+        "kind": kind,
         "phase": format!("{:?}", task.phase()),
         "attempts": task.attempts(),
       })

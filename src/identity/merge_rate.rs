@@ -376,8 +376,8 @@ mod tests {
 
   /// The default limits derive from the reference cluster scale: the
   /// join pool keeps today's strict per-source budget, and the member
-  /// pool admits a whole same-site cluster reconnecting at once (the
-  /// incident-B shape) instead of starving it.
+  /// pool admits a whole same-site cluster reconnecting at once (a
+  /// same-site reconnect burst) instead of starving it.
   #[test]
   fn merge_rate_defaults_derive_from_the_reference_cluster_scale() {
     let limits = MergeAdmissionLimits::default();
@@ -397,7 +397,7 @@ mod tests {
 
   /// A same-site cluster reconnecting as members draws the generous
   /// pool: sixty-four same-source member reconnects are all admitted
-  /// outright (the incident-B shape now converges in one step), and
+  /// outright (a same-site reconnect burst converges in one step), and
   /// member volume consumes none of the same source's strict join
   /// budget: sixteen joins still pass, the seventeenth is refused.
   #[test]

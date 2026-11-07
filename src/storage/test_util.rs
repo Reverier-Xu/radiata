@@ -1,8 +1,8 @@
 //! Shared value-construction helpers for storage test lanes.
 //!
 //! The JSON adapter lane (`json/helpers.rs`) and the backend-neutral
-//! contract suite (`contract.rs`) previously declared their own copies of
-//! these constructors; a single definition prevents them from drifting.
+//! contract suite (`contract.rs`) share these constructors; a single
+//! definition prevents them from drifting.
 
 use std::sync::Arc;
 

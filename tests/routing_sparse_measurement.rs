@@ -1,4 +1,4 @@
-//! Sparse-topology routing measurement (audit 2026-10-23 item D-6 / R2-D05).
+//! Sparse-topology routing measurement.
 //!
 //! Evidence work, not a behavior change: eight real TLS nodes over loopback
 //! are reshaped into sparse graphs — ring, tree, dead-end branches, an
@@ -11,11 +11,11 @@
 //! Two lanes run against every cell:
 //!
 //! - **default** — the built-in `DefaultNextHop` algorithm unchanged. A
-//!   measuring wrapper registered under the built-in policy's own tag
-//!   (`DefaultNextHop::TAG`, which a caller may claim per the registry
-//!   contract) delegates every decision to `radiata::DefaultNextHop` and only
-//!   records `(trace, local, chosen)` cluster-wide. No production code path
-//!   changes; the wrapper is a test-side observer.
+//!   measuring wrapper registered under a caller-owned tag selected as every
+//!   node's route policy (`with_route_policy`) delegates every decision to
+//!   `radiata::DefaultNextHop` and only records `(trace, local, chosen)`
+//!   cluster-wide. No production code path changes; the wrapper is a test-side
+//!   observer.
 //! - **oracle** — the same wrapper answers from a precomputed BFS next-hop
 //!   table of the enforced shape: what routing with full reachability knowledge
 //!   would do. The oracle lane's `decisions == distance − 1` invariant and its
@@ -29,7 +29,7 @@
 //! Failure cells classify the typed kinds the origin observes and the
 //! recovery that exists (forwarder branch search, caller fresh-trace
 //! retries) or does not (budget exhaustion below path length, unreachable
-//! destinations, the direct-only convenience reply of D-7).
+//! destinations, the direct-only convenience reply).
 //!
 //! Two tests share this harness: `sparse_routing_structural_invariants`
 //! runs the lean profile (CI: real nodes, small samples, structural
@@ -71,11 +71,15 @@ use common::{MemoryStorageFactory, ScriptedKeys, required_capabilities};
 /// Cluster size: one anchor plus seven members.
 const NODES: usize = 8;
 /// The measurement protocol carrying the routed payloads.
-const MEASURE_PROTOCOL: &str = "radiata.woooo.tech/protocols/sparse-measure";
+const MEASURE_PROTOCOL: &str = "example.org/protocols/sparse-measure";
 /// The protocol of the derived convenience replies (reply-probe cell).
-const REPLY_PROTOCOL: &str = "radiata.woooo.tech/protocols/sparse-reply";
+const REPLY_PROTOCOL: &str = "example.org/protocols/sparse-reply";
 /// The session-core feature both protocols declare.
 const FEATURE_TAG: &str = "radiata.woooo.tech/features/session-core";
+/// The caller-owned route-policy tag carrying the measuring wrapper: the
+/// built-in default tag is core-owned (a caller claim conflicts), so the
+/// wrapper lives under its own tag and every node selects it explicitly.
+const MEASURE_POLICY_TAG: &str = "example.org/route-policies/sparse-measure";
 /// The generous hop budget: every simple path in an eight-node graph (at
 /// most seven edges) fits, so budget never masks search behavior. A path
 /// of m edges needs m − 1 ≤ budget.
@@ -325,7 +329,7 @@ impl Shared {
 }
 
 /// The measuring next-hop policy: an observer registered under the
-/// built-in policy's own tag on every node. Default and reply lanes
+/// caller-owned measurement tag on every node. Default and reply lanes
 /// delegate to the untouched built-in algorithm; the oracle lane answers
 /// from the enforced shape's BFS table (falling back to the built-in pick
 /// and counting a drift only if the table ever disagrees with the live
@@ -336,7 +340,7 @@ struct MeasuringPolicy {
 }
 
 impl RouteNextHop for MeasuringPolicy {
-  fn next_hop<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+  fn plan<'a>(&'a self, view: NextHopView<'a>) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
     Box::pin(async move {
       let trace = view.trace().clone();
       let local = view.local().clone();
@@ -346,7 +350,7 @@ impl RouteNextHop for MeasuringPolicy {
         // tagged policy. Behave exactly like the built-in default and
         // keep it out of the per-trace measurement log.
         self.shared.count_foreign();
-        return DefaultNextHop.next_hop(view).await;
+        return DefaultNextHop::default().plan(view).await;
       };
       let oracle_pick = match lane {
         Lane::Oracle => {
@@ -362,15 +366,18 @@ impl RouteNextHop for MeasuringPolicy {
         Lane::Default | Lane::Reply => None,
       };
       let outcome = match oracle_pick {
-        Some(next) => Ok(next),
-        None => DefaultNextHop.next_hop(view).await,
+        Some(next) => Ok(Some(vec![next])),
+        None => DefaultNextHop::default().plan(view).await,
       };
       self.shared.record_decision(
         lane,
         &trace,
         Decision {
           local,
-          chosen: outcome.as_ref().ok().cloned(),
+          chosen: outcome
+            .as_ref()
+            .ok()
+            .and_then(|path| path.as_ref().and_then(|path| path.first().cloned())),
         },
       );
       outcome
@@ -474,18 +481,20 @@ async fn start_node(seed: u64, shared: &Arc<Shared>) -> Node {
       )
       .unwrap();
   }
-  // Claim the built-in policy's own tag: the builder auto-registers the
-  // built-in default only when the tag is free, so every node resolves
-  // its default route policy to the measuring wrapper.
+  // Register the measuring wrapper under its caller-owned tag and select
+  // it as every node's route policy, so all lanes route through it.
+  let policy_tag = radiata::QualifiedTag::parse(MEASURE_POLICY_TAG).unwrap();
   registry
     .register_next_hop(
-      radiata::QualifiedTag::parse(DefaultNextHop::TAG).unwrap(),
+      policy_tag.clone(),
       Arc::new(MeasuringPolicy {
         shared: Arc::clone(shared),
       }),
     )
     .unwrap();
-  let config = NodeConfig::new().with_connection_degree(1);
+  let config = NodeConfig::new()
+    .with_connection_degree(1)
+    .with_route_policy(policy_tag);
   let handle = NodeBuilder::new(factory)
     .keys(keys)
     .config(config)
@@ -818,7 +827,7 @@ async fn send_one(
     .open_stream(
       StreamTarget::Exact(target.clone()),
       ProtocolTag::parse(MEASURE_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, budget).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, budget).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap();
@@ -1649,7 +1658,7 @@ async fn run_failure_cells(
   )
   .await;
 
-  // B1: seven-hop destination under a three-hop budget. Every path is
+  // Seven-hop destination under a three-hop budget. Every path is
   // longer than the budget, so no attempt and no fresh trace can deliver.
   let mut b1 = Cell {
     shape: "chain8",
@@ -1693,8 +1702,8 @@ async fn run_failure_cells(
   report_retries("chain8", 0, 7, 3, &retries);
 
   // R: convenience-reply probes. A delivered multi-hop stream's derived
-  // return stream is direct-only (hardcoded one-hop budget, D-7's
-  // decided boundary): the reply can never cross the chain back to the
+  // return stream is direct-only (hardcoded one-hop budget, a decided
+  // boundary): the reply can never cross the chain back to the
   // source, whatever the caller intends.
   for probe in 0..profile.reply_probes {
     let target = nodes[7].id().clone();
@@ -1703,7 +1712,7 @@ async fn run_failure_cells(
       .open_stream(
         StreamTarget::Exact(target),
         ProtocolTag::parse(MEASURE_PROTOCOL).unwrap(),
-        StreamPolicy::new(RoutingPolicy::Direct, OPEN_BUDGET).unwrap(),
+        StreamPolicy::new(RoutingPolicy::DIRECT, OPEN_BUDGET).unwrap(),
         StreamMetadata::new(),
       )
       .unwrap();
@@ -1759,7 +1768,7 @@ async fn sparse_routing_structural_invariants() {
 }
 
 /// The full statistical profile behind `--ignored`; its logged tables
-/// are the D-6 measurement report data.
+/// are the measurement report data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "full statistical profile: cargo test --release --test routing_sparse_measurement sparse_routing_full_profile_tables -- --ignored --exact --nocapture"]
 async fn sparse_routing_full_profile_tables() {

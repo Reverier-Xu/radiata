@@ -2,7 +2,9 @@ pub(crate) mod private {
   pub trait Sealed {}
 }
 
-use crate::{NodeId, packet::RouteHandle};
+use std::sync::Arc;
+
+use crate::{NodeId, packet::RouteHandle, protocol::EventTag};
 
 #[allow(private_bounds)]
 pub trait Event: private::Sealed + Clone + Send + Sync + 'static {}
@@ -216,6 +218,7 @@ impl ResourceChanged {
 /// Where a committed resource candidate that produced
 /// [`ResourceChanged`] came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ResourceOrigin {
   /// This node's own write effect committed the candidate.
   Local,
@@ -268,3 +271,33 @@ impl TaskChanged {
 impl private::Sealed for TaskChanged {}
 
 impl Event for TaskChanged {}
+
+/// One caller-published event on the node's tag-keyed channel: the
+/// [`EventTag`] key it was published under and its opaque payload bytes.
+/// The core never inspects the payload; the tag is the publish/subscribe
+/// key and travels with every delivered item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaggedEvent {
+  tag: EventTag,
+  payload: Arc<[u8]>,
+}
+
+impl TaggedEvent {
+  /// The tag the event was published under.
+  pub const fn tag(&self) -> &EventTag {
+    &self.tag
+  }
+
+  /// The publisher's opaque payload bytes.
+  pub const fn payload(&self) -> &Arc<[u8]> {
+    &self.payload
+  }
+
+  pub(crate) const fn new(tag: EventTag, payload: Arc<[u8]>) -> Self {
+    Self { tag, payload }
+  }
+}
+
+impl private::Sealed for TaggedEvent {}
+
+impl Event for TaggedEvent {}

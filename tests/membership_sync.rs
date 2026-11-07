@@ -20,12 +20,12 @@ use radiata::{Endpoint, NodeBuilder, NodeConfig, NodeHandle, PageSpec};
 mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys};
-// The shared multi-cluster gate (audit 2026-10-27 B3): the lanes
+// The shared multi-cluster gate: the lanes
 // serialize so each cluster owns the machine while it runs — in this
 // process through the gate's async mutex and across test-file
 // processes through the kernel file lock under `target/`, so
-// cross-file cluster parallelism is bounded machine-wide too (the
-// per-file `OnceLock` this replaces left other files' clusters free
+// cross-file cluster parallelism is bounded machine-wide too (a
+// per-file `OnceLock` would leave other files' clusters free
 // to oversubscribe the runner).
 use radiata_test_support::cluster_gate;
 
@@ -40,7 +40,7 @@ use radiata_test_support::cluster_gate;
 /// runner that cannot carry several oversubscribed clusters at once,
 /// so the lanes serialize on the shared cluster gate and each cluster
 /// owns the machine while it runs — including against other test
-/// files' clusters (audit 2026-10-27 B3).
+/// files' clusters.
 fn init_tracing() {
   use std::sync::Once;
   static INIT: Once = Once::new();
@@ -59,7 +59,7 @@ struct Node {
 }
 
 /// The echo protocol tag of the revised SLO workload sample.
-const ECHO_PROTOCOL: &str = "radiata.woooo.tech/protocols/workload-echo";
+const ECHO_PROTOCOL: &str = "example.org/protocols/workload-echo";
 
 /// Counts fully drained workload packets (sample delivery observation).
 #[derive(Debug, Default)]
@@ -1639,7 +1639,7 @@ async fn membership_sync_sixteen_node_revised_workload_slo() {
     .open_stream(
       radiata::StreamTarget::Exact(nodes[15].id.clone()),
       radiata::ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      radiata::StreamPolicy::new(radiata::RoutingPolicy::Direct, 1).unwrap(),
+      radiata::StreamPolicy::new(radiata::RoutingPolicy::DIRECT, 1).unwrap(),
       radiata::StreamMetadata::new(),
     )
     .unwrap();
@@ -1818,9 +1818,9 @@ async fn membership_sync_delivers_fat_descriptor_pages() {
   }
 }
 
-/// Regression (the 2026-10-09 audit, item 10): the local descriptor's
+/// Regression: the local descriptor's
 /// endpoint rewrite must carry the owner's capability labels. Listener
-/// add/remove drift used to rebuild the descriptor without labels and
+/// add/remove drift would otherwise rebuild the descriptor without labels and
 /// propagate the emptied set to peers at a higher revision. The lane
 /// also pins the documented endpoint semantics: a patched-but-unlistened
 /// endpoint is advisory and rolls back on the next maintenance rewrite

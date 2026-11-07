@@ -39,12 +39,12 @@ use tokio::time::sleep;
 use zeroize::Zeroizing;
 
 use super::{
-  SECRET_LEN, custody_corrupt, fresh_secret, handle_for, io_error, operation_from_handle,
-  validate_delete_pair,
+  SECRET_LEN, created_key, custody_corrupt, fresh_secret, handle_for, io_error,
+  operation_from_handle, validate_delete_pair,
 };
 use crate::{
-  BoxFuture, CreatedKey, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle,
-  KeyOperationId, ProviderErrorContext, PublicKey, Result, Signature, provider::KeyProvider,
+  BoxFuture, KeyCapabilities, KeyCreateState, KeyDeleteState, KeyHandle, KeyOperationId,
+  ProviderErrorContext, PublicKey, Result, Signature, provider::KeyProvider,
 };
 
 /// Suffix of the durable key artifact: the raw 32-byte Ed25519 seed.
@@ -277,15 +277,10 @@ impl FileKeyStore {
     {
       self.barrier(context)?;
     }
-    Ok(KeyCreateState::Present(Self::created(handle, secret)))
-  }
-
-  fn created(handle: &KeyHandle, secret: &[u8; SECRET_LEN]) -> CreatedKey {
-    let signing = SigningKey::from_bytes(secret);
-    CreatedKey::new(
-      handle.clone(),
-      PublicKey::from_bytes(signing.verifying_key().to_bytes()),
-    )
+    Ok(KeyCreateState::Present(created_key(
+      handle,
+      &SigningKey::from_bytes(secret),
+    )))
   }
 
   /// Loads the signing key behind one handle. Strict validation first:
@@ -424,7 +419,10 @@ impl KeyProvider for FileKeyStore {
                 if self.discard_artifact(&intent_path, ProviderErrorContext::KeyCreate)? {
                   self.barrier(ProviderErrorContext::KeyCreate)?;
                 }
-                return Ok(KeyCreateState::Present(Self::created(&handle, &secret)));
+                return Ok(KeyCreateState::Present(created_key(
+                  &handle,
+                  &SigningKey::from_bytes(&secret),
+                )));
               }
               // Lost a concurrent mint of the same operation: the
               // winner's seed is the committed one; resolve from the

@@ -8,8 +8,8 @@
 //! shape of a flapping peer (session churn resolving ack verdicts as
 //! undelivered), and the watermark acceptance sample: exactly one
 //! write into a converged mid-size catalog must converge within one
-//! detection cadence window plus one reconciliation round — not the full
-//! catalog re-send cycle the previous fingerprint design paid on every
+//! detection cadence window plus one reconciliation round — not a full
+//! catalog re-send cycle on every
 //! quiet window. The matrix quantifies whether the per-page admission
 //! ack wait (2s bound) changes convergence or steady-state behavior at
 //! scale.
@@ -351,8 +351,8 @@ async fn sync_ack_convergence_matrix() {
 /// The watermark acceptance sample: a converged 4096-record
 /// catalog receives exactly one mid-catalog write. The sample must be
 /// one detection cadence window plus an amortized scan walk (a single
-/// changed page) — orders of magnitude below the full-catalog re-send
-/// cycle the previous fingerprint design paid on every quiet window.
+/// changed page) — orders of magnitude below a full-catalog re-send
+/// cycle on every quiet window.
 #[ignore = "explicit benchmark: cargo test --release --test sync_scale_benchmark sync_watermark_single_write_converges_within_one_cadence_window -- --ignored --nocapture"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn sync_watermark_single_write_converges_within_one_cadence_window() {

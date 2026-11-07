@@ -25,8 +25,10 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys, required_capabilities};
 
-const POLICY_TAG: &str = "radiata.woooo.tech/policies/linear";
-const PROTOCOL_TAG: &str = "radiata.woooo.tech/protocols/test-echo";
+const POLICY_TAG: &str = "example.org/policies/linear";
+const STREAM_POLICY_TAG: &str = "example.org/route-policies/linear-stream";
+const EMPTY_POLICY_TAG: &str = "example.org/route-policies/linear-empty";
+const PROTOCOL_TAG: &str = "example.org/protocols/test-echo";
 const FEATURE_TAG: &str = "radiata.woooo.tech/features/session-core";
 
 type SharedTable = Arc<Mutex<BTreeMap<String, String>>>;
@@ -40,23 +42,35 @@ struct SharedPolicy {
 }
 
 impl RouteNextHop for SharedPolicy {
-  fn next_hop<'a>(
+  fn plan<'a>(
     &'a self, view: radiata::NextHopView<'a>,
   ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = radiata::Result<radiata::NodeId>> + Send + 'a>,
+    Box<
+      dyn std::future::Future<Output = radiata::Result<Option<Vec<radiata::NodeId>>>> + Send + 'a,
+    >,
   > {
     Box::pin(async move {
       // The topology is per-node: which neighbour leads toward the
-      // destination depends on where the packet currently is.
-      let key = format!("{}|{}", view.local().as_str(), view.destination().as_str());
+      // destination depends on where the packet currently is. The policy
+      // plans the rest of its linear walk from here to the destination.
       let guard = self.table.lock().unwrap();
-      let next = guard.get(&key).ok_or_else(|| {
-        radiata::Error::provider(
-          radiata::ProviderErrorKind::Unsupported,
-          radiata::ProviderErrorContext::RoutingPolicy,
-        )
-      })?;
-      radiata::NodeId::parse(next)
+      let mut path = Vec::new();
+      let mut current = view.local().clone();
+      while current != *view.destination() {
+        let key = format!("{}|{}", current.as_str(), view.destination().as_str());
+        let next = guard.get(&key).ok_or_else(|| {
+          radiata::Error::provider(
+            radiata::ProviderErrorKind::Unsupported,
+            radiata::ProviderErrorContext::RoutingPolicy,
+          )
+        })?;
+        current = radiata::NodeId::parse(next)?;
+        path.push(current.clone());
+        if path.len() > usize::try_from(view.remaining_hops()).unwrap_or(usize::MAX) {
+          return Err(radiata::Error::caller("linear policy budget"));
+        }
+      }
+      Ok(Some(path))
     })
   }
 }
@@ -66,7 +80,7 @@ struct Collector {
   packets: Mutex<Vec<(String, Vec<u8>)>>,
   /// Typed body interruptions observed mid-stream (a relay leg dying):
   /// `(trace, error kind)`. A truncated body must surface here, never as
-  /// a delivered packet (audit 2026-10-09 item 11).
+  /// a delivered packet.
   interruptions: Mutex<Vec<(String, ErrorKind)>>,
 }
 
@@ -182,10 +196,31 @@ async fn start_node(
     registry
       .register_next_hop(
         QualifiedTag::parse(POLICY_TAG).unwrap(),
-        Arc::new(SharedPolicy { table }),
+        Arc::new(SharedPolicy {
+          table: Arc::clone(&table),
+        }),
       )
       .unwrap();
     config = config.with_route_policy(QualifiedTag::parse(POLICY_TAG).unwrap());
+    // The stream-level lanes of the same policy shape: one over the
+    // shared linear table (the delivery lane of the routing-policy test)
+    // and one over a permanently empty table (the typed-failure lane).
+    registry
+      .register_routing_policy(
+        QualifiedTag::parse(STREAM_POLICY_TAG).unwrap(),
+        Arc::new(SharedPolicy {
+          table: Arc::clone(&table),
+        }),
+      )
+      .unwrap();
+    registry
+      .register_routing_policy(
+        QualifiedTag::parse(EMPTY_POLICY_TAG).unwrap(),
+        Arc::new(SharedPolicy {
+          table: Arc::default(),
+        }),
+      )
+      .unwrap();
   }
   let handle = NodeBuilder::new(factory)
     .keys(keys)
@@ -499,7 +534,7 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
   settle_linear_chain(&nodes).await;
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
 
   // ---- Successful three-hop delivery ----
   let packet = nodes[0]
@@ -618,7 +653,7 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
     .open_stream(
       StreamTarget::Exact(nodes[3].id().clone()),
       ProtocolTag::parse(PROTOCOL_TAG).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap();
@@ -629,6 +664,109 @@ async fn routed_packets_cross_three_hops_and_interrupt_explicitly() {
       ErrorKind::StreamInterrupted | ErrorKind::RouteUnavailable | ErrorKind::Unsupported
     ),
     "expected an explicit typed route failure, got {error:?}"
+  );
+
+  for node in &nodes {
+    let _ = node.handle.shutdown().await;
+  }
+}
+
+/// A caller-registered stream-level routing policy is authoritative for
+/// its stream: registered under a caller-domain tag, selected through
+/// `StreamPolicy::new(RoutingPolicy::from(tag), hops)`, it plans the
+/// route its stream follows — and a policy over an empty table fails the
+/// route with a typed delivery error instead of falling back to the
+/// node-level policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_registered_stream_routing_policy_delivers_along_its_chain() {
+  init_tracing();
+  let (nodes, table) = boot_linear_four(true).await;
+
+  // Per-node linear chain policy over the concrete identities: for every
+  // origin, the way toward a later member is its right-hand neighbour.
+  {
+    let mut guard = table.lock().unwrap();
+    for origin in 0..4_usize {
+      for destination in (origin + 1)..4_usize {
+        let next = origin + 1;
+        guard.insert(
+          format!(
+            "{}|{}",
+            nodes[origin].id().as_str(),
+            nodes[destination].id.as_ref().unwrap().as_str()
+          ),
+          nodes[next].id().as_str().to_owned(),
+        );
+      }
+    }
+  }
+
+  settle_linear_chain(&nodes).await;
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+
+  // The stream-level policy lane: A's policy plans the whole chain
+  // A -> B -> C -> D and every hop follows it.
+  let stream_policy = StreamPolicy::new(
+    RoutingPolicy::from(QualifiedTag::parse(STREAM_POLICY_TAG).unwrap()),
+    8,
+  )
+  .unwrap();
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
+      protocol.clone(),
+      stream_policy,
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let ack = packet.send_sync(vec_body(&[b"lane", b"d"])).await.unwrap();
+  assert_eq!(ack.destination(), nodes[3].id());
+  wait_for(
+    || {
+      nodes[3]
+        .collector
+        .packets
+        .lock()
+        .unwrap()
+        .first()
+        .map(|(_, body)| body == &b"laned".to_vec())
+        .unwrap_or(false)
+    },
+    Duration::from_secs(30),
+    "the stream policy's planned chain must deliver the body",
+  )
+  .await;
+  // No intermediate consumer ran along the planned chain.
+  for node in &nodes[..3] {
+    assert!(node.collector.packets.lock().unwrap().is_empty());
+  }
+  let delivered_before_failure = nodes[3].collector.packets.lock().unwrap().len();
+
+  // The empty-table lane: the same policy shape over a table with no
+  // entries plans nothing, so the route fails typed at admission instead
+  // of falling back to the node-level policy.
+  let empty_policy = StreamPolicy::new(
+    RoutingPolicy::from(QualifiedTag::parse(EMPTY_POLICY_TAG).unwrap()),
+    8,
+  )
+  .unwrap();
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
+      protocol,
+      empty_policy,
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let error = packet.send_sync(vec_body(&[b"never"])).await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
+  assert_eq!(
+    nodes[3].collector.packets.lock().unwrap().len(),
+    delivered_before_failure,
+    "the failed lane must not deliver anything"
   );
 
   for node in &nodes {
@@ -649,7 +787,7 @@ async fn default_policy_relays_routed_packets_without_configuration() {
   settle_linear_chain(&nodes).await;
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
   let packet = nodes[0]
     .handle
     .open_stream(
@@ -703,7 +841,7 @@ async fn a_body_above_the_chunk_bound_crosses_three_hops_byte_exact() {
   let expected: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
   let packet = nodes[0]
     .handle
     .open_stream(
@@ -745,7 +883,7 @@ async fn a_body_above_the_chunk_bound_crosses_three_hops_byte_exact() {
   }
 }
 
-/// A mid-route relay leg death (audit 2026-10-09 item 11): while a gated
+/// A mid-route relay leg death: while a gated
 /// body is in flight from A toward D across the A—B—C—D chain, the B—C
 /// leg dies. The relay at C must synthesize a typed *interrupted* end for
 /// D — D's consumer observes exactly one typed `StreamInterrupted` and
@@ -780,7 +918,7 @@ async fn relay_leg_death_surfaces_typed_interruption_at_the_destination() {
   settle_linear_chain(&nodes).await;
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
   let (body, open_flag, notify) = gated_body();
   let packet = nodes[0]
     .handle
@@ -874,14 +1012,13 @@ async fn relay_leg_death_surfaces_typed_interruption_at_the_destination() {
   }
 }
 
-/// The origin-side route record's terminal contract (remaining items
-/// 2026-10-10, P2-3): the pump's end-of-stream `Delivered` and the relay
-/// chain's late mid-flight failure report are two writers on one record,
-/// and the route table's monotonic terminal machine must converge them to
-/// one deterministic final answer. The realistic ordering is pinned here:
-/// a post-admission failure is only reported upstream when the surviving
-/// relay's chunk relay fails (`forward::relay_chunk` → `fail_hop`), so
-/// the pump's tail lands first and the failure report arrives late — and
+/// The origin-side route record's terminal contract: the pump's end-of-stream
+/// `Delivered` and the relay chain's late mid-flight failure report are two
+/// writers on one record, and the route table's monotonic terminal machine must
+/// converge them to one deterministic final answer. The realistic ordering is
+/// pinned here: a post-admission failure is only reported upstream when the
+/// surviving relay's chunk relay fails (`forward::relay_chunk` → `fail_hop`),
+/// so the pump's tail lands first and the failure report arrives late — and
 /// must still override the recorded `Delivered`. The opposite ordering
 /// (failure first) is exercised by the pump-side lib tests in
 /// `src/routing/outbound.rs`.
@@ -912,7 +1049,7 @@ async fn relay_leg_death_leaves_the_origin_record_failed_regardless_of_ordering(
   settle_linear_chain(&nodes).await;
 
   let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
   let (body, open_flag, notify) = gated_body();
   let packet = nodes[0]
     .handle
@@ -976,7 +1113,7 @@ async fn relay_leg_death_leaves_the_origin_record_failed_regardless_of_ordering(
     .unwrap();
 
   // D's consumer observes the typed interruption — the consumer-side
-  // semantics of the same death (audit 2026-10-09 item 11).
+  // semantics of the same death.
   wait_for(
     || !nodes[3].collector.interruptions.lock().unwrap().is_empty(),
     Duration::from_secs(30),
@@ -1053,6 +1190,291 @@ async fn relay_leg_death_leaves_the_origin_record_failed_regardless_of_ordering(
     );
     tokio::time::sleep(Duration::from_millis(20)).await;
   }
+
+  for node in &nodes {
+    let _ = node.handle.shutdown().await;
+  }
+}
+
+/// Waits until every member's descriptor has reached every node's store:
+/// admission validates a caller-named path's hops against the origin's
+/// descriptor store, so the path is only admissible once the members'
+/// descriptors have converged.
+async fn wait_for_member_descriptors(nodes: &[Node]) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  loop {
+    let mut complete = true;
+    for node in nodes {
+      match node
+        .handle
+        .members()
+        .list(radiata::PageSpec::first(64).unwrap())
+        .await
+      {
+        Ok(page) if page.items().len() >= nodes.len() => {}
+        _ => complete = false,
+      }
+    }
+    if complete {
+      return;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "every member's descriptor must reach every node's store"
+    );
+    for node in nodes {
+      let _ = node.handle.sync().await;
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+}
+
+/// A caller-named path is authoritative: it decides the route the policy
+/// would otherwise plan, and every hop follows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_caller_named_path_overrides_the_policy_and_delivers() {
+  init_tracing();
+  let (nodes, table) = boot_linear_four(true).await;
+
+  // The explicit lane's policy is made unusable for this destination: it
+  // plans a first hop that is not a live peer of the origin, so a
+  // policy-driven send fails at admission. The caller's path below names
+  // a usable route, which proves the caller's decision is the one taken.
+  {
+    let mut guard = table.lock().unwrap();
+    guard.insert(
+      format!("{}|{}", nodes[0].id().as_str(), nodes[3].id().as_str()),
+      nodes[3].id().as_str().to_owned(),
+    );
+  }
+
+  settle_linear_chain(&nodes).await;
+  wait_for_member_descriptors(&nodes).await;
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
+
+  // Without a caller path the policy's plan leaves along a node the origin
+  // holds no session with: the route fails at admission.
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Exact(nodes[3].id().clone()),
+      protocol.clone(),
+      policy.clone(),
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let error = packet.send_sync(vec_body(&[b"policy"])).await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
+
+  // A -> C -> D: C is a direct peer of A and D is the destination, so the
+  // path is admissible and the stream crosses both hops.
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Path {
+        destination: nodes[3].id().clone(),
+        path: vec![nodes[2].id().clone(), nodes[3].id().clone()],
+      },
+      protocol.clone(),
+      policy.clone(),
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let ack = packet
+    .send_sync(vec_body(&[b"caller", b"-path"]))
+    .await
+    .unwrap();
+  assert_eq!(ack.destination(), nodes[3].id());
+  wait_for(
+    || {
+      nodes[3]
+        .collector
+        .packets
+        .lock()
+        .unwrap()
+        .first()
+        .map(|(_, body)| body == &b"caller-path".to_vec())
+        .unwrap_or(false)
+    },
+    Duration::from_secs(30),
+    "the caller-named path must deliver the body",
+  )
+  .await;
+  // No intermediate consumer ran along the named path.
+  for node in &nodes[..3] {
+    assert!(node.collector.packets.lock().unwrap().is_empty());
+  }
+
+  // A three-hop caller path (B, C, D) is admissible too and delivers over
+  // the same chain.
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Path {
+        destination: nodes[3].id().clone(),
+        path: vec![
+          nodes[1].id().clone(),
+          nodes[2].id().clone(),
+          nodes[3].id().clone(),
+        ],
+      },
+      protocol,
+      policy,
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let ack = packet.send_sync(vec_body(&[b"three"])).await.unwrap();
+  assert_eq!(ack.destination(), nodes[3].id());
+  wait_for(
+    || {
+      nodes[3]
+        .collector
+        .packets
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body == &b"three".to_vec())
+    },
+    Duration::from_secs(30),
+    "the three-hop caller-named path must deliver the body",
+  )
+  .await;
+  for node in &nodes[..3] {
+    assert!(node.collector.packets.lock().unwrap().is_empty());
+  }
+
+  for node in &nodes {
+    let _ = node.handle.shutdown().await;
+  }
+}
+
+/// The hop budget counts relays, not path entries: the origin's dispatch
+/// consumes no budget and arrival is checked before it, so a path of
+/// `relays + 1` entries (the relays plus the destination) is exactly what
+/// a `max_hops = relays` budget carries. A one-relay caller-named path is
+/// therefore admissible under `StreamPolicy::direct(1)` and delivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_one_relay_caller_path_fits_a_one_hop_budget() {
+  init_tracing();
+  let (nodes, _table) = boot_linear_four(false).await;
+  settle_linear_chain(&nodes).await;
+  wait_for_member_descriptors(&nodes).await;
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+  // A -> C -> D: one relay, so the two-entry path fits `max_hops = 1`.
+  let packet = nodes[0]
+    .handle
+    .open_stream(
+      StreamTarget::Path {
+        destination: nodes[3].id().clone(),
+        path: vec![nodes[2].id().clone(), nodes[3].id().clone()],
+      },
+      protocol,
+      StreamPolicy::direct(1).unwrap(),
+      StreamMetadata::new(),
+    )
+    .unwrap();
+  let ack = packet.send_sync(vec_body(&[b"one-relay"])).await.unwrap();
+  assert_eq!(ack.destination(), nodes[3].id());
+  wait_for(
+    || {
+      nodes[3]
+        .collector
+        .packets
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body == &b"one-relay".to_vec())
+    },
+    Duration::from_secs(30),
+    "a one-relay caller path must fit a one-hop budget",
+  )
+  .await;
+  // No intermediate consumer ran along the named path.
+  for node in &nodes[..3] {
+    assert!(node.collector.packets.lock().unwrap().is_empty());
+  }
+
+  for node in &nodes {
+    let _ = node.handle.shutdown().await;
+  }
+}
+
+/// Caller-named paths are validated: shape errors fail synchronously at
+/// `open_stream`, and reachability errors fail typed at admission before
+/// any frame moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn invalid_caller_paths_are_rejected() {
+  init_tracing();
+  let (nodes, _table) = boot_linear_four(false).await;
+  settle_linear_chain(&nodes).await;
+  wait_for_member_descriptors(&nodes).await;
+
+  let protocol = ProtocolTag::parse(PROTOCOL_TAG).unwrap();
+  let destination = nodes[3].id().clone();
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap();
+  let open = |path: Vec<radiata::NodeId>, policy: StreamPolicy| {
+    nodes[0].handle.open_stream(
+      StreamTarget::Path {
+        destination: destination.clone(),
+        path,
+      },
+      protocol.clone(),
+      policy,
+      StreamMetadata::new(),
+    )
+  };
+
+  // A repeated node is not a route.
+  let error = open(
+    vec![
+      nodes[1].id().clone(),
+      nodes[1].id().clone(),
+      destination.clone(),
+    ],
+    policy.clone(),
+  )
+  .unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::InvalidInput);
+  // The path must end at the destination.
+  let error = open(vec![nodes[1].id().clone()], policy.clone()).unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::InvalidInput);
+  // The path is bounded by the caller's hop budget: the budget counts
+  // relays, so a two-relay path (three entries) needs `max_hops = 2`.
+  let error = open(
+    vec![
+      nodes[1].id().clone(),
+      nodes[2].id().clone(),
+      destination.clone(),
+    ],
+    StreamPolicy::direct(1).unwrap(),
+  )
+  .unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::ResourceExhausted);
+  // An empty path is not a route.
+  let error = open(Vec::new(), policy.clone()).unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
+  // A hop that is not a known member fails at admission.
+  let unknown = radiata::NodeId::parse("node-0000000000000000000zz").unwrap();
+  let packet = open(
+    vec![nodes[1].id().clone(), unknown, destination.clone()],
+    policy.clone(),
+  )
+  .unwrap();
+  let error = packet.send_sync(vec_body(&[b"unknown"])).await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
+
+  // A first hop without a live session fails at admission: the origin can
+  // only hand the frame to a node it holds a session with.
+  let packet = open(vec![destination.clone()], policy).unwrap();
+  let error = packet.send_sync(vec_body(&[b"direct"])).await.unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::RouteUnavailable);
+
+  // Nothing reached the destination.
+  assert!(nodes[3].collector.packets.lock().unwrap().is_empty());
 
   for node in &nodes {
     let _ = node.handle.shutdown().await;

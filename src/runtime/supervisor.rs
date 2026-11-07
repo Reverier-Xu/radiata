@@ -9,7 +9,7 @@ use tokio::{
 use super::{
   anti_entropy::spawn_sync_driver,
   packets::{PacketAdmission, PumpHandoff},
-  task_effects::{ConnectionTasks, track_connection_task},
+  shutdown::finish_shutdown,
   task_manager::{TaskManagerHandle, spawn_task_manager},
 };
 use crate::{
@@ -23,12 +23,12 @@ use crate::{
   protocol::offer::node_offer,
   provider::{KeyProvider, StorageFactory},
   routing::{RouteTable, outbound::run_outbound},
-  runtime::{Control, LifecycleSnapshot, RuntimeClient},
+  runtime::{Control, LeaveSignal, LifecycleSnapshot, RuntimeClient},
   session::{
     SessionDriver,
-    stream::{SessionPacketContext, SessionTable, run_session},
+    stream::{SessionPacketContext, SessionTable},
   },
-  transport::registry::{Transport, TransportListener, TransportTrust},
+  transport::registry::TransportListener,
 };
 
 /// Depth of the node's control channel, the API verbs' command queue:
@@ -43,18 +43,13 @@ use crate::{
 /// `ADMISSION_CONCURRENCY`. The shutdown path reuses it to pre-size the
 /// queued-reply drain, where it is a true bound: a closed bounded
 /// channel can hold no more queued messages than its capacity.
-const CONTROL_CAPACITY: usize = 32;
+pub(super) const CONTROL_CAPACITY: usize = 32;
 
-/// The bounded cooperative window the drained connection tasks get at
-/// shutdown before only the stragglers are aborted: the graceful
-/// signal was already broadcast, so an in-flight consumer drain (a
-/// fully received control payload mid persist-and-emit) completes
-/// instead of being aborted mid-apply, while a task that never settles
-/// can hold the shutdown reply no longer than this bound. Handles
-/// already aborted upstream (the anti-entropy driver, the tick
-/// workers, the accept loops) resolve immediately, so a quiet node's
-/// shutdown stays as prompt as before.
-const CONNECTION_TASK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// The leave plane's signal depth: one leave per incarnation, and the
+/// first signal is the one that decides the shutdown reason, so a
+/// capacity of one parks nothing and refuses only a signal the loop is
+/// already tearing down on.
+const LEAVE_SIGNAL_CAPACITY: usize = 1;
 
 /// Depth of the bounded channel for immediate sync-round requests
 /// forwarded to the sync driver (the cursor owner): the only writer is
@@ -80,8 +75,8 @@ pub(crate) const SYNC_ROUND_CHANNEL_CAPACITY: usize = 8;
 /// outrun this depth.
 pub(crate) const PACKET_CHANNEL_CAPACITY: usize = CONTROL_CAPACITY;
 
-/// The bound on simultaneously running packet admission tasks (audit
-/// 2026-10-23 P1-5): each admission may await a caller-supplied routing
+/// The bound on simultaneously running packet admission tasks: each
+/// admission may await a caller-supplied routing
 /// policy, so this bounds how many such waits are in flight. A
 /// saturated pool disables the control loop's packet arm instead of
 /// blocking the loop, and the bounded packet command channel carries the
@@ -105,7 +100,7 @@ pub(crate) const ADMISSION_CONCURRENCY: usize = 4;
 /// and reject its request with the typed shutdown kind.
 const PUMP_HANDOFF_CAPACITY: usize = ADMISSION_CONCURRENCY;
 
-// The capacity constants' joint relations (audit follow-up B4), pinned
+// The capacity constants' joint relations, pinned
 // at compile time so a violation fails any build: the pump handoff
 // queue must fit every handoff one fully parallel admission window can
 // produce (each permit holder writes at most one handoff, and only the
@@ -132,24 +127,24 @@ pub(crate) type ListenerEntry = (Endpoint, std::sync::Arc<dyn TransportListener>
 pub(crate) type ListenerRegistry =
   Arc<std::sync::Mutex<BTreeMap<crate::identity::ListenerId, ListenerEntry>>>;
 
-struct LifecyclePublisher {
+pub(super) struct LifecyclePublisher {
   state: watch::Sender<LifecycleSnapshot>,
   terminal: bool,
 }
 
 impl LifecyclePublisher {
-  fn new(state: watch::Sender<LifecycleSnapshot>) -> Self {
+  pub(super) fn new(state: watch::Sender<LifecycleSnapshot>) -> Self {
     Self {
       state,
       terminal: false,
     }
   }
 
-  fn publish(&self, snapshot: LifecycleSnapshot) {
+  pub(super) fn publish(&self, snapshot: LifecycleSnapshot) {
     self.state.send_replace(snapshot);
   }
 
-  fn stop(&mut self, reason: ShutdownReason) {
+  pub(super) fn stop(&mut self, reason: ShutdownReason) {
     self.publish(LifecycleSnapshot::stopped(reason));
     self.terminal = true;
   }
@@ -276,7 +271,7 @@ pub(crate) async fn spawn_runtime(
   // shared plane behind it (the anti-entropy driver ticks the same
   // plane once the supervisor spawns it). The plane and the packet
   // context the operation handles build share one authorization
-  // boundary (audit 2026-10-23, P1-11), so a sync-delivered revocation
+  // boundary, so a sync-delivered revocation
   // tombstone and a finishing handshake's publication serialize
   // exactly like the local revoke effect does.
   let authorization = crate::session::stream::AuthorizationBoundary::default();
@@ -303,9 +298,10 @@ pub(crate) async fn spawn_runtime(
   // runtime is marked ready (the core protocols above joined the feature
   // set): a provisioning failure (a caller-required feature outside the
   // registry) is a typed start() error, never a running node that
-  // silently stopped.
-  let mut definitions = crate::protocol::feature::builtin_definitions()?;
-  definitions.extend(dependencies.extensions.feature_definitions());
+  // silently stopped. The registry holds exactly the definitions installed
+  // by `ExtensionRegistry::register_default` plus every caller
+  // registration; there is no hidden official fallback.
+  let definitions = dependencies.extensions.feature_definitions();
   // The merged registry is shared with the session driver (Arc): the same
   // set that built the node offer drives every handshake selection, so
   // caller-registered features survive into the negotiated intersection.
@@ -318,6 +314,11 @@ pub(crate) async fn spawn_runtime(
   let (state_tx, state_rx) = watch::channel(LifecycleSnapshot::starting());
   let (ready_tx, ready_rx) = oneshot::channel();
   let (packet_tx, packet_rx) = packets;
+  // The leave plane's signal to the control loop: the task manager sends
+  // the success, and the leave effect itself sends the fatal failure of a
+  // teardown that already began (see `LeaveSignal`). The effect's half
+  // rides the operation planes, so it is created before them.
+  let (leave_signal, leave_signals) = mpsc::channel(LEAVE_SIGNAL_CAPACITY);
   // The node-shared operation handles are built here rather than inside
   // the supervisor: the supervisor's own fields, the verb effects, and
   // every node handle must read the same session driver (one credential
@@ -328,18 +329,18 @@ pub(crate) async fn spawn_runtime(
     offer,
     registry,
     authorization,
+    leave_signal.clone(),
   )?;
   dependencies.operations = Some(Arc::clone(&operations));
   // The task manager is spawned here, beside the supervisor and before the
   // node is marked running: the client side rides the node handle (so an
   // admitted task always has a live manager) and the teardown handle rides
   // the runtime dependencies (so the shutdown path drains it in order).
-  let (leave_complete, leave_signals) = mpsc::channel(1);
   let (task_client, task_manager) = spawn_task_manager(super::task_manager::TaskManagerDeps {
     entropy: dependencies.entropy.clone(),
     clock: Arc::new(crate::time::HostWallClock),
     operations,
-    leave_complete,
+    leave_signal,
   })?;
   dependencies.task_manager = Some(task_manager);
   let client = RuntimeClient::new(
@@ -356,7 +357,7 @@ pub(crate) async fn spawn_runtime(
     sync_rounds,
     RuntimeSignals {
       control: control_rx,
-      leave_complete: leave_signals,
+      leave_signal: leave_signals,
       state: state_tx,
       ready: ready_tx,
     },
@@ -372,8 +373,8 @@ pub(crate) async fn spawn_runtime(
 /// transpose two same-typed channels.
 struct RuntimeSignals {
   control: mpsc::Receiver<Control>,
-  /// The task manager's leave-completion signal (see `finish_shutdown`).
-  leave_complete: mpsc::Receiver<()>,
+  /// The leave plane's signal (see [`LeaveSignal`] and `finish_shutdown`).
+  leave_signal: mpsc::Receiver<LeaveSignal>,
   state: watch::Sender<LifecycleSnapshot>,
   ready: oneshot::Sender<()>,
 }
@@ -399,7 +400,7 @@ async fn supervise(
 ) {
   let RuntimeSignals {
     mut control,
-    mut leave_complete,
+    mut leave_signal,
     state,
     ready,
   } = signals;
@@ -469,7 +470,7 @@ async fn supervise(
   let terminal = run_control_loop(
     &mut supervisor,
     &mut control,
-    &mut leave_complete,
+    &mut leave_signal,
     &mut packet_rx,
     &mut tasks,
   )
@@ -518,12 +519,12 @@ async fn terminate_stale_traces(supervisor: &Supervisor) {
   }
 }
 
-/// Spawns the periodic planes OFF the select loop (audit 2026-10-09 item 3):
+/// Spawns the periodic planes OFF the select loop:
 /// one long-lived recovery-observation worker (recovery tick plus the three
 /// retention sweeps) and one degree-maintenance worker, each owning its own
-/// timer, so slow storage or a slow policy no longer parks control-plane
-/// reads and packet admission behind a tick. Bounded accounting (audit item
-/// 4's lesson): exactly two tasks for the node's lifetime, aborted and
+/// timer, so slow storage or a slow policy never parks control-plane
+/// reads and packet admission behind a tick. Bounded accounting: exactly
+/// two tasks for the node's lifetime, aborted and
 /// awaited by the shutdown path — never one spawned task per tick.
 fn spawn_tick_workers(supervisor: &Supervisor) -> Result<Vec<tokio::task::JoinHandle<()>>> {
   let ticks = std::sync::Arc::new(supervisor.tick_state()?);
@@ -542,10 +543,10 @@ fn spawn_tick_workers(supervisor: &Supervisor) -> Result<Vec<tokio::task::JoinHa
 /// loop's own state machine, not the supervisor's.
 async fn run_control_loop(
   supervisor: &mut Supervisor, control: &mut mpsc::Receiver<Control>,
-  leave_complete: &mut mpsc::Receiver<()>,
+  leave_signal: &mut mpsc::Receiver<LeaveSignal>,
   packet_rx: &mut mpsc::Receiver<crate::packet::OutboundRequest>, tasks: &mut JoinSet<()>,
 ) -> TerminalPhase {
-  // The packet admission plane (audit 2026-10-23 P1-5): target
+  // The packet admission plane: target
   // resolution, descriptor validation, first-hop selection, and the route
   // record run in spawned admission tasks, never inline here — a
   // caller-supplied policy that never resolves parks one bounded
@@ -565,11 +566,12 @@ async fn run_control_loop(
   let (pump_tx, mut pump_rx) = mpsc::channel::<PumpHandoff>(PUMP_HANDOFF_CAPACITY);
   let mut pump_open = true;
   let mut packets_open = true;
-  // The leave effect's completion signal: once it lands, the caller has
-  // already observed the task's terminal outcome (the publication precedes
-  // the signal) and the node tears down with the active-leave reason. A
-  // closed channel means the manager (the sender's only owner) is gone, so
-  // the arm is disabled rather than polled again.
+  // The leave plane's signal: the success tears down with the
+  // active-leave reason, and a failure after the leave's teardown began
+  // tears down with the failure's kind — the node cannot keep running
+  // once its listeners and sessions are down. A closed channel means
+  // every sender (the manager and the operation planes) is gone, so the
+  // arm is disabled rather than polled again.
   let mut leave_signals_open = true;
   loop {
     // Fill the packet arm's admission slot without awaiting: a saturated
@@ -624,11 +626,17 @@ async fn run_control_loop(
         pump_outbound(supervisor, tasks, handoff);
       }
       finished = tasks.join_next(), if !tasks.is_empty() => reap_packet_task(finished),
-      signal = leave_complete.recv(), if leave_signals_open => {
+      signal = leave_signal.recv(), if leave_signals_open => {
         match signal {
-          Some(()) => {
+          Some(LeaveSignal::Complete) => {
             return TerminalPhase {
               reason: ShutdownReason::ActiveLeave,
+              first_reply: None,
+            };
+          }
+          Some(LeaveSignal::Fatal(kind)) => {
+            return TerminalPhase {
+              reason: ShutdownReason::Fatal(kind),
               first_reply: None,
             };
           }
@@ -698,6 +706,10 @@ async fn serve_control_command(
       let result = supervisor.page_resources(cursor, limit).await;
       let _ = reply.send(result);
     }
+    Control::WatchResources { from, reply } => {
+      let result = supervisor.watch_resources(from).await;
+      let _ = reply.send(result);
+    }
     Control::PageListeners {
       cursor,
       limit,
@@ -752,20 +764,23 @@ fn admit_packet(
 ) {
   // The identity context (and the store handle it carries) is cloned per
   // admission and lives only inside the admission task: a long-lived clone
-  // here would survive the shutdown path's storage drain (audit 2026-10-23
-  // P1-10).
+  // here would survive the shutdown path's storage drain.
   let Some(context) = supervisor.dependencies.context.clone() else {
     request.reject(crate::ErrorKind::Internal);
     return;
   };
   let admission = admission.clone();
   let pump = pump_tx.clone();
+  // The packet context is cloned per admission for the local delivery leg;
+  // the trace sink it carries holds the identity context only weakly, so
+  // the clone never outlives the shutdown path's storage drain.
+  let packet = Arc::clone(&supervisor.packet);
   tasks.spawn(async move {
     // The permit is the admission slot and lives as long as the resolution
     // work, so `ADMISSION_CONCURRENCY` bounds the in-flight admissions
     // regardless of what a policy awaits.
     let _permit = permit;
-    match admission.admit(&context, request).await {
+    match admission.admit(&context, &packet, request).await {
       // The recorded route returns to the loop, which owns the pump
       // `JoinSet` and spawns `run_outbound`.
       Ok(Some(handoff)) => {
@@ -783,128 +798,42 @@ fn admit_packet(
   });
 }
 
-/// Spawns the outbound pump for one admitted packet: the route record already
-/// landed in the admission task (record-before-pump), so the pump only runs
-/// the request under the loop's task set. Core-internal control traffic stays
-/// out of the durable trace store — its volume is a runtime implementation
-/// detail, not caller evidence — so the pump holds no sink for it, and the
-/// record flag carries the same exclusion to the read loop's late-failure
-/// revision path.
+/// Spawns the pump for one admitted packet: the route record already landed
+/// in the admission task (record-before-pump), so the pump only runs the
+/// request under the loop's task set. The handoff's delivery leg decides
+/// where the frames go: a session leg rides the outbound session pump; the
+/// local leg admits and consumes the stream in-process.
 fn pump_outbound(supervisor: &Supervisor, tasks: &mut JoinSet<()>, handoff: PumpHandoff) {
   let local = supervisor.packet.local().clone();
   let routes = supervisor.dependencies.routes.clone();
   let events = Arc::clone(&supervisor.dependencies.events);
-  let trace = if handoff.request.internal {
+  let PumpHandoff {
+    leg,
+    request,
+    route,
+  } = handoff;
+  // Core-internal control traffic stays out of the durable trace store —
+  // its volume is a runtime implementation detail, not caller evidence —
+  // so the pump holds no sink for it, and the record flag carries the same
+  // exclusion to the read loop's late-failure revision path.
+  let trace = if request.internal {
     None
   } else {
     Some(supervisor.trace_sink.clone())
   };
   tasks.spawn(async move {
-    run_outbound(
-      handoff.entry,
-      local,
-      handoff.request,
-      routes,
-      handoff.force_routed,
-      trace,
-      events,
-    )
-    .await;
+    run_outbound(leg, local, request, routes, route, trace, events).await;
   });
 }
 
 /// Reaps one finished packet task (an admission or its pump) as it completes
-/// instead of letting its handle accumulate in the task set until shutdown
-/// (audit 2026-10-09, item 4): the set stays bounded by the live
+/// instead of letting its handle accumulate in the task set until shutdown:
+/// the set stays bounded by the live
 /// admission-plus-pump count, and a join error (a panicked or aborted task)
 /// stays visible as a diagnostic.
 fn reap_packet_task(finished: Option<std::result::Result<(), tokio::task::JoinError>>) {
   if let Some(Err(error)) = finished {
     tracing::warn!(%error, "packet task exited abnormally");
-  }
-}
-
-/// The shutdown sequence shared by the explicit, fatal, and active-leave
-/// exits: the control channel closes, the task manager drains (the
-/// journaled kinds run to their terminal phase), the runtime's own task
-/// set tears down, and every queued shutdown reply answers with the one
-/// reason.
-async fn finish_shutdown(
-  mut control: mpsc::Receiver<Control>, mut tasks: JoinSet<()>,
-  mut dependencies: RuntimeDependencies, drained: Vec<tokio::task::JoinHandle<()>>,
-  lifecycle: &mut LifecyclePublisher, first_reply: Option<oneshot::Sender<ShutdownOutcome>>,
-  reason: ShutdownReason,
-) {
-  lifecycle.publish(LifecycleSnapshot::shutting_down());
-  control.close();
-
-  // The task manager goes first: it stops admitting, releases every
-  // cancellable effect, and awaits the journaled kinds (leave,
-  // frozen-journal resolution) to their terminal phase. Only then does the
-  // node's own task set shut down — the effects still need the storage and
-  // session machinery this teardown releases.
-  if let Some(manager) = dependencies.task_manager.take() {
-    manager.begin_shutdown();
-    manager.drain().await;
-  }
-
-  let mut queued_replies = Vec::with_capacity(CONTROL_CAPACITY);
-  while let Ok(Control::Shutdown { reply }) = control.try_recv() {
-    queued_replies.push(reply);
-  }
-  tasks.shutdown().await;
-  // Drain the returned task teardown so every storage capture is dropped
-  // before the shutdown reply returns (a restarted node on the same
-  // factory must not race the release). The handles aborted upstream (the
-  // anti-entropy driver, the tick workers, the accept loops) resolve
-  // immediately; the live connection tasks get one shared, bounded
-  // cooperative window — the graceful signal was already broadcast — so
-  // an in-flight consumer drain finishes its apply, and only a task still
-  // unfinished at the window's edge is aborted and reaped: a wedged task
-  // can never hang the reply past the bound.
-  let deadline = tokio::time::Instant::now() + CONNECTION_TASK_SHUTDOWN_GRACE;
-  for mut handle in drained {
-    if tokio::time::timeout_at(deadline, &mut handle)
-      .await
-      .is_err()
-    {
-      // Straggler: abort it, then reap the aborted join so its captures
-      // still drop before the reply. (A handle that settled inside the
-      // window was already joined by the timed poll — re-polling a
-      // completed `JoinHandle` panics, so only this arm awaits again.)
-      handle.abort();
-      let _ = handle.await;
-    }
-  }
-  // The storage execution completion barrier (audit 2026-10-23 P1-10):
-  // every runtime plane is torn down above, so no new execution can
-  // start; the storage flush now resolves only when every detached
-  // execution the node spawned has ended (committed, failed, or rolled
-  // back) and every snapshot execution has released its handle — commit
-  // and read alike — so the shutdown reply returns only once no
-  // in-flight execution still holds the database (the snapshot half is
-  // audit 2026-10-27 B3: a still-live read pinned the file lock past
-  // the reply and restarts raced it). Like the task manager's journaled
-  // drain, the wait is deliberately unbounded: it awaits durability
-  // obligations, not cancellable effects. A flush failure is diagnosed
-  // and teardown continues, because the reply itself must still answer.
-  if let Some(context) = dependencies.context.as_ref()
-    && let Err(error) = context.store().provider().flush().await
-  {
-    tracing::warn!(
-      kind = ?error.kind(),
-      "storage execution completion barrier failed at shutdown"
-    );
-  }
-  drop(control);
-  drop(dependencies);
-
-  lifecycle.stop(reason);
-  if let Some(reply) = first_reply {
-    let _ = reply.send(ShutdownOutcome::new(reason));
-  }
-  for reply in queued_replies {
-    let _ = reply.send(ShutdownOutcome::new(reason));
   }
 }
 
@@ -937,7 +866,7 @@ pub(super) struct Supervisor {
   // The two periodic-plane workers (recovery observation with the
   // retention sweeps, degree maintenance): spawned once by `supervise`,
   // aborted and awaited by `into_dependencies` — a fixed two-handle
-  // population, never one task per tick (audit 2026-10-09 items 3–4).
+  // population, never one task per tick.
   pub(super) tick_workers: Vec<tokio::task::JoinHandle<()>>,
   pub(super) trace_sink: crate::routing::trace::TraceSink,
   // Approximate live durable trace-record population, shared with the
@@ -948,9 +877,9 @@ pub(super) struct Supervisor {
 
 /// The periodic planes' shared state: everything the recovery-observation
 /// worker (`recovery_tick` plus the three retention sweeps) and the
-/// degree-maintenance worker need to run OFF the supervisor's select loop
-/// (audit 2026-10-09 item 3: slow storage or a slow policy resolution must
-/// never park control-plane reads and packet admission behind a tick).
+/// degree-maintenance worker need to run OFF the supervisor's select loop,
+/// because slow storage or a slow policy resolution must
+/// never park control-plane reads and packet admission behind a tick.
 /// Built once per incarnation by [`Supervisor::tick_state`] from the same
 /// Arc-held collaborators the supervisor reads, so the workers observe the
 /// one truth per field — no second controller, cache, or session table.
@@ -991,7 +920,7 @@ pub(super) struct TickState {
   pub(super) endpoint_attempts: std::sync::Mutex<std::collections::BTreeMap<NodeId, u64>>,
   /// The bridge-probe cadence bracket: maintenance ticks an otherwise
   /// quiescent healthy node waits before its next cross-partition probe
-  /// dial (audit finding #1's residual boundary — see `runtime/degree.rs`).
+  /// dial (the plane's residual boundary — see `runtime/degree.rs`).
   /// Only the maintenance worker mutates it, so a racing read at worst
   /// shifts one probe by one tick.
   pub(super) bridge_probe_ticks: Arc<std::sync::atomic::AtomicU32>,
@@ -1026,11 +955,12 @@ fn session_packet_context(
   // The effective route policy: the caller selection, or the built-in
   // default policy tag (registered by the builder out of the box).
   let route_policy = dependencies.config.route_policy()?;
+  let trace_metadata_active = dependencies.config.trace_metadata_limits().active();
   // The durable trace sink is born with the packet context it serves (one
   // construction site): the origin pump's terminal facts and the read
   // loop's late-failure revisions share one bounded queue and one
   // live-record counter with the retention sweep and the observability
-  // view (remaining items 2026-10-10, P2-7).
+  // view.
   let trace_records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
   let trace_sink = crate::routing::trace::TraceSink::new(
     Arc::clone(context),
@@ -1050,8 +980,11 @@ fn session_packet_context(
     dependencies.sessions.clone(),
     dependencies.routes.clone(),
     Some(trace_sink),
-    crate::routing::forward::FORWARDING_ROUTE_CAPACITY_DEFAULT,
-    dependencies.config.trace_metadata_limits().active(),
+    // One configured bound for both in-memory route populations: the
+    // forwarding table and the terminal route records share the trace
+    // metadata budget the route table derives its capacity from.
+    trace_metadata_active,
+    trace_metadata_active,
     Arc::clone(&dependencies.connection_tasks),
     crate::protocol::CONTROL_CBOR_LIMITS,
     dependencies.config.relay_hop_deadline(),
@@ -1069,6 +1002,7 @@ pub(super) fn operation_deps(
   offer: crate::protocol::offer::FeatureOffer,
   features: std::sync::Arc<crate::protocol::feature::FeatureRegistry>,
   authorization: crate::session::stream::AuthorizationBoundary,
+  leave_signal: mpsc::Sender<LeaveSignal>,
 ) -> Result<Arc<super::task_effects::OperationDeps>> {
   let Some(context) = dependencies.context.clone() else {
     return Err(Error::internal("runtime context"));
@@ -1097,6 +1031,7 @@ pub(super) fn operation_deps(
     driver,
     packet,
     shutdown,
+    leave_signal,
   )?))
 }
 
@@ -1133,7 +1068,7 @@ impl Supervisor {
     // construction site) and is read back here: the origin pump's terminal
     // facts, the read loop's late-failure revisions, the retention sweep,
     // and the observability view all share the one bounded instance and
-    // its live-record counter (remaining items 2026-10-10, P2-7).
+    // its live-record counter.
     let Some(trace_sink) = packet.trace_sink().cloned() else {
       return Err(Box::new((Error::internal("trace sink"), dependencies)));
     };
@@ -1273,173 +1208,6 @@ impl Supervisor {
   }
 }
 
-/// Dials one transport connection under the configured dial deadline: the
-/// deadline bounds the whole connect (TCP dial, TLS handshake, and
-/// WebSocket upgrade), so a peer that accepts and then goes silent
-/// cannot stall the supervisor's control loop or hold a recovery slot
-/// forever. An elapsed deadline maps onto the same coarse typed
-/// transport-connect failure as any other dial error; the connect
-/// future is cancelled, so the deadline and endpoint are the only real
-/// cause a diagnostic can carry.
-pub(super) async fn connect_with_deadline(
-  transport: &Arc<dyn Transport>, receiver: Endpoint, trust: TransportTrust,
-  deadline: std::time::Duration,
-) -> Result<crate::transport::connection::Connection> {
-  match tokio::time::timeout(deadline, transport.connect(receiver.clone(), trust)).await {
-    Ok(result) => result,
-    Err(_) => {
-      tracing::debug!(
-        endpoint = %receiver.as_str(),
-        deadline = ?deadline,
-        "transport dial deadline elapsed"
-      );
-      Err(Error::provider(
-        crate::ProviderErrorKind::Io,
-        crate::ProviderErrorContext::TransportConnect,
-      ))
-    }
-  }
-}
-
-/// Runs one member-mode dial against an already-admitted peer: the
-/// member-mode handshake proves both identities over a fresh transcript
-/// and exporter binding, then the session is kept open for packet streams.
-/// Called by `connect_member` and by the recovery controller's detached
-/// dial tasks. The dial deadline travels with the call so a detached
-/// recovery dial releases its in-flight slot within the bound. The kept
-/// session pump joins the node's tracked connection tasks through the
-/// same registration the join effect uses, so the recovery tick reaps
-/// it and the shutdown path owns it.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn dial_member(
-  transport: Arc<dyn Transport>, driver: SessionDriver,
-  sessions: crate::session::stream::SessionTable, packet: Arc<SessionPacketContext>,
-  shutdown: watch::Receiver<()>, connection_tasks: ConnectionTasks, receiver: Endpoint,
-  peer: &NodeId, class: crate::session::stream::DialClass, dial_deadline: std::time::Duration,
-) -> Result<NodeId> {
-  let recovery = class == crate::session::stream::DialClass::Recovery;
-  crate::audit::dial_started(peer.as_str(), recovery);
-  let result = async {
-    // A member dial carries the same trust intent as a join dial: the
-    // endpoint's transport class decides it, and the member handshake's
-    // identity proof authenticates the peer over the fresh channel
-    // binding.
-    let trust = TransportTrust::for_dial(&receiver.selector());
-    let mut connection =
-      connect_with_deadline(&transport, receiver.clone(), trust, dial_deadline).await?;
-    let session = driver.initiate_member(&mut connection, peer).await?;
-    let authenticated = session.peer().clone();
-    // The member-mode dial returns only after the session table settles, so
-    // the caller's first packet cannot race registration (including the
-    // crossed-dial loser outcome, which reports no usable session).
-    let tracked_tasks = Arc::clone(&connection_tasks);
-    keep_outbound_session(
-      connection,
-      session,
-      packet,
-      sessions,
-      shutdown,
-      receiver.clone(),
-      class,
-      |session_task| track_connection_task(&tracked_tasks, session_task),
-    )
-    .await?;
-    Ok(authenticated)
-  }
-  .await;
-  crate::audit::dial_settled(peer.as_str(), recovery, result.is_ok());
-  result
-}
-
-/// The keep-open tail shared by join and member dials: spawns the
-/// outbound session pump through the caller's spawner and returns only
-/// after the session table registers the entry, so the caller's first
-/// packet cannot race registration.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn keep_outbound_session(
-  connection: crate::transport::connection::Connection,
-  session: crate::session::EstablishedSession, packet: Arc<SessionPacketContext>,
-  sessions: SessionTable, shutdown: watch::Receiver<()>, attachment: Endpoint,
-  class: crate::session::stream::DialClass,
-  spawn: impl FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
-) -> Result<()> {
-  let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
-  spawn(Box::pin(run_session(
-    connection,
-    session,
-    packet,
-    sessions,
-    shutdown,
-    crate::session::stream::DialDirection::Outgoing,
-    attachment,
-    Some(registered_tx),
-    class,
-  )));
-  if registered_rx.await.is_err() {
-    return Err(Error::internal("session registration"));
-  }
-  Ok(())
-}
-
-#[cfg(test)]
-mod dial_deadline_tests {
-  use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-  };
-
-  use super::connect_with_deadline;
-  use crate::{
-    Endpoint, ErrorKind,
-    transport::{registry::TransportTrust, wss::WssTransport},
-  };
-
-  /// A peer that accepts TCP and then goes silent must surface the typed
-  /// dial failure within the configured deadline instead of hanging the
-  /// dialer. This exercises the one helper every production dial path
-  /// shares (`reconcile_join`, and `reconcile_connect` plus the detached
-  /// recovery and connection-degree dials through `dial_member`); the
-  /// regression it guards is a connect with no bound at all, which
-  /// stalled the supervisor's control loop and pinned recovery slots
-  /// forever.
-  #[tokio::test]
-  async fn a_silent_peer_fails_the_dial_within_the_deadline() {
-    // The listener accepts and then holds the socket without ever
-    // speaking TLS: the TCP connect succeeds, then the handshake stalls
-    // on a socket that never answers. Holding it open matters — an
-    // early drop would reset the connection, let the TLS handshake fail
-    // fast, and bypass the timeout path under test.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let holder = tokio::spawn(async move {
-      let (_held, _) = listener.accept().await.unwrap();
-      tokio::time::sleep(Duration::from_secs(30)).await;
-    });
-
-    let transport: Arc<dyn crate::transport::registry::Transport> = Arc::new(WssTransport::new());
-    let endpoint = Endpoint::parse(&format!("wss://127.0.0.1:{}", address.port())).unwrap();
-    let deadline = Duration::from_millis(100);
-    let started = Instant::now();
-    let error = connect_with_deadline(&transport, endpoint, TransportTrust::Merge, deadline)
-      .await
-      .unwrap_err();
-    let elapsed = started.elapsed();
-
-    // The same coarse typed classification as any other dial failure.
-    assert_eq!(error.kind(), ErrorKind::Io);
-    assert_eq!(error.context(), "transport connect");
-    // The failure lands on the deadline, not instantaneously (an early
-    // socket error) and not at the unbounded OS connect timeout.
-    assert!(elapsed >= deadline);
-    assert!(
-      elapsed < Duration::from_secs(5),
-      "the dial took {elapsed:?}"
-    );
-
-    holder.abort();
-  }
-}
-
 #[cfg(test)]
 mod receipt_retention_sweep_tests {
   use std::{sync::Arc, time::Duration};
@@ -1482,8 +1250,9 @@ mod receipt_retention_sweep_tests {
         .unwrap(),
     );
     let config = NodeConfig::new().with_receipt_retention(retention).unwrap();
-    let mut definitions = feature::builtin_definitions().unwrap();
-    definitions.extend(ExtensionRegistry::new().feature_definitions());
+    let mut extensions = ExtensionRegistry::new();
+    extensions.register_default().unwrap();
+    let definitions = extensions.feature_definitions();
     let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
     let offer = node_offer(&registry, config.required_features()).unwrap();
     let (round_tx, round_rx) = mpsc::channel(super::SYNC_ROUND_CHANNEL_CAPACITY);
@@ -1495,7 +1264,7 @@ mod receipt_retention_sweep_tests {
       keys: Some(keys),
       config,
       entropy: entropy.clone(),
-      extensions: Arc::new(ExtensionRegistry::new()),
+      extensions: Arc::new(extensions),
       sessions: Default::default(),
       routes: Default::default(),
       events: Arc::new(crate::node::EventHub::new()),
@@ -1512,12 +1281,14 @@ mod receipt_retention_sweep_tests {
     // The operation handles are built the way `spawn_runtime` builds them,
     // so the test drives the exact production construction path for the
     // packet context and the session driver too.
+    let (leave_signal, _leave_signals) = mpsc::channel(super::LEAVE_SIGNAL_CAPACITY);
     let operations = super::operation_deps(
       &dependencies,
       packet_tx.clone(),
       offer,
       registry,
       crate::session::stream::AuthorizationBoundary::default(),
+      leave_signal,
     )
     .expect("operation handles");
     dependencies.operations = Some(operations);
@@ -1577,8 +1348,8 @@ mod receipt_retention_sweep_tests {
       .apply_receipt_retention()
       .await
       .unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining());
 
     // Anchor one committed receipt and let its deadline elapse.
     let receipt = commit_one(&supervisor, entropy.as_ref(), b"first").await;
@@ -1604,8 +1375,8 @@ mod receipt_retention_sweep_tests {
       .apply_receipt_retention()
       .await
       .unwrap();
-    assert_eq!(report.forgotten, 1);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 1);
+    assert!(!report.remaining());
     // A forgotten receipt never grows a second anchor.
     assert!(
       !anchor_receipt(
@@ -1650,16 +1421,16 @@ mod receipt_retention_sweep_tests {
       .apply_receipt_retention()
       .await
       .unwrap();
-    assert_eq!(report.forgotten, 0);
-    assert!(!report.remaining);
+    assert_eq!(report.forgotten(), 0);
+    assert!(!report.remaining());
   }
 
   /// The retention tick holds the same quietness contract as the
   /// reconcile tick's quiescence probe: a fresh single node that just
   /// completed its identity ceremony leaves no retention candidate and
   /// no anchor behind, so repeated retention sweeps find nothing and the
-  /// store's commit count does not grow (regression: the ceremony's
-  /// leftover retention candidate made the first tick commit the anchor
+  /// store's commit count does not grow (a leftover ceremony retention
+  /// candidate would make the first tick commit the anchor
   /// and the candidate consumption as two background writes, drifting
   /// commit-count pins and racing conditional commits on CI).
   #[tokio::test]
@@ -1705,16 +1476,16 @@ mod shutdown_drain_tests {
     task::JoinSet,
   };
 
-  use super::{
-    CONNECTION_TASK_SHUTDOWN_GRACE, CONTROL_CAPACITY, LifecyclePublisher, finish_shutdown,
-    test_support,
-  };
+  use super::{CONTROL_CAPACITY, LifecyclePublisher, test_support};
   use crate::{
     BoxFuture, CommitOutcome, Digest, ReconcileOutcome, ShutdownReason, StoreCapabilities,
     StoreRequirements, StoreTransaction, TransactionId,
     extension::StoreSnapshot,
     provider::{Storage, StorageFactory},
-    runtime::LifecycleSnapshot,
+    runtime::{
+      LifecycleSnapshot,
+      shutdown::{CONNECTION_TASK_SHUTDOWN_GRACE, finish_shutdown},
+    },
     storage::contract::ReferenceFactory,
   };
 
@@ -1793,8 +1564,8 @@ mod shutdown_drain_tests {
   /// of being aborted mid-apply: the tracked drain task is handed out
   /// live by `into_dependencies`, and `finish_shutdown`'s cooperative
   /// window outlasts the apply's settle (the `ConsumerDrainGuard`
-  /// contract in `session::inbound`). Under the old abort-everything
-  /// teardown the parked apply dies with the node and the flag stays
+  /// contract in `session::inbound`). An abort-everything
+  /// teardown would kill the parked apply with the node and leave the flag
   /// false.
   #[tokio::test(start_paused = true)]
   async fn shutdown_completes_an_in_flight_consumer_drain_apply() {
@@ -1913,12 +1684,12 @@ mod shutdown_drain_tests {
     );
   }
 
-  /// `finish_shutdown` provides the storage execution completion barrier
-  /// (audit 2026-10-23 P1-10): the shutdown reply must not return while
+  /// `finish_shutdown` provides the storage execution completion barrier:
+  /// the shutdown reply must not return while
   /// the node's storage still has an in-flight execution — represented
   /// here by a flush that parks on a gate — and must return promptly
-  /// once the barrier resolves. Under the old immediate-return flush the
-  /// reply would land while the "execution" still holds the database.
+  /// once the barrier resolves. An immediate-return flush would land the
+  /// reply while the "execution" still holds the database.
   #[tokio::test]
   async fn shutdown_awaits_the_storage_execution_completion_barrier() {
     let (reference, config) = test_support::reference_and_config();
@@ -1972,7 +1743,7 @@ mod shutdown_drain_tests {
   }
 }
 
-/// The control-loop admission contract (audit 2026-10-23 P1-5): a
+/// The control-loop admission contract: a
 /// caller-supplied next-hop policy that never resolves may park only one
 /// bounded admission slot. Control reads, another packet's admission,
 /// and shutdown all complete inside their bounds while that admission
@@ -1993,8 +1764,8 @@ mod admission_loop_tests {
   use tokio::sync::{mpsc, oneshot, watch};
 
   use super::{
-    ADMISSION_CONCURRENCY, CONTROL_CAPACITY, Control, LifecycleSnapshot, RuntimeSignals,
-    ShutdownReason, supervise,
+    ADMISSION_CONCURRENCY, CONTROL_CAPACITY, Control, LeaveSignal, LifecycleSnapshot,
+    RuntimeSignals, ShutdownReason, supervise,
     test_support::{self, RuntimeFixture},
   };
   use crate::{
@@ -2019,7 +1790,7 @@ mod admission_loop_tests {
   }
 
   impl RouteNextHop for PendingNextHop {
-    fn next_hop<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<NodeId>> {
+    fn plan<'a>(&'a self, _view: NextHopView<'a>) -> BoxFuture<'a, Result<Option<Vec<NodeId>>>> {
       self.calls.fetch_add(1, Ordering::Relaxed);
       Box::pin(std::future::pending())
     }
@@ -2034,10 +1805,18 @@ mod admission_loop_tests {
   fn probe_request(
     trace_id: TraceId, target: StreamTarget,
   ) -> (OutboundRequest, oneshot::Receiver<RoutedAckOutcome>) {
+    probe_request_with_policy(trace_id, target, crate::RoutingPolicy::DIRECT)
+  }
+
+  /// The same probe under an explicit stream routing policy.
+  fn probe_request_with_policy(
+    trace_id: TraceId, target: StreamTarget, routing_policy: crate::RoutingPolicy,
+  ) -> (OutboundRequest, oneshot::Receiver<RoutedAckOutcome>) {
     let (ack_notify, ack) = oneshot::channel();
     let request = OutboundRequest {
       trace_id,
       target,
+      routing_policy,
       load_balancer: None,
       max_hops: 1,
       protocol: crate::ProtocolTag::parse("radiata.woooo.tech/protocols/admission-probe").unwrap(),
@@ -2061,8 +1840,8 @@ mod admission_loop_tests {
     task: tokio::task::JoinHandle<()>,
     // A live node keeps both signal ends alive; the loop's leave and
     // lifecycle arms then stay armed exactly as in production.
-    _leave: mpsc::Sender<()>,
-    _state: watch::Receiver<LifecycleSnapshot>,
+    leave: mpsc::Sender<LeaveSignal>,
+    state: watch::Receiver<LifecycleSnapshot>,
   }
 
   /// Starts the real control loop over the fixture with the pending policy
@@ -2080,6 +1859,7 @@ mod admission_loop_tests {
       sync_rounds,
       entropy,
       sessions,
+      leave_signals,
     } = test_support::runtime_fixture_over(
       reference as Arc<dyn crate::provider::StorageFactory>,
       config,
@@ -2091,8 +1871,17 @@ mod admission_loop_tests {
     )
     .await;
     let routes = dependencies.routes.clone();
+    // The signal's sender is the one the leave effect itself holds, so the
+    // test drives the loop's arm through the production channel.
+    let leave = dependencies
+      .operations
+      .as_ref()
+      .expect("operation handles")
+      .planes()
+      .expect("planes")
+      .leave_signal
+      .clone();
     let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
-    let (leave_tx, leave_rx) = mpsc::channel(1);
     let (state_tx, state_rx) = watch::channel(LifecycleSnapshot::starting());
     let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(supervise(
@@ -2101,7 +1890,7 @@ mod admission_loop_tests {
       sync_rounds,
       RuntimeSignals {
         control: control_rx,
-        leave_complete: leave_rx,
+        leave_signal: leave_signals,
         state: state_tx,
         ready: ready_tx,
       },
@@ -2115,8 +1904,8 @@ mod admission_loop_tests {
       entropy,
       calls,
       task,
-      _leave: leave_tx,
-      _state: state_rx,
+      leave,
+      state: state_rx,
     }
   }
 
@@ -2156,6 +1945,32 @@ mod admission_loop_tests {
         .expect("recovery view");
     }
 
+    /// The leave plane's fatal signal must stop the node with the
+    /// failure's kind — never leave it `Running` after its teardown began.
+    async fn fatal_leave(self, kind: crate::ErrorKind) {
+      self
+        .leave
+        .send(LeaveSignal::Fatal(kind))
+        .await
+        .expect("leave channel");
+      let mut state = self.state.clone();
+      let reason = tokio::time::timeout(SHUTDOWN_BOX, async {
+        loop {
+          if let Some(reason) = state.borrow().reason() {
+            return reason;
+          }
+          state.changed().await.expect("lifecycle state");
+        }
+      })
+      .await
+      .expect("the fatal leave stops the node");
+      assert_eq!(reason, ShutdownReason::Fatal(kind));
+      tokio::time::timeout(SHUTDOWN_BOX, self.task)
+        .await
+        .expect("the control loop must exit")
+        .expect("the control loop must not panic");
+    }
+
     /// Shutdown must answer inside the shutdown bound and the loop must
     /// exit without panicking.
     async fn shutdown(self) {
@@ -2175,6 +1990,15 @@ mod admission_loop_tests {
         .expect("the control loop must exit")
         .expect("the control loop must not panic");
     }
+  }
+
+  /// A leave that failed after its network teardown began cannot leave the
+  /// node running: the leave plane's fatal signal drives the one shutdown
+  /// sequence with the failure's kind.
+  #[tokio::test]
+  async fn a_fatal_leave_signal_stops_the_node_with_the_failure_kind() {
+    let pending = start_pending_policy_loop().await;
+    pending.fatal_leave(crate::ErrorKind::Internal).await;
   }
 
   #[tokio::test]
@@ -2251,6 +2075,47 @@ mod admission_loop_tests {
     pending.read().await;
     pending.shutdown().await;
   }
+
+  /// A stream whose routing-policy tag names no registered policy fails
+  /// typed at admission: the sender observes the invalid-input kind and
+  /// the bounded route record ends failed with it, instead of the stream
+  /// silently routing direct.
+  #[tokio::test]
+  async fn an_unregistered_stream_routing_policy_fails_typed_at_admission() {
+    let pending = start_pending_policy_loop().await;
+    let unregistered = crate::RoutingPolicy::parse("example.com/route-policies/unregistered")
+      .expect("a canonical caller tag");
+    let trace_id = trace(7);
+    let (request, ack) = probe_request_with_policy(
+      trace_id.clone(),
+      StreamTarget::Exact(test_support::member_id(9)),
+      unregistered,
+    );
+    pending.packet.send(request).await.expect("packet channel");
+    let outcome = tokio::time::timeout(PROBE_BOX, ack)
+      .await
+      .expect("the admission must answer")
+      .expect("the admission ack channel");
+    assert_eq!(outcome.err(), Some(crate::ErrorKind::InvalidInput));
+    // The typed failure is also the route record's terminal state.
+    let state = pending
+      .routes
+      .lock()
+      .expect("route table")
+      .get(&trace_id)
+      .map(|record| record.state.clone());
+    assert_eq!(
+      state,
+      Some(crate::packet::RouteState::Failed(
+        crate::ErrorKind::InvalidInput
+      ))
+    );
+    // The pending next-hop policy the fixture registers is never reached:
+    // the stream policy resolves (and fails) first.
+    assert_eq!(pending.calls.load(Ordering::Relaxed), 0);
+
+    pending.shutdown().await;
+  }
 }
 
 /// The runtime's shared supervisor-unit-test fixture: builds a
@@ -2265,9 +2130,9 @@ pub(crate) mod test_support {
 
   use tokio::sync::{mpsc, watch};
 
-  use super::{RuntimeDependencies, Supervisor, node_offer};
+  use super::{LeaveSignal, RuntimeDependencies, Supervisor, node_offer};
   use crate::{
-    NodeConfig, TransportScheme,
+    NodeConfig,
     extension_registry::ExtensionRegistry,
     identity::{
       lifecycle::open_local_identity,
@@ -2277,7 +2142,6 @@ pub(crate) mod test_support {
     provider::StorageFactory,
     session::stream::SessionTable,
     storage::contract::{ReferenceFactory, required_capabilities},
-    transport::registry::builtin_transport_tag,
   };
 
   /// The fixture's runtime inputs: everything `spawn_runtime` hands the
@@ -2290,6 +2154,10 @@ pub(crate) mod test_support {
     pub(crate) sync_rounds: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
     pub(crate) entropy: Arc<dyn crate::api::Entropy>,
     pub(crate) sessions: SessionTable,
+    /// The leave plane's signal receiver: the production `supervise` loop
+    /// owns it, so a fixture that drives a real leave effect reads the
+    /// signal here.
+    pub(crate) leave_signals: mpsc::Receiver<LeaveSignal>,
   }
 
   /// Builds the runtime dependencies over a fresh in-memory identity
@@ -2314,32 +2182,12 @@ pub(crate) mod test_support {
       .unwrap(),
     );
     let mut extensions = ExtensionRegistry::new();
-    // The built-in transports the node builder installs: the ticks
-    // resolve the members' wss endpoints through this registry.
-    for (tag, transport) in [
-      (
-        builtin_transport_tag(TransportScheme::Tls).unwrap(),
-        Arc::new(crate::transport::tls_transport::TlsTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-      (
-        builtin_transport_tag(TransportScheme::Wss).unwrap(),
-        Arc::new(crate::transport::wss::WssTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-      (
-        builtin_transport_tag(TransportScheme::Tcp).unwrap(),
-        Arc::new(crate::transport::plain::PlainTransport::new())
-          as Arc<dyn crate::transport::registry::Transport>,
-      ),
-    ] {
-      extensions
-        .register_builtin_transport(tag, transport)
-        .unwrap();
-    }
+    // Caller extensions first, then the explicit default path: the same
+    // order the node builder applies, so a caller override or a
+    // caller-claimed next-hop tag wins over the official entry.
     prepare(&mut extensions);
-    let mut definitions = feature::builtin_definitions().unwrap();
-    definitions.extend(extensions.feature_definitions());
+    extensions.register_default().unwrap();
+    let definitions = extensions.feature_definitions();
     let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
     let offer = node_offer(&registry, config.required_features()).unwrap();
     let (round_tx, round_rx) = mpsc::channel(super::SYNC_ROUND_CHANNEL_CAPACITY);
@@ -2369,12 +2217,14 @@ pub(crate) mod test_support {
     // The operation handles are built the way `spawn_runtime` builds them,
     // so the tick drives the exact production packet context and session
     // driver instead of a stand-in.
+    let (leave_signal, leave_signals) = mpsc::channel(super::LEAVE_SIGNAL_CAPACITY);
     let operations = super::operation_deps(
       &dependencies,
       packet_tx.clone(),
       offer,
       registry,
       crate::session::stream::AuthorizationBoundary::default(),
+      leave_signal,
     )
     .expect("operation handles");
     dependencies.operations = Some(operations);
@@ -2385,6 +2235,7 @@ pub(crate) mod test_support {
       sync_rounds: round_rx,
       entropy,
       sessions,
+      leave_signals,
     }
   }
 
@@ -2443,14 +2294,8 @@ pub(crate) mod test_support {
       .iter()
       .map(|port| crate::Endpoint::parse(&format!("wss://127.0.0.1:{port}")).unwrap())
       .collect();
-    let descriptor = crate::membership::NodeDescriptorV1::new(
-      node.clone(),
-      member_key(seed),
-      endpoints,
-      1,
-      false,
-      1,
-    );
+    let descriptor =
+      crate::membership::NodeDescriptorV1::new(node.clone(), member_key(seed), endpoints, 1, 1);
     crate::membership::store::store_descriptor_ctx(
       supervisor.context().unwrap().store(),
       supervisor.dependencies.entropy.as_ref(),

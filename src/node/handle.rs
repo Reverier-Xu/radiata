@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
-  Endpoint, Error, Event, EventOptions, EventSubscription, MergeCredential, NodeId,
+  Endpoint, Error, Event, EventOptions, EventSubscription, EventTag, MergeCredential, NodeId,
   NodeMetadataPatch, NodeStatus, OutboundStream, ProtocolTag, PublicKey, Result, ShutdownOutcome,
-  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, Task, TraceId,
+  ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TaggedEvent, Task, TraceId,
   api::{BoxFuture, Entropy},
   extension_registry::ExtensionRegistry,
   node::{Credentials, Listeners, Members, Resources, Routes, Sessions, Tasks, Topology, Trust},
@@ -44,40 +44,44 @@ impl NodeHandle {
   /// until [`OutboundStream::send_sync`] or [`OutboundStream::send_async`]
   /// consumes the body.
   ///
-  /// An exact-node target rejects a load-balancer selection; a
+  /// An exact-node or path target rejects a load-balancer selection; a
   /// matching-node target requires one whose tag resolves in the node's
-  /// [`ExtensionRegistry`]. The routing policy must be the built-in
-  /// direct policy — enforced up front when the [`StreamPolicy`] is
-  /// constructed — and the protocol tag must be registered.
+  /// [`ExtensionRegistry`]. A caller-named path is validated here for
+  /// shape (non-empty, duplicate-free, inside the hop budget, ending at
+  /// the destination) and at admission for reachability. The routing
+  /// policy tag resolves in the same registry at admission — an
+  /// unregistered policy fails there — and the protocol tag must be
+  /// registered.
   pub fn open_stream(
     &self, target: StreamTarget, protocol: ProtocolTag, policy: StreamPolicy,
     metadata: StreamMetadata,
   ) -> Result<OutboundStream> {
-    let load_balancer = match (&target, policy.load_balancing_policy()) {
-      (StreamTarget::Exact(_), Some(_)) => {
+    match (&target, policy.load_balancing_policy()) {
+      (StreamTarget::Exact(_) | StreamTarget::Path { .. }, Some(_)) => {
         return Err(Error::invalid_input("packet load balancer"));
       }
-      (StreamTarget::Exact(_), None) => None,
+      (StreamTarget::Exact(_) | StreamTarget::Path { .. }, None) => {}
       (StreamTarget::MatchingNodes(_), None) => {
         return Err(Error::invalid_input("packet load balancer"));
       }
       (StreamTarget::MatchingNodes(_), Some(tag)) => {
         // Every referenced policy tag must resolve in the registry.
-        if !self.extensions.has_load_balancer(tag) {
+        if !self.extensions.has_load_balancer(tag)? {
           return Err(Error::invalid_input("packet load balancer"));
         }
-        Some(tag.clone())
       }
-    };
-    if !self.extensions.has_protocol(&protocol) {
+    }
+    if let StreamTarget::Path { destination, path } = &target {
+      crate::packet::validate_caller_path(destination, path, policy.max_hops())?;
+    }
+    if !self.extensions.has_protocol(&protocol)? {
       return Err(Error::unsupported("packet protocol"));
     }
     let trace_id = TraceId::generate(self.entropy.as_ref())?;
     Ok(OutboundStream::new(
       trace_id,
       target,
-      load_balancer,
-      policy.max_hops(),
+      policy,
       protocol,
       metadata,
       self.runtime.clone(),
@@ -220,11 +224,15 @@ impl NodeHandle {
   /// `wait` resolves with the outcome; the active-leave shutdown starts
   /// only after the task terminalizes, and the terminal publication
   /// precedes the shutdown signal, so `wait` always observes the outcome
-  /// before any teardown begins.
+  /// before any teardown begins. A failure after the leave began tearing
+  /// the network down instead shuts the node down with
+  /// [`ShutdownReason::Fatal`], because it has no listeners and no
+  /// sessions left to serve with.
   ///
   /// Admission-time failures are the pure shape checks (a stopped node, a
-  /// missing acknowledgement marker, a second leave while one is in
-  /// flight); the frozen-store refusal and every journal/teardown failure
+  /// missing acknowledgement marker, a second leave while one is admitted
+  /// — the first leave holds its exclusivity slot until its terminal
+  /// report); the frozen-store refusal and every journal/teardown failure
   /// are effect-time and surface on the task's `wait`.
   ///
   /// The leave is journaled before any network effect, and once the
@@ -359,7 +367,7 @@ impl NodeHandle {
   /// Admission-time failures are the pure shape checks only (a stopped
   /// node); the frozen-store refusal and the member-connectivity
   /// precondition are effect-time and surface on the task's `wait`.
-  pub async fn issue_cleanup_checkpoint(&self) -> Result<Task<u64>> {
+  pub async fn issue_cleanup_checkpoint(&self) -> Result<Task<i64>> {
     crate::runtime::issue_cleanup_checkpoint(self.runtime.admit()?).await
   }
 
@@ -505,6 +513,78 @@ impl NodeHandle {
       return Err(Error::shutting_down("node events"));
     }
     Ok(self.events.subscribe::<E>(options))
+  }
+
+  /// Publishes one caller event on the node's tag-keyed channel: every
+  /// live [`NodeHandle::subscribe`] subscriber of `tag` receives a
+  /// [`TaggedEvent`] carrying `tag` and the opaque `payload` bytes. The
+  /// core never inspects the payload; `tag` is the publish/subscribe
+  /// key.
+  ///
+  /// The channel shares the typed event hub's contract: subscriptions
+  /// are bounded (each subscriber lags independently instead of
+  /// blocking the publisher), an event with no live subscriber is
+  /// dropped, and nothing is retained for replay. The nine sealed crate
+  /// event types keep their own typed channel; the two coexist.
+  ///
+  /// The built-in `radiata.woooo.tech` domain is reserved: the crate's
+  /// official events are the sealed types, so a caller event lives under
+  /// a caller-owned [`EventTag`] domain and a reserved-domain tag is
+  /// refused here. The only other failure is a node that is not running.
+  pub fn publish(&self, tag: EventTag, payload: std::sync::Arc<[u8]>) -> Result<()> {
+    if self.runtime.status() != NodeStatus::Running {
+      return Err(Error::shutting_down("tag-keyed event channel"));
+    }
+    crate::protocol::tag::require_caller_domain(tag.domain(), "tag-keyed event channel")?;
+    self.events.publish(&tag, payload);
+    Ok(())
+  }
+
+  /// Subscribes to one tag's channel on the node's tag-keyed event
+  /// channel: every later [`NodeHandle::publish`] under `tag` arrives as
+  /// a [`TaggedEvent`] item over the same bounded subscription plumbing
+  /// as [`NodeHandle::watch`] (lag, cancellation safety, and the stream
+  /// view included). Events published before the subscription are not
+  /// replayed.
+  ///
+  /// The built-in `radiata.woooo.tech` domain is reserved for the
+  /// crate's sealed event types and is refused here. The only other
+  /// failure is a node that is not running.
+  pub fn subscribe(
+    &self, tag: EventTag, options: EventOptions,
+  ) -> Result<EventSubscription<TaggedEvent>> {
+    if self.runtime.status() != NodeStatus::Running {
+      return Err(Error::shutting_down("tag-keyed event channel"));
+    }
+    crate::protocol::tag::require_caller_domain(tag.domain(), "tag-keyed event channel")?;
+    Ok(self.events.subscribe_tagged(tag, options))
+  }
+
+  /// Opens a watch over the durable resource change feed: `None` starts at
+  /// the feed's current head (only later commits are observed),
+  /// `Some(version)` first replays every entry with a version greater than
+  /// `version` and then follows live commits. Each change carries the
+  /// `resourceVersion` the commit assigned inside the same durable
+  /// transaction as the record, so a consumer resumes by passing the last
+  /// version it processed.
+  ///
+  /// The feed is persisted, not process-local: a watch created after a
+  /// restart resumes from the persisted head, and the sequence continues
+  /// with no gap and no reordering. The feed keeps its full history — the
+  /// library never evicts entries, and trimming it is the operator's
+  /// cleanup decision. A watch whose cursor the feed no longer reaches
+  /// (the feed was wiped or reset) observes
+  /// [`crate::ResourceFeedError::Reset`] and re-lists from the reported
+  /// head; a slow consumer never blocks a resource write.
+  ///
+  /// The only failure is the command channel's own (a stopped node); feed
+  /// read failures surface from [`crate::ResourceWatch::next`]. The watch
+  /// holds the store open, so drop it before reopening the same storage.
+  pub async fn watch_resources(&self, from: Option<u64>) -> Result<crate::ResourceWatch> {
+    self
+      .runtime
+      .send_command(move |reply| Control::WatchResources { from, reply })
+      .await
   }
 
   /// Sends one whole body as a single stream and waits for the

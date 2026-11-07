@@ -1,934 +1,196 @@
-//! The frozen `0.1.0` wire/metadata compatibility manifest.
+//! Behavioral wire-compatibility checks.
 //!
-//! [`VECTOR_MANIFEST`] lists every golden vector the `0.1.0` release
-//! freezes across the eight format families: packet wire frames, identity
-//! records, node descriptors, resource records, route trace metadata,
-//! pending transactions, migration schema records, and the handshake
-//! feature offer. Each entry pins
-//! the exact vector bytes plus the current reader that must accept them;
-//! the family inventory is closed, so an omitted fixture or reader fails
-//! the compatibility suite. Vector bytes are frozen: a format change is a
-//! deliberate compatibility amendment, never an accident.
+//! Frozen golden bytes live with the format's owner module, pinned by
+//! each owner's golden suite. This module keeps only what git cannot
+//! provide: the frozen previous-shape node descriptor pins that an old
+//! wire shape must still decode through the current reader, and the
+//! behavioral assertions pin that unsupported format versions fail
+//! closed without depending on any frozen bytes.
 
 use std::sync::Arc;
 
-/// The canonical decoder limits every compatibility reader uses, matching
-/// the production control-plane decode path.
-use crate::protocol::CONTROL_CBOR_LIMITS as FREEZE_CBOR_LIMITS;
-use crate::{Result, StoreValue, packet::wire, protocol::wire as protocol_wire};
+use ed25519_dalek::SigningKey;
 
-/// One frozen format family of the compatibility manifest.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CompatibilityFamily {
-  /// Packet-stream wire frame bodies (`open`, `chunk`, `end`, `ack`).
-  Packet,
-  /// Identity persisted records.
-  Identity,
-  /// Owner-signed node descriptor records.
-  Node,
-  /// Signed resource tuple records.
-  Resource,
-  /// Route trace metadata records.
-  Trace,
-  /// Pending-transaction journal records.
-  Transaction,
-  /// Migration schema records (base and edge shapes).
-  Migration,
-  /// Handshake control-plane messages. The feature offer is the encoded
-  /// message whose shape the mixed-version lane negotiates, so freezing
-  /// it is what makes a future format change a deliberate amendment: a
-  /// field added or removed here silently breaks every older peer's
-  /// handshake, and no test that builds both sides from the current
-  /// registry can observe that.
-  Handshake,
+use crate::{
+  Endpoint, LabelKey, LabelSet, LabelValue, NodeId, ProtocolTag, PublicKey, ResourceName,
+  ResourceUri, StreamMetadata, TraceId,
+  hex::decode as hex_decode,
+  membership::{NODE_DESCRIPTOR_SCHEMA, NodeDescriptorV1, page::decode_descriptor},
+  packet::{RouteState, wire},
+  protocol::{CONTROL_CBOR_LIMITS, wire as protocol_wire},
+  provider::{KeyHandle, KeyOperationId},
+  resource::{RESOURCE_RECORD_SCHEMA, ResourceRecordV1},
+  routing::trace::{TRACE_SCHEMA, TraceRecord, decode_trace_record},
+  storage::migration::{METADATA_SCHEMA_V1, decode_schema_record, encode_schema_record},
+};
+
+/// The frozen previous-shape node descriptor (record version 1, no
+/// capability labels): these bytes were written by an older reader
+/// shape, and the current reader must keep accepting them.
+const NODE_DESCRIPTOR_V1_HEX: &str = "87782d726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6e6f64652d64657363726970746f7201781a6e6f64652d3030303030303030303030303030303030303030315820d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da81781b7773733a2f2f6e6f6465312e6578616d706c652e6e65743a3434330701";
+
+fn node(value: u8) -> NodeId {
+  NodeId::parse(&format!("node-{value:021}")).unwrap()
 }
 
-impl CompatibilityFamily {
-  /// Every frozen family, in manifest order.
-  pub(crate) const ALL: [Self; 8] = [
-    Self::Packet,
-    Self::Identity,
-    Self::Node,
-    Self::Resource,
-    Self::Trace,
-    Self::Transaction,
-    Self::Migration,
-    Self::Handshake,
-  ];
+fn trace() -> TraceId {
+  TraceId::parse("trace-000000000000000000001").unwrap()
 }
 
-/// How a manifest vector must be read.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum VectorShape {
-  /// The current reader decodes and re-encodes the vector byte-for-byte.
-  ByteStable,
-  /// The previous-shape vector is accepted by the current reader; the
-  /// re-encoding upgrades to the current shape, so byte equality does
-  /// not hold. Only the decode acceptance is frozen.
-  PreviousReader,
+fn protocol() -> ProtocolTag {
+  ProtocolTag::parse("radiata.woooo.tech/protocols/v1/example").unwrap()
 }
 
-/// One frozen golden vector and the reader that must accept it.
-pub(crate) struct CompatibilityVector {
-  /// The frozen format family.
-  pub(crate) family: CompatibilityFamily,
-  /// The stable vector name inside its family.
-  pub(crate) name: &'static str,
-  /// The frozen schema tag that must appear inside the vector bytes, or
-  /// `None` for frame bodies whose schema/kind IDs ride the prelude.
-  pub(crate) tag: Option<&'static str>,
-  /// The frozen vector bytes, lowercase hexadecimal.
-  pub(crate) hex: &'static str,
-  /// The frozen read semantics of the vector.
-  pub(crate) shape: VectorShape,
-  /// The current reader: decode then canonical re-encode.
-  pub(crate) read: fn(&[u8]) -> Result<Vec<u8>>,
+fn endpoint() -> Endpoint {
+  Endpoint::parse("wss://node1.example.net").unwrap()
 }
 
-// ---- frozen identity schema tags (byte-frozen inside every vector) ----
-
-const LOCAL_IDENTITY_TAG: &str = "radiata.woooo.tech/schemas/v1/local-identity";
-const KEY_CREATION_INTENT_TAG: &str = "radiata.woooo.tech/schemas/v1/key-creation-intent";
-const IDENTITY_BINDING_TAG: &str = "radiata.woooo.tech/schemas/v1/identity-binding";
-const CREDENTIAL_USE_TAG: &str = "radiata.woooo.tech/schemas/v1/credential-use";
-const MERGE_GRANT_TAG: &str = "radiata.woooo.tech/schemas/v1/merge-grant";
-const KEY_DELETED_TAG: &str = "radiata.woooo.tech/schemas/v1/key-deleted";
-
-/// The frozen packet frame readers. The `open` reader accepts the one
-/// canonical open shape: direct frames omit the route element, routed
-/// frames carry it.
-fn read_packet_open(bytes: &[u8]) -> Result<Vec<u8>> {
-  let frame = wire::decode_open(bytes, FREEZE_CBOR_LIMITS)?;
-  wire::encode_open(&frame)
+fn descriptor_key() -> PublicKey {
+  let signing = SigningKey::from_bytes(&[21; 32]);
+  PublicKey::from_bytes(signing.verifying_key().to_bytes())
 }
 
-fn read_packet_chunk(bytes: &[u8]) -> Result<Vec<u8>> {
-  let frame = wire::decode_chunk(bytes, FREEZE_CBOR_LIMITS)?;
-  wire::encode_chunk(&frame)
+/// The frozen previous-shape node descriptor still decodes through the
+/// current reader: record version 1 carries no capability labels and one
+/// endpoint.
+#[test]
+fn previous_descriptor_shape_still_decodes() {
+  let bytes = hex_decode(NODE_DESCRIPTOR_V1_HEX, "previous descriptor golden").unwrap();
+  let decoded = decode_descriptor(&bytes).unwrap();
+  assert_eq!(decoded.labels().entries().count(), 0);
+  assert_eq!(decoded.endpoints().len(), 1);
 }
 
-fn read_packet_end(bytes: &[u8]) -> Result<Vec<u8>> {
-  let frame = wire::decode_end(bytes, FREEZE_CBOR_LIMITS)?;
-  wire::encode_end(&frame)
-}
+/// Unknown, downgraded, and newer unsupported format versions return
+/// typed errors from every reader checked here, without fallback
+/// decoding. The inputs are constructed from the current encoders, so
+/// the assertion does not depend on any frozen bytes.
+#[test]
+fn unsupported_format_versions_fail_closed() {
+  // Packet frames: unknown and downgraded schema/kind IDs never resolve.
+  assert!(protocol_wire::lookup(protocol_wire::BASE_SCHEMA_ID, 0x0000).is_none());
+  assert!(protocol_wire::lookup(0x0002, 0x0001).is_none());
+  assert!(protocol_wire::lookup_packet(protocol_wire::BASE_SCHEMA_ID, 0x0014).is_none());
 
-fn read_packet_ack(bytes: &[u8]) -> Result<Vec<u8>> {
-  let frame = wire::decode_ack(bytes, FREEZE_CBOR_LIMITS)?;
-  wire::encode_ack(&frame)
-}
+  // A noncanonical trailing element is refused before dispatch.
+  let mut trailed = open_frame_bytes();
+  trailed.push(0x00);
+  assert!(wire::decode_open(&trailed, CONTROL_CBOR_LIMITS).is_err());
 
-// ---- frozen identity record readers ----
-
-fn read_local_identity(bytes: &[u8]) -> Result<Vec<u8>> {
-  crate::identity::records::LocalIdentityV1::decode(bytes)?.encode()
-}
-
-fn read_key_creation_intent(bytes: &[u8]) -> Result<Vec<u8>> {
-  crate::identity::records::KeyCreationIntentV1::decode(bytes)?.encode()
-}
-
-fn read_identity_binding(bytes: &[u8]) -> Result<Vec<u8>> {
-  crate::identity::records::IdentityBindingV1::decode(bytes)?.encode()
-}
-
-fn read_credential_use(bytes: &[u8]) -> Result<Vec<u8>> {
-  crate::identity::records::CredentialUseV1::decode(bytes)?.encode()
-}
-
-fn read_merge_grant(bytes: &[u8]) -> Result<Vec<u8>> {
-  crate::identity::records::MergeGrantV1::decode(bytes)?.encode()
-}
-
-fn read_key_deleted(bytes: &[u8]) -> Result<Vec<u8>> {
-  crate::identity::records::KeyDeletedV1::decode(bytes)?.encode()
-}
-
-// ---- frozen node/resource/trace/transaction/migration readers ----
-
-fn read_node_descriptor(bytes: &[u8]) -> Result<Vec<u8>> {
-  crate::membership::page::decode_descriptor(bytes)?.encode()
-}
-
-fn read_resource_record(bytes: &[u8]) -> Result<Vec<u8>> {
-  crate::resource::ResourceRecordV1::decode(bytes)?.encode()
-}
-
-fn read_trace_record(bytes: &[u8]) -> Result<Vec<u8>> {
-  let record = crate::routing::trace::decode_trace_record(bytes)?;
-  record.encode()
-}
-
-fn read_pending_transaction(bytes: &[u8]) -> Result<Vec<u8>> {
-  crate::storage::pending::PendingTransactionV1::decode(bytes)?.encode()
-}
-
-fn read_feature_offer(bytes: &[u8]) -> Result<Vec<u8>> {
-  crate::protocol::offer::FeatureOffer::decode(bytes)?.encode()
-}
-
-fn read_migration_schema_record(bytes: &[u8]) -> Result<Vec<u8>> {
-  let (kind, tag, digest) =
-    crate::storage::migration::decode_schema_record(&StoreValue::new(Arc::from(bytes)))?;
-  Ok(
-    crate::storage::migration::encode_schema_record(kind, &tag, digest.as_ref())
-      .as_bytes()
-      .to_vec(),
-  )
-}
-
-/// The frozen golden vectors of the `0.1.0` release, grouped by family in
-/// [`CompatibilityFamily::ALL`] order. The inventory below is closed: the
-/// compatibility suite asserts the exact per-family counts, so removing,
-/// renaming, or adding a vector without a plan amendment fails.
-pub(crate) const VECTOR_MANIFEST: &[CompatibilityVector] = &[
-  // Packet frame bodies: the direct open omits the route element, the
-  // routed open carries it — one canonical wire shape, two frame
-  // variants — and the end frame's two terminal outcomes (completed and
-  // relay-synthesized interruption) are each frozen.
-  CompatibilityVector {
-    family: CompatibilityFamily::Packet,
-    name: "open-direct-v1",
-    tag: None,
-    hex: PACKET_OPEN_DIRECT_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_packet_open,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Packet,
-    name: "open-routed-v1",
-    tag: None,
-    hex: PACKET_OPEN_ROUTED_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_packet_open,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Packet,
-    name: "chunk-v1",
-    tag: None,
-    hex: PACKET_CHUNK_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_packet_chunk,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Packet,
-    name: "end-v1",
-    tag: None,
-    hex: PACKET_END_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_packet_end,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Packet,
-    name: "end-interrupted-v1",
-    tag: None,
-    hex: PACKET_END_INTERRUPTED_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_packet_end,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Packet,
-    name: "ack-v1",
-    tag: None,
-    hex: PACKET_ACK_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_packet_ack,
-  },
-  // Identity records: the whole closed record surface of the identity
-  // journal, pinned byte-for-byte by the owner module's frozen goldens
-  // (`crate::identity::records`): the manifest references the same
-  // constants the owner golden suite pins its constructors to, so the
-  // two suites cannot drift apart.
-  CompatibilityVector {
-    family: CompatibilityFamily::Identity,
-    name: "local-identity-v1",
-    tag: Some(LOCAL_IDENTITY_TAG),
-    hex: crate::identity::records::LOCAL_IDENTITY_GOLDEN,
-    shape: VectorShape::ByteStable,
-    read: read_local_identity,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Identity,
-    name: "key-creation-intent-v1",
-    tag: Some(KEY_CREATION_INTENT_TAG),
-    hex: crate::identity::records::KEY_CREATION_INTENT_GOLDEN,
-    shape: VectorShape::ByteStable,
-    read: read_key_creation_intent,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Identity,
-    name: "identity-binding-v1",
-    tag: Some(IDENTITY_BINDING_TAG),
-    hex: crate::identity::records::IDENTITY_BINDING_GOLDEN,
-    shape: VectorShape::ByteStable,
-    read: read_identity_binding,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Identity,
-    name: "credential-use-v1",
-    tag: Some(CREDENTIAL_USE_TAG),
-    hex: crate::identity::records::CREDENTIAL_USE_GOLDEN,
-    shape: VectorShape::ByteStable,
-    read: read_credential_use,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Identity,
-    name: "merge-grant-v1",
-    tag: Some(MERGE_GRANT_TAG),
-    hex: crate::identity::records::MERGE_GRANT_GOLDEN,
-    shape: VectorShape::ByteStable,
-    read: read_merge_grant,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Identity,
-    name: "key-deleted-v1",
-    tag: Some(KEY_DELETED_TAG),
-    hex: crate::identity::records::KEY_DELETED_GOLDEN,
-    shape: VectorShape::ByteStable,
-    read: read_key_deleted,
-  },
-  // Node descriptors: the previous record version 1 shape (no capability
-  // labels) and the current version 2 shape.
-  CompatibilityVector {
-    family: CompatibilityFamily::Node,
-    name: "descriptor-v1",
-    tag: Some(crate::membership::NODE_DESCRIPTOR_SCHEMA),
-    hex: NODE_DESCRIPTOR_V1_HEX,
-    shape: VectorShape::PreviousReader,
-    read: read_node_descriptor,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Node,
-    name: "descriptor-v2",
-    tag: Some(crate::membership::NODE_DESCRIPTOR_SCHEMA),
-    hex: NODE_DESCRIPTOR_V2_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_node_descriptor,
-  },
-  // Resource records: the previous fixture and the current live and
-  // removal fixtures.
-  CompatibilityVector {
-    family: CompatibilityFamily::Resource,
-    name: "record-g7-previous",
-    tag: Some(crate::resource::RESOURCE_RECORD_SCHEMA),
-    hex: RESOURCE_RECORD_G7_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_resource_record,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Resource,
-    name: "record-g9-live",
-    tag: Some(crate::resource::RESOURCE_RECORD_SCHEMA),
-    hex: RESOURCE_RECORD_G9_LIVE_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_resource_record,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Resource,
-    name: "record-g9-removal",
-    tag: Some(crate::resource::RESOURCE_RECORD_SCHEMA),
-    hex: RESOURCE_RECORD_G9_REMOVAL_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_resource_record,
-  },
-  // Route trace metadata: the initial routing record and the delivered
-  // transition of the same trace.
-  CompatibilityVector {
-    family: CompatibilityFamily::Trace,
-    name: "record-routing-v1",
-    tag: Some(crate::routing::trace::TRACE_SCHEMA),
-    hex: TRACE_RECORD_ROUTING_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_trace_record,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Trace,
-    name: "record-delivered-v1",
-    tag: Some(crate::routing::trace::TRACE_SCHEMA),
-    hex: TRACE_RECORD_DELIVERED_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_trace_record,
-  },
-  // Pending transactions: the identity-records pending journal record,
-  // pinned by the owner module's frozen compatibility golden
-  // (`crate::storage::pending`).
-  CompatibilityVector {
-    family: CompatibilityFamily::Transaction,
-    name: "pending-record-v1",
-    tag: Some(PENDING_TRANSACTION_TAG),
-    hex: crate::storage::pending::PENDING_RECORD_COMPAT_GOLDEN,
-    shape: VectorShape::ByteStable,
-    read: read_pending_transaction,
-  },
-  // Migration schema records: the base stamp of the declared chain's
-  // current target and one edge record with its implementation digest.
-  CompatibilityVector {
-    family: CompatibilityFamily::Migration,
-    name: "base-record-v1",
-    tag: Some(crate::storage::migration::V3),
-    hex: MIGRATION_BASE_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_migration_schema_record,
-  },
-  CompatibilityVector {
-    family: CompatibilityFamily::Migration,
-    name: "edge-record-v1",
-    tag: Some(crate::storage::migration::EDGE_ONE_TAG),
-    hex: MIGRATION_EDGE_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_migration_schema_record,
-  },
-  // Handshake: the initiator's feature offer — every built-in feature
-  // supported at its definition digest, the direct-request chain
-  // required. No schema tag rides the wire (the offer is a two-element
-  // array), so the freeze is the bytes alone.
-  CompatibilityVector {
-    family: CompatibilityFamily::Handshake,
-    name: "feature-offer-initiator-v1",
-    tag: None,
-    hex: FEATURE_OFFER_INITIATOR_HEX,
-    shape: VectorShape::ByteStable,
-    read: read_feature_offer,
-  },
-];
-
-const PENDING_TRANSACTION_TAG: &str = "radiata.woooo.tech/schemas/v1/pending-transaction";
-
-// ---- frozen vector bytes (lowercase hexadecimal) ----
-
-const PACKET_OPEN_DIRECT_HEX: &str = "85781b74726163652d303030303030303030303030303030303030303031781a6e6f64652d303030303030303030303030303030303030303031781a6e6f64652d3030303030303030303030303030303030303030327827726164696174612e776f6f6f6f2e746563682f70726f746f636f6c732f76312f6578616d706c6581827821726164696174612e776f6f6f6f2e746563682f6c6162656c732f6578616d706c654666726f7a656e";
-const PACKET_OPEN_ROUTED_HEX: &str = "86781b74726163652d303030303030303030303030303030303030303031781a6e6f64652d303030303030303030303030303030303030303031781a6e6f64652d3030303030303030303030303030303030303030337827726164696174612e776f6f6f6f2e746563682f70726f746f636f6c732f76312f6578616d706c6581827821726164696174612e776f6f6f6f2e746563682f6c6162656c732f6578616d706c654666726f7a656e83781a6e6f64652d30303030303030303030303030303030303030303281781a6e6f64652d30303030303030303030303030303030303030303102";
-const PACKET_CHUNK_HEX: &str =
-  "83781b74726163652d303030303030303030303030303030303030303031014a626f64792d6279746573";
-/// Regenerated with the typed terminal discriminant (audit 2026-10-09
-/// item 11, a pre-release format amendment): the end frame is a
-/// two-element array whose second element is the terminal reason code
-/// (`0` = sender-completed, `1` = relay-synthesized interruption).
-const PACKET_END_HEX: &str = "82781b74726163652d30303030303030303030303030303030303030303100";
-const PACKET_END_INTERRUPTED_HEX: &str =
-  "82781b74726163652d30303030303030303030303030303030303030303101";
-const PACKET_ACK_HEX: &str = "83781b74726163652d30303030303030303030303030303030303030303100190fa0";
-const NODE_DESCRIPTOR_V1_HEX: &str = "88782d726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6e6f64652d64657363726970746f7201781a6e6f64652d3030303030303030303030303030303030303030315820d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da81781b7773733a2f2f6e6f6465312e6578616d706c652e6e65743a34343307f401";
-const NODE_DESCRIPTOR_V2_HEX: &str = "89782d726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6e6f64652d64657363726970746f7202781a6e6f64652d3030303030303030303030303030303030303030315820d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da81781b7773733a2f2f6e6f6465312e6578616d706c652e6e65743a34343307f401818278186578616d706c652e6f72672f6c6162656c732f6f776e6572667465616d2d61";
-const RESOURCE_RECORD_G7_HEX: &str = "8c782d726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f7265736f757263652d7265636f7264017828726164696174612e776f6f6f6f2e746563682f7265736f75726365732f64656d6f2d6f626a65637468646f63756d656e746d66696c653a2f2f2f746d702f61818278186578616d706c652e6f72672f6c6162656c732f6f776e6572667465616d2d611903e8781a6e6f64652d30303030303030303030303030303030303030303100f45820e8d13060de074dc393d9d34e6ad5ab662b5b3447da833e8c68c4a8273a669f0258404fca5e2c1fbd4a76a0b99e5815efc88e86b127a2f97e9247b924121a3a11dd2373f351d6cb71be1b672359e926f19814ceef7ce31ca1f6a1e2977946ce8c1302";
-const RESOURCE_RECORD_G9_LIVE_HEX: &str = "8c782d726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f7265736f757263652d7265636f7264017824726164696174612e776f6f6f6f2e746563682f7265736f75726365732f67392d6c69766568646f63756d656e746e66696c653a2f2f2f746d702f6739828278186578616d706c652e6f72672f6c6162656c732f6f776e6572667465616d2d6182776f746865722e6e65742f6c6162656c732f726567696f6e626575190fa0781a6e6f64652d30303030303030303030303030303030303030303100f45820092078bd2ba7bc8d74980b59ed70e16e30edf8c0caba8b14d868972c46fc5b115840347ee74f13a45c170b0e67f76e6b6e2eb9d7c4b429147c613c2c9534b05886c07f766601a6eac116f60b0d49b7494b3b3df65fa25f2332608d0e82b995aa7d03";
-const RESOURCE_RECORD_G9_REMOVAL_HEX: &str = "8c782d726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f7265736f757263652d7265636f7264017827726164696174612e776f6f6f6f2e746563682f7265736f75726365732f67392d72656d6f76656468646f63756d656e747666696c653a2f2f2f746d702f67392d72656d6f76656480191388781a6e6f64652d30303030303030303030303030303030303030303101f5582002b69dcf5fd392f373bf05c760a72e82c16790199c1ed6a408dccd6374f7279a5840eaa329909fb959cd6a55dd1fbaeffb9f152b744ea690a7042de11145bc2db5001414cdb0d541de9ae829461b80b395793d726dc5136535b61d67b93d39cfcf00";
-const TRACE_RECORD_ROUTING_HEX: &str = "897829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f726f7574652d747261636501781b74726163652d303030303030303030303030303030303030303031781a6e6f64652d303030303030303030303030303030303030303031781a6e6f64652d3030303030303030303030303030303030303030330100f6190fa0";
-const TRACE_RECORD_DELIVERED_HEX: &str = "897829726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f726f7574652d747261636501781b74726163652d303030303030303030303030303030303030303031781a6e6f64652d303030303030303030303030303030303030303031781a6e6f64652d3030303030303030303030303030303030303030330102f6191388";
-const MIGRATION_BASE_HEX: &str =
-  "012b726164696174612e776f6f6f6f2e746563682f736368656d61732f76332f6d657461646174612d74657374";
-/// The `0.1.0` initiator feature offer: five supported built-ins at their
-/// definition digests plus the four required session features. Frozen
-/// because this is the message a mixed-version pair must agree on — the
-/// pre-`0.1.0` limit negotiation was removed from exactly this array, and
-/// that removal is not backward compatible.
-const FEATURE_OFFER_INITIATOR_HEX: &str = "8285827830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e58203df87b424b76c2b0e73284e877679a07aeb1688c150bf90a99c6bc667f0b8aae827829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d657373616765735820b65136c721b44eb602c70788a372644af3b738ccfe0437c2ba33060a89ff9d2f82782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d7265717565737458207dfa9f0d5f24bf399f1ff3dd7f3354f09a7448d0a48b8e0b6e98c5b56e4e0a2782782b726164696174612e776f6f6f6f2e746563682f66656174757265732f726f757465642d64656c6976657279582057dfd16e43af9dbf7a4e47bdbeb40cb50d2f031d0355bb126dc3c16134f859a5827828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f7265582022373a9809f3ec58a1becf45acb4dfae3da54151973534fcfc18aeab57f0f874847830726164696174612e776f6f6f6f2e746563682f66656174757265732f617574682d656432353531392d73657373696f6e7829726164696174612e776f6f6f6f2e746563682f66656174757265732f646174612d6d65737361676573782a726164696174612e776f6f6f6f2e746563682f66656174757265732f6469726563742d726571756573747828726164696174612e776f6f6f6f2e746563682f66656174757265732f73657373696f6e2d636f7265";
-const MIGRATION_EDGE_HEX: &str = "0230726164696174612e776f6f6f6f2e746563682f736368656d61732f76312f6d6967726174696f6e2d656467652d6f6e65c00d58dde43d09d570842a07443e7f0c5e19950c605651d760d378b12945b23b";
-
-/// The frozen per-family vector inventory: an omitted fixture or reader
-/// changes a count and fails the compatibility suite.
-pub(crate) const FROZEN_FAMILY_COUNTS: [(CompatibilityFamily, usize); 8] = [
-  (CompatibilityFamily::Packet, 6),
-  (CompatibilityFamily::Identity, 6),
-  (CompatibilityFamily::Node, 2),
-  (CompatibilityFamily::Resource, 3),
-  (CompatibilityFamily::Trace, 2),
-  (CompatibilityFamily::Transaction, 1),
-  (CompatibilityFamily::Migration, 2),
-  (CompatibilityFamily::Handshake, 1),
-];
-
-#[cfg(test)]
-mod tests {
-  use std::sync::Arc;
-
-  use ed25519_dalek::SigningKey;
-
-  use super::{FROZEN_FAMILY_COUNTS, VECTOR_MANIFEST, VectorShape, protocol_wire, wire};
-  use crate::{
-    Endpoint, LabelKey, LabelSet, LabelValue, NodeId, ProtocolTag, PublicKey, ResourceName,
-    ResourceUri, StoreValue, StreamMetadata, TraceId,
-    hex::decode as hex_decode,
-    membership::page::decode_descriptor,
-    protocol::{CONTROL_CBOR_LIMITS, wire::PacketKind},
-    resource::ResourceRecordV1,
-    routing::{
-      HopState,
-      trace::{TracePhase, TraceRecord, TraceTransition, decode_trace_record},
-    },
-  };
-
-  fn golden(hex: &str) -> Vec<u8> {
-    hex_decode(hex, "compatibility golden").unwrap()
-  }
-
-  fn entry(name: &str) -> &'static super::CompatibilityVector {
-    VECTOR_MANIFEST
-      .iter()
-      .find(|vector| vector.name == name)
-      .unwrap_or_else(|| panic!("missing compatibility vector: {name}"))
-  }
-
-  fn bytes(name: &str) -> Vec<u8> {
-    golden(entry(name).hex)
-  }
-
-  // ---- golden vectors reproduce byte-for-byte ----
-
-  /// Every manifest-listed current vector decodes through its family
-  /// reader and re-encodes byte-for-byte, and every vector carries its
-  /// frozen schema tag.
-  #[test]
-  fn manifest_vectors_reproduce_byte_for_byte() {
-    for vector in VECTOR_MANIFEST {
-      let raw = golden(vector.hex);
-      if let Some(tag) = vector.tag {
-        assert!(
-          raw
-            .windows(tag.len())
-            .any(|window| window == tag.as_bytes()),
-          "vector {} must carry its frozen schema tag",
-          vector.name
-        );
-      }
-      if vector.shape == VectorShape::ByteStable {
-        let reencoded = (vector.read)(&raw)
-          .unwrap_or_else(|error| panic!("vector {} failed to read: {error}", vector.name));
-        assert_eq!(
-          reencoded, raw,
-          "vector {} is not byte-stable under its reader",
-          vector.name
-        );
-      } else {
-        // Previous-shape vectors decode through the current reader; the
-        // re-encoding upgrades to the current shape by design.
-        (vector.read)(&raw).unwrap();
-      }
-    }
-  }
-
-  /// The frozen schema, kind, and tag IDs of the closed wire registry and
-  /// the exported record schemas are unchanged.
-  #[test]
-  fn frozen_format_identifiers_are_unchanged() {
-    assert_eq!(protocol_wire::BASE_SCHEMA_ID, 0x0001);
-    let handshake_ids = [0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006];
-    for kind in protocol_wire::HandshakeKind::ALL {
-      assert_eq!(kind.kind_id(), handshake_ids[kind as usize]);
-      assert!(protocol_wire::lookup(protocol_wire::BASE_SCHEMA_ID, kind.kind_id()).is_some());
-    }
-    let packet_ids = [0x0010, 0x0011, 0x0012, 0x0013];
-    for kind in PacketKind::ALL {
-      assert_eq!(kind.kind_id(), packet_ids[kind as usize]);
-      assert!(
-        protocol_wire::lookup_packet(protocol_wire::BASE_SCHEMA_ID, kind.kind_id()).is_some()
-      );
-    }
-    assert_eq!(
-      crate::membership::NODE_DESCRIPTOR_SCHEMA,
-      "radiata.woooo.tech/schemas/v1/node-descriptor"
-    );
-    assert_eq!(
-      crate::routing::trace::TRACE_SCHEMA,
-      "radiata.woooo.tech/schemas/v1/route-trace"
-    );
-    assert_eq!(
-      crate::resource::RESOURCE_RECORD_SCHEMA,
-      "radiata.woooo.tech/schemas/v1/resource-record"
-    );
-    assert_eq!(
-      crate::storage::migration::BASE_VERSION,
-      "radiata.woooo.tech/schemas/v1/metadata-test"
-    );
-    assert_eq!(
-      crate::storage::migration::V2,
-      "radiata.woooo.tech/schemas/v2/metadata-test"
-    );
-    assert_eq!(
-      crate::storage::migration::V3,
-      "radiata.woooo.tech/schemas/v3/metadata-test"
-    );
-    assert_eq!(
-      crate::storage::migration::EDGE_ONE_TAG,
-      "radiata.woooo.tech/schemas/v1/migration-edge-one"
-    );
-    assert_eq!(
-      crate::storage::migration::EDGE_TWO_TAG,
-      "radiata.woooo.tech/schemas/v1/migration-edge-two"
-    );
-  }
-
-  // ---- previous readers accept compatible vectors ----
-
-  /// The manifest inventory is closed: every family ships exactly its
-  /// frozen vector count and every family has a reader, so an omitted
-  /// fixture or reader fails the suite.
-  #[test]
-  fn family_inventory_is_closed() {
-    // The frozen family list itself is closed: no family is silently
-    // dropped from the inventory table.
-    for family in super::CompatibilityFamily::ALL {
-      assert!(
-        FROZEN_FAMILY_COUNTS
-          .iter()
-          .any(|(owned, _)| *owned == family),
-        "family {family:?} missing from the frozen inventory"
-      );
-    }
-    for (family, count) in FROZEN_FAMILY_COUNTS {
-      let shipped = VECTOR_MANIFEST
-        .iter()
-        .filter(|vector| vector.family == family)
-        .count();
-      assert_eq!(shipped, count, "family {family:?} inventory drifted");
-    }
-    assert_eq!(VECTOR_MANIFEST.len(), 23);
-  }
-
-  /// The frozen vector shapes stay accepted by the current readers: the
-  /// direct packet open decodes without a route envelope, the record
-  /// version 1 node descriptor decodes to an empty capability label set,
-  /// and the previous resource fixture keeps its exact logical tuple
-  /// version.
-  #[test]
-  fn previous_reader_shapes_stay_accepted() {
-    // Packet open, direct variant: canonical, no route element.
-    let direct = wire::decode_open(&bytes("open-direct-v1"), CONTROL_CBOR_LIMITS).unwrap();
-    assert!(direct.route.is_none());
-    // Packet open, routed variant: routed envelope present.
-    let routed = wire::decode_open(&bytes("open-routed-v1"), CONTROL_CBOR_LIMITS).unwrap();
-    assert!(routed.route.is_some());
-
-    // Node descriptor, record version 1: no capability labels.
-    let previous_descriptor = decode_descriptor(&bytes("descriptor-v1")).unwrap();
-    assert_eq!(previous_descriptor.labels().entries().count(), 0);
-    assert_eq!(previous_descriptor.endpoints().len(), 1);
-    // The same record in the current version 2 shape round-trips.
-    let current_descriptor = decode_descriptor(&bytes("descriptor-v2")).unwrap();
-    assert_eq!(current_descriptor.encode().unwrap(), bytes("descriptor-v2"));
-
-    // Resource record, previous fixture: exact logical version.
-    let previous_resource = ResourceRecordV1::decode(&bytes("record-g7-previous")).unwrap();
-    assert_eq!(previous_resource.timestamp_millis(), 1_000);
-    assert!(
-      !ResourceRecordV1::decode(&bytes("record-g9-live"))
-        .unwrap()
-        .removed()
-    );
-    assert!(
-      ResourceRecordV1::decode(&bytes("record-g9-removal"))
-        .unwrap()
-        .removed()
-    );
-  }
-
-  // ---- unsupported format versions fail closed ----
-
-  /// Unknown, downgraded, and newer unsupported format versions return
-  /// typed errors from every family reader without fallback decoding.
-  #[test]
-  fn unsupported_format_versions_fail_closed() {
-    // Packet frames: unknown and downgraded schema/kind IDs never resolve.
-    assert!(protocol_wire::lookup(protocol_wire::BASE_SCHEMA_ID, 0x0000).is_none());
-    assert!(protocol_wire::lookup(0x0002, 0x0001).is_none());
-    assert!(protocol_wire::lookup_packet(protocol_wire::BASE_SCHEMA_ID, 0x0014).is_none());
-    // A noncanonical trailing element is refused before dispatch.
-    let mut trailed = bytes("open-routed-v1");
-    trailed.push(0x00);
-    assert!(wire::decode_open(&trailed, CONTROL_CBOR_LIMITS).is_err());
-
-    // Every schema-tagged family refuses a downgraded (0) and a newer
-    // (2) record version at the same wire position.
-    for name in [
-      "local-identity-v1",
-      "key-creation-intent-v1",
-      "identity-binding-v1",
-      "credential-use-v1",
-      "merge-grant-v1",
-      "key-deleted-v1",
-      "descriptor-v2",
-      "record-g9-live",
-      "record-routing-v1",
-      "pending-record-v1",
-    ] {
-      let vector = entry(name);
-      let tag = vector.tag.expect("schema-tagged vector");
-      let raw = golden(vector.hex);
-      let position = raw
-        .windows(tag.len())
-        .position(|window| window == tag.as_bytes())
-        .unwrap()
-        + tag.len();
-      let current_version = raw[position];
-      assert!(current_version == 0x01 || current_version == 0x02);
-      for version in [0x00_u8, current_version + 1] {
-        let mut mutated = raw.clone();
-        mutated[position] = version;
-        assert!(
-          (vector.read)(&mutated).is_err(),
-          "vector {name} must reject record version {version}"
-        );
-      }
-    }
-
-    // Migration schema records: unknown record kinds fail closed.
-    for kind in [0x00_u8, 0x03] {
-      let mut mutated = bytes("base-record-v1");
-      mutated[0] = kind;
-      assert!(super::read_migration_schema_record(&mutated).is_err());
-    }
-    // The edge-record digest width is frozen.
-    let mut short_digest = bytes("edge-record-v1");
-    short_digest.pop();
-    assert!(super::read_migration_schema_record(&short_digest).is_err());
-  }
-
-  // ---- deterministic vector construction (freeze witnesses) ----
-
-  fn node(value: u8) -> NodeId {
-    NodeId::parse(&format!("node-{value:021}")).unwrap()
-  }
-
-  fn trace() -> TraceId {
-    TraceId::parse("trace-000000000000000000001").unwrap()
-  }
-
-  fn protocol() -> ProtocolTag {
-    ProtocolTag::parse("radiata.woooo.tech/protocols/v1/example").unwrap()
-  }
-
-  fn endpoint() -> Endpoint {
-    Endpoint::parse("wss://node1.example.net").unwrap()
-  }
-
-  fn descriptor_key() -> PublicKey {
-    let signing = SigningKey::from_bytes(&[21; 32]);
-    PublicKey::from_bytes(signing.verifying_key().to_bytes())
-  }
-
-  /// The constructed current vector of each constructible family must
-  /// equal its pinned manifest bytes: a constructor change can never
-  /// silently drift away from the frozen bytes.
-  #[test]
-  fn constructed_vectors_match_the_frozen_bytes() {
-    // Packet frames.
-    let metadata = StreamMetadata::new()
-      .insert(
-        "radiata.woooo.tech/labels/example".parse().unwrap(),
-        Arc::from(b"frozen".as_slice()),
+  // Schema-tagged records: a downgraded (0) and a newer (current + 1)
+  // record version at the same wire position are refused by the current
+  // reader. The identity and pending-transaction families run the same
+  // assertion in their owner modules' golden suites.
+  let labels = LabelSet::new()
+    .insert(
+      LabelKey::parse("example.org/labels/owner").unwrap(),
+      LabelValue::parse("team-a").unwrap(),
+    )
+    .unwrap();
+  /// One fail-closed case: the schema tag, the current-shape record
+  /// bytes, and the reader whose typed refusal is asserted.
+  type FailClosedCase<'a> = (&'a str, Vec<u8>, fn(&[u8]) -> bool);
+  let cases: Vec<FailClosedCase<'_>> = vec![
+    (
+      NODE_DESCRIPTOR_SCHEMA,
+      NodeDescriptorV1::new(node(1), descriptor_key(), vec![endpoint()], 7, 1)
+        .with_labels(labels.clone())
+        .encode()
+        .unwrap(),
+      |bytes| decode_descriptor(bytes).is_err(),
+    ),
+    (
+      RESOURCE_RECORD_SCHEMA,
+      ResourceRecordV1::new(
+        ResourceName::parse("radiata.woooo.tech/resources/fail-closed").unwrap(),
+        LabelValue::parse("document").unwrap(),
+        ResourceUri::parse("file:///tmp/fail-closed").unwrap(),
+        labels,
+        4_000,
+        node(1),
+        0,
+        false,
       )
-      .unwrap();
-    let direct = wire::encode_open(&wire::OpenFrame {
-      trace_id: trace(),
-      source: node(1),
-      destination: node(2),
-      protocol: protocol(),
-      metadata: metadata.clone(),
-      route: None,
-    })
-    .unwrap();
-    assert_eq!(direct, bytes("open-direct-v1"));
-    let routed = wire::encode_open(&wire::OpenFrame {
-      trace_id: trace(),
-      source: node(1),
-      destination: node(3),
-      protocol: protocol(),
-      metadata: metadata.clone(),
-      route: Some(HopState {
-        current: node(2),
-        visited: vec![node(1)],
-        remaining_hops: 2,
-      }),
-    })
-    .unwrap();
-    assert_eq!(routed, bytes("open-routed-v1"));
-    let chunk = wire::encode_chunk(&wire::ChunkFrame {
-      trace_id: trace(),
-      sequence: 1,
-      bytes: minicbor::bytes::ByteVec::from(b"body-bytes".to_vec()),
-    })
-    .unwrap();
-    assert_eq!(chunk, bytes("chunk-v1"));
-    let end = wire::encode_end(&wire::EndFrame {
-      trace_id: trace(),
-      reason: wire::EndReason::Completed,
-    })
-    .unwrap();
-    assert_eq!(end, bytes("end-v1"));
-    let interrupted_end = wire::encode_end(&wire::EndFrame {
-      trace_id: trace(),
-      reason: wire::EndReason::Interrupted,
-    })
-    .unwrap();
-    assert_eq!(interrupted_end, bytes("end-interrupted-v1"));
-    let ack = wire::encode_ack(&wire::AckFrame {
-      trace_id: trace(),
-      status: wire::AckStatus::Admitted,
-      admitted_at_millis: 4_000,
-    })
-    .unwrap();
-    assert_eq!(ack, bytes("ack-v1"));
-
-    // Identity key-deleted record (the other five identity vectors are
-    // pinned golden bytes already round-tripped byte-for-byte above).
-    let deleted = crate::identity::records::KeyDeletedV1::new(
-      crate::provider::KeyOperationId::parse("keyop-aaaaaaaaaaaaaaaaaaaaa").unwrap(),
-      crate::provider::KeyHandle::from_provider_bytes(Arc::from(b"provider-handle-01".as_slice()))
+      .unwrap()
+      .encode()
+      .unwrap(),
+      |bytes| ResourceRecordV1::decode(bytes).is_err(),
+    ),
+    (
+      TRACE_SCHEMA,
+      TraceRecord::new(trace(), node(1), node(3), crate::time::from_millis(4_000))
+        .encode()
         .unwrap(),
-    )
+      |bytes| decode_trace_record(bytes).is_err(),
+    ),
+    (
+      crate::identity::records::KEY_DELETED_SCHEMA,
+      crate::identity::records::KeyDeletedV1::new(
+        KeyOperationId::parse("keyop-aaaaaaaaaaaaaaaaaaaaa").unwrap(),
+        KeyHandle::from_provider_bytes(Arc::from(b"provider-handle-01".as_slice())).unwrap(),
+      )
+      .encode()
+      .unwrap(),
+      |bytes| crate::identity::records::KeyDeletedV1::decode(bytes).is_err(),
+    ),
+  ];
+  for (tag, raw, decode_fails) in cases {
+    let position = raw
+      .windows(tag.len())
+      .position(|window| window == tag.as_bytes())
+      .unwrap_or_else(|| panic!("record must carry its schema tag {tag}"));
+    let version_position = position + tag.len();
+    let current_version = raw[version_position];
+    assert!(current_version == 0x01 || current_version == 0x02);
+    for version in [0x00_u8, current_version + 1] {
+      let mut mutated = raw.clone();
+      mutated[version_position] = version;
+      assert!(
+        decode_fails(&mutated),
+        "record version {version} must fail closed for schema {tag}"
+      );
+    }
+  }
+
+  // Migration schema records: any kind other than the baseline fails
+  // closed.
+  for kind in [0x00_u8, 0x02, 0x03] {
+    let mutated = encode_schema_record(kind, METADATA_SCHEMA_V1);
+    assert!(decode_schema_record(&mutated).is_err());
+  }
+}
+
+/// Decoded trace records preserve their exact phase and endpoints.
+#[test]
+fn trace_vectors_decode_to_exact_phases() {
+  let routing = TraceRecord::new(trace(), node(1), node(3), crate::time::from_millis(4_000));
+  let decoded = decode_trace_record(&routing.encode().unwrap()).unwrap();
+  assert_eq!(decoded.phase(), &RouteState::Routing);
+  assert_eq!(decoded.source(), &node(1));
+  assert_eq!(decoded.destination(), &node(3));
+  let delivered = routing
+    .with_transition(RouteState::Delivered, crate::time::from_millis(5_000))
     .encode()
     .unwrap();
-    assert_eq!(deleted, bytes("key-deleted-v1"));
+  let decoded = decode_trace_record(&delivered).unwrap();
+  assert_eq!(decoded.phase(), &RouteState::Delivered);
+}
 
-    // Node descriptor, current version 2 shape.
-    let descriptor = crate::membership::NodeDescriptorV1::new(
-      node(1),
-      descriptor_key(),
-      vec![endpoint()],
-      7,
-      false,
-      1,
-    )
-    .with_labels(
-      LabelSet::new()
-        .insert(
-          LabelKey::parse("example.org/labels/owner").unwrap(),
-          LabelValue::parse("team-a").unwrap(),
-        )
-        .unwrap(),
-    )
-    .encode()
-    .unwrap();
-    assert_eq!(descriptor, bytes("descriptor-v2"));
-
-    // Resource records, live and removal fixtures.
-    let writer = node(1);
-    let seed = [11_u8; 32];
-    let live = ResourceRecordV1::sign(
-      ResourceName::parse("radiata.woooo.tech/resources/g9-live").unwrap(),
-      LabelValue::parse("document").unwrap(),
-      ResourceUri::parse("file:///tmp/g9").unwrap(),
-      LabelSet::new()
-        .insert(
-          LabelKey::parse("example.org/labels/owner").unwrap(),
-          LabelValue::parse("team-a").unwrap(),
-        )
-        .unwrap()
-        .insert(
-          LabelKey::parse("other.net/labels/region").unwrap(),
-          LabelValue::parse("eu").unwrap(),
-        )
-        .unwrap(),
-      4_000,
-      writer.clone(),
-      0,
-      false,
-      &SigningKey::from_bytes(&seed),
+/// One canonical direct open frame: no route element.
+fn open_frame_bytes() -> Vec<u8> {
+  let metadata = StreamMetadata::new()
+    .insert(
+      crate::QualifiedTag::parse("radiata.woooo.tech/labels/example").unwrap(),
+      Arc::from(b"frozen".as_slice()),
     )
     .unwrap();
-    assert_eq!(live.encode().unwrap(), bytes("record-g9-live"));
-    let removal = ResourceRecordV1::sign(
-      ResourceName::parse("radiata.woooo.tech/resources/g9-removed").unwrap(),
-      LabelValue::parse("document").unwrap(),
-      ResourceUri::parse("file:///tmp/g9-removed").unwrap(),
-      LabelSet::new(),
-      5_000,
-      writer,
-      1,
-      true,
-      &SigningKey::from_bytes(&seed),
-    )
-    .unwrap();
-    assert_eq!(removal.encode().unwrap(), bytes("record-g9-removal"));
-
-    // Trace records: routing and delivered phases of the same trace.
-    let updated_at = crate::time::from_millis(4_000);
-    let routing = TraceRecord::new(trace(), node(1), node(3), updated_at)
-      .encode()
-      .unwrap();
-    assert_eq!(routing, bytes("record-routing-v1"));
-    let delivered = TraceRecord::new(trace(), node(1), node(3), updated_at)
-      .with_transition(TraceTransition::Delivered, crate::time::from_millis(5_000))
-      .encode()
-      .unwrap();
-    assert_eq!(delivered, bytes("record-delivered-v1"));
-
-    // Migration schema records: base stamp of the declared current
-    // target and one edge record with its implementation digest.
-    let base =
-      crate::storage::migration::encode_schema_record(1, crate::storage::migration::V3, None)
-        .as_bytes()
-        .to_vec();
-    assert_eq!(base, bytes("base-record-v1"));
-    let edge = crate::storage::migration::encode_schema_record(
-      2,
-      crate::storage::migration::EDGE_ONE_TAG,
-      Some(&crate::storage::migration::implementation_digest(
-        crate::storage::migration::EDGE_ONE_TAG,
-      )),
-    )
-    .as_bytes()
-    .to_vec();
-    assert_eq!(edge, bytes("edge-record-v1"));
-
-    // The identity and transaction vectors above reference the owner
-    // modules' frozen golden constants directly, so there is no second
-    // copy of those bytes to cross-check here; the owner golden suites
-    // pin the same constants to their constructors byte-for-byte.
-
-    // The previous-shape node descriptor bytes decode to the exact
-    // logical record of the version 2 record minus its labels.
-    let upgraded = decode_descriptor(&bytes("descriptor-v1")).unwrap();
-    let upgraded_v2 = crate::membership::NodeDescriptorV1::new(
-      upgraded.node().clone(),
-      upgraded.public_key().clone(),
-      upgraded.endpoints().to_vec(),
-      upgraded.revision(),
-      upgraded.removed(),
-      1,
-    )
-    .with_labels(LabelSet::new());
-    assert_eq!(upgraded_v2, current_descriptor_of(&upgraded_v2));
-  }
-
-  fn current_descriptor_of(
-    descriptor: &crate::membership::NodeDescriptorV1,
-  ) -> crate::membership::NodeDescriptorV1 {
-    decode_descriptor(&descriptor.encode().unwrap()).unwrap()
-  }
-
-  /// Decoded trace records preserve their exact phase and timestamps.
-  #[test]
-  fn trace_vectors_decode_to_exact_phases() {
-    let routing = decode_trace_record(&bytes("record-routing-v1")).unwrap();
-    assert_eq!(routing.phase(), &TracePhase::Routing);
-    assert_eq!(routing.source(), &node(1));
-    assert_eq!(routing.destination(), &node(3));
-    let delivered = decode_trace_record(&bytes("record-delivered-v1")).unwrap();
-    assert_eq!(delivered.phase(), &TracePhase::Delivered);
-  }
-
-  /// The migration base record of the declared chain target carries no
-  /// digest; the edge record carries exactly the implementation digest.
-  #[test]
-  fn migration_vectors_carry_exact_digests() {
-    let (kind, tag, digest) = crate::storage::migration::decode_schema_record(&StoreValue::new(
-      Arc::from(bytes("base-record-v1").into_boxed_slice()),
-    ))
-    .unwrap();
-    assert_eq!(kind, 1);
-    assert_eq!(tag, crate::storage::migration::V3);
-    assert!(digest.is_none());
-    let (kind, tag, digest) = crate::storage::migration::decode_schema_record(&StoreValue::new(
-      Arc::from(bytes("edge-record-v1").into_boxed_slice()),
-    ))
-    .unwrap();
-    assert_eq!(kind, 2);
-    assert_eq!(tag, crate::storage::migration::EDGE_ONE_TAG);
-    assert_eq!(
-      digest.as_ref(),
-      Some(&crate::storage::migration::implementation_digest(
-        crate::storage::migration::EDGE_ONE_TAG
-      ))
-    );
-  }
+  wire::encode_open(&wire::OpenFrame {
+    trace_id: trace(),
+    source: node(1),
+    destination: node(2),
+    protocol: protocol(),
+    metadata,
+    route: None,
+  })
+  .unwrap()
 }

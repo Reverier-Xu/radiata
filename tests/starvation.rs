@@ -3,15 +3,13 @@
 //! local resource writes keep flowing while four wedged dials hold
 //! every network execution slot.
 //!
-//! Before the declarative refactor every mutating verb ran inline in
-//! the supervisor's select loop, so one slow join dial (the transport
-//! deadline alone) froze reads, commands, and packet routing for the
-//! whole dial. The join now runs as a task-manager effect off the loop.
-//! Before the slot split, all effects shared one four-permit pool, so
-//! four wedged dials also froze every local write (the resource write
-//! queued behind the dials): the dials now draw from their own channel
+//! Every mutating verb runs as a task-manager effect off the
+//! supervisor's select loop, so one slow join dial (the transport
+//! deadline alone) cannot freeze reads, commands, or packet routing for the
+//! whole dial. The dials draw from their own execution channel
 //! ([`NodeConfig::with_task_reconcile_slots`]) while local work keeps
-//! its own. These tests pin that the loop's own lanes (control reads
+//! its own, so four wedged dials cannot freeze a local write. These
+//! tests pin that the loop's own lanes (control reads
 //! and the outbound packet pump) and the local channel answer promptly
 //! mid-dial.
 
@@ -38,19 +36,19 @@ const READ_BOX: Duration = Duration::from_secs(1);
 /// The box the packet admission must fit in while the dial is wedged.
 const PACKET_BOX: Duration = Duration::from_secs(2);
 /// The box the local resource write must fit in while every network
-/// slot sits inside a wedged dial: under the old shared pool the write
-/// queued until the first dial's deadline elapsed (seconds), so a tight
+/// slot sits inside a wedged dial: a shared pool would queue the write
+/// until the first dial's deadline elapsed (seconds), so a tight
 /// box is the discriminator.
 const LOCAL_WRITE_BOX: Duration = Duration::from_secs(2);
 /// The network slot budget for the saturation scenario: four wedged
-/// dials fill the whole channel deterministically (the same shape the
-/// old shared pool offered every effect).
+/// dials fill the whole channel deterministically (the same shape a
+/// shared pool would offer every effect).
 const NETWORK_SLOTS: usize = 4;
 /// The box the saturation drive (every dial reaching `Running`) and the
 /// shutdown must fit in.
 const DRIVE_BOX: Duration = Duration::from_secs(10);
 
-const ECHO_PROTOCOL: &str = "radiata.woooo.tech/protocols/starvation-echo";
+const ECHO_PROTOCOL: &str = "example.org/protocols/starvation-echo";
 
 /// A packet consumer that drains and counts echo bodies.
 #[derive(Debug, Default)]
@@ -154,8 +152,8 @@ async fn reads_and_packets_flow_while_a_join_is_wedged_on_a_silent_peer() {
   common::merge_with_retry(&member, &issuer, listener.endpoint().clone()).await;
   let issuer_id = issuer.local_node().await.unwrap().node_id().clone();
 
-  // Warm the member's lazy self-publication before the wedge (remaining
-  // items 2026-10-10, P2-9): a member read only SCHEDULES the local
+  // Warm the member's lazy self-publication before the wedge: a member
+  // read only SCHEDULES the local
   // descriptor's first publication now, so the probe below exercises
   // the read lane against the wedged dial, not the publication landing.
   let warm_deadline = Instant::now() + Duration::from_secs(5);
@@ -228,7 +226,7 @@ async fn reads_and_packets_flow_while_a_join_is_wedged_on_a_silent_peer() {
     member.send(
       StreamTarget::Exact(issuer_id.clone()),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       echo_body(b"still-flowing"),
     ),
   )
@@ -289,8 +287,8 @@ fn dial_subject(index: usize) -> radiata::NodeId {
 /// The full saturation shape the shared pool froze: four wedged network
 /// dials holding every network slot at once. Reads, packet admission,
 /// and a local resource write must all still answer inside their boxes
-/// — under the old single pool the write queued behind the dials for a
-/// whole dial deadline (the audit's finding), and before the
+/// — a write queued behind the dials for a
+/// whole dial deadline was the failure this shape pins, and before the
 /// declarative refactor even the reads and packets froze.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reads_packets_and_local_writes_flow_while_four_dials_hold_every_network_slot() {
@@ -332,8 +330,8 @@ async fn reads_packets_and_local_writes_flow_while_four_dials_hold_every_network
   common::merge_with_retry(&member, &issuer, listener.endpoint().clone()).await;
   let issuer_id = issuer.local_node().await.unwrap().node_id().clone();
 
-  // Warm the member's lazy self-publication before the wedge (remaining
-  // items 2026-10-10, P2-9): a member read only SCHEDULES the local
+  // Warm the member's lazy self-publication before the wedge: a member
+  // read only SCHEDULES the local
   // descriptor's first publication now, so the saturation probes below
   // exercise the read lane against the wedged dials, not the
   // publication landing.
@@ -412,7 +410,7 @@ async fn reads_packets_and_local_writes_flow_while_four_dials_hold_every_network
     member.send(
       StreamTarget::Exact(issuer_id.clone()),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       echo_body(b"still-flowing"),
     ),
   )
@@ -427,7 +425,7 @@ async fn reads_packets_and_local_writes_flow_while_four_dials_hold_every_network
   );
 
   // The local plane: a resource write runs on the local channel,
-  // inside the box — this is the probe the old shared pool queued
+  // inside the box — this is the probe a shared pool would queue
   // behind the dials.
   let write = ResourceWrite::new(
     ResourceName::parse("radiata.woooo.tech/resources/starvation-local-write").unwrap(),
@@ -545,13 +543,12 @@ fn trace_records(status: &radiata::ObservabilitySnapshot) -> u64 {
     .unwrap()
 }
 
-/// The periodic-tick lane of the starvation contract (audit 2026-10-09
-/// item 3): while a recovery-tick retention sweep commits against a slow
-/// device (every commit serialized behind a 6s delay), the supervisor's
-/// own lanes must keep answering — the storage-free recovery read, the
-/// member page (a read, not a commit), and packet admission. Before the
-/// tick planes moved onto their own workers, the sweep ran inline in the
-/// select loop, so one slow commit parked reads and packet admission
+/// The periodic-tick lane of the starvation contract: while a recovery-tick
+/// retention sweep commits against a slow device (every commit serialized
+/// behind a 6s delay), the supervisor's own lanes must keep answering — the
+/// storage-free recovery read, the member page (a read, not a commit), and
+/// packet admission. A sweep running inline in the
+/// select loop would park reads and packet admission
 /// behind it for the whole device delay; with the workers, only the
 /// next tick waits.
 ///
@@ -612,7 +609,7 @@ async fn reads_and_packets_flow_while_a_retention_sweep_wedges_on_slow_storage()
     .send(
       StreamTarget::Exact(peer_id.clone()),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       echo_body(b"sweep-arm"),
     )
     .await
@@ -665,7 +662,7 @@ async fn reads_and_packets_flow_while_a_retention_sweep_wedges_on_slow_storage()
       probe.send(
         StreamTarget::Exact(peer_id.clone()),
         ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-        StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+        StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
         echo_body(b"still-flowing"),
       ),
     )
@@ -703,14 +700,13 @@ async fn reads_and_packets_flow_while_a_retention_sweep_wedges_on_slow_storage()
   peer.shutdown().await.unwrap();
 }
 
-/// The lazy-publication lane of the starvation contract (remaining
-/// items 2026-10-10, P2-9): a node that never bound a listener
-/// publishes its local descriptor lazily, and that publication is a
-/// COMMIT. It used to run inline in the supervisor's select loop — the
-/// first member read awaited the descriptor commit itself — so on slow
+/// The lazy-publication lane of the starvation contract: a node that never
+/// bound a listener publishes its local descriptor lazily, and that publication
+/// is a COMMIT. Running it inline in the supervisor's select loop would make
+/// the first member read await the descriptor commit itself, so on slow
 /// storage the first member read (and every control operation queued
-/// behind it in the loop) parked for the whole device delay. The read
-/// path now only SCHEDULES the publication (single flight, off the
+/// behind it in the loop) would park for the whole device delay. The read
+/// path only SCHEDULES the publication (single flight, off the
 /// loop) and answers from committed state: the read returns inside its
 /// box while the publication pays the device delay, and the local node
 /// becomes visible once the scheduled publication lands.

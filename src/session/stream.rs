@@ -18,7 +18,7 @@
 //! they attach to.
 
 use std::{
-  collections::{BTreeMap, BTreeSet, HashMap},
+  collections::{BTreeMap, BTreeSet},
   sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -41,9 +41,10 @@ use crate::{
   ErrorKind, NodeId, QualifiedTag, Result, TraceId,
   extension_registry::ExtensionRegistry,
   routing::{
-    forward::{self, PendingAck, PendingAcks},
+    forward::{self, PendingAck},
     table::RouteTable,
   },
+  session::pending::PendingAdmissions,
   transport::connection::{Connection, ConnectionWriter},
 };
 
@@ -194,12 +195,12 @@ impl RevokedSubjects {
 }
 
 /// The node-local authorization boundary between durable revocation and
-/// final session publication (audit 2026-10-23, P1-11).
+/// final session publication.
 ///
 /// A handshake authorizes its peer against the durable trusted binding at
 /// admission and then spends network round trips completing. A revocation
-/// that commits inside that window used to retire only the sessions that
-/// existed when it ran, and the finishing handshake published a fresh
+/// that commits inside that window would otherwise retire only the sessions
+/// that existed when it ran, and the finishing handshake would publish a fresh
 /// session for the revoked identity with no further check. This boundary
 /// closes the window with one short exclusive section on each side of it:
 ///
@@ -207,9 +208,10 @@ impl RevokedSubjects {
 ///   ledger record, and the subject's session retirement
 ///   (`crate::runtime::task_effects`);
 /// - a sync-delivered revocation tombstone (`apply_revocation_record` in
-///   `crate::membership::tombstone`) holds the same section across its durable
-///   install, the ledger record, and the retirement, so a remote revocation
-///   closes the in-flight window exactly like a local one;
+///   `crate::membership::tombstone`) persists its durable install first and
+///   then holds the same section across the ledger record and the retirement,
+///   so a remote revocation closes the in-flight window exactly like a local
+///   one while the fsync-bound commit stays outside the section;
 /// - session publication (`run_session`) holds its section across the
 ///   authorization re-check and the session-table insertion.
 ///
@@ -217,8 +219,7 @@ impl RevokedSubjects {
 /// inserts before the retirement runs (and the retirement removes it), and
 /// one that loses observes the revoked subject and refuses to publish. The
 /// section is short by construction and never spans network negotiation —
-/// only the local commit, the in-memory ledger, and the session table sit
-/// inside it.
+/// only the in-memory ledger and the session table sit inside it.
 ///
 /// The ledger is per-incarnation only: revocations from earlier
 /// incarnations are durable and fail handshake admission on their own
@@ -255,9 +256,11 @@ pub(crate) struct SessionPacketContext {
   pub(super) routes: RouteTable,
   /// The node's durable trace sink: the origin pump's terminal facts and
   /// the read loop's late-failure revisions persist through the one
-  /// bounded instance the supervisor owns (remaining items 2026-10-10,
-  /// P2-7). `None` only in unit-test contexts without a store.
+  /// bounded instance the supervisor owns. `None` only in unit-test
+  /// contexts without a store.
   pub(super) trace: Option<crate::routing::trace::TraceSink>,
+  /// The node's configured bound on concurrently forwarded routes (the
+  /// trace metadata budget, shared with the terminal route records).
   pub(super) forwarding_capacity: usize,
   /// The node's configured bound on in-memory terminal route records;
   /// admission rejections must respect it like every other writer.
@@ -274,8 +277,13 @@ pub(crate) struct SessionPacketContext {
   /// The acknowledgment budget one forwarded-open hop gets (see
   /// `NodeConfig::with_relay_hop_deadline`).
   pub(super) relay_hop_deadline: Duration,
+  /// The node-level local-delivery plane (see [`LocalDelivery`]): the
+  /// shared admitted-stream table and pending-admission map every local
+  /// delivery leg of this node pumps through — the local counterpart of
+  /// one session's read loop, born with this context.
+  pub(super) local_delivery: Arc<super::inbound::LocalDelivery>,
   /// The node's authorization boundary between durable revocation and
-  /// final session publication (audit 2026-10-23, P1-11): born with this
+  /// final session publication: born with this
   /// context, so every session publication, the revocation effect, and
   /// the sync-delivered tombstone lane serialize on the same section
   /// through the one shared instance.
@@ -315,6 +323,9 @@ impl SessionPacketContext {
       live_consumers: ConsumerBudget::new(MAX_LIVE_CONSUMERS),
       parser_limits,
       relay_hop_deadline,
+      local_delivery: Arc::new(super::inbound::LocalDelivery::new(
+        policy.pending_admissions,
+      )),
       authorization,
     }
   }
@@ -345,7 +356,7 @@ impl SessionPacketContext {
     &self.local
   }
 
-  /// The caller-selected bound on concurrently forwarded routes.
+  /// The node's configured bound on concurrently forwarded routes.
   pub(crate) const fn forwarding_capacity(&self) -> usize {
     self.forwarding_capacity
   }
@@ -429,11 +440,10 @@ pub(crate) struct SessionMeta {
 #[derive(Clone)]
 pub(crate) struct SessionEntry {
   pub(crate) frames: BoundedSender,
-  pub(crate) pending_acks: PendingAcks,
-  /// Per-session concurrent admission bound from the session policy,
-  /// carried here so the outbound pump (which runs without the session
-  /// context) can enforce typed backpressure.
-  pub(crate) pending_admissions: usize,
+  /// The session's pending admissions (the origin's waiters and the
+  /// forwarding hops' relays): the map carries its own per-session bound
+  /// and lock discipline, so no caller locks it directly.
+  pub(crate) pending_acks: PendingAdmissions,
   pub(crate) clock: Arc<dyn crate::time::WallClock>,
   /// The public session metadata.
   pub(crate) meta: Arc<SessionMeta>,
@@ -490,8 +500,7 @@ impl SessionEntry {
     let (frames, _receiver) = super::queue::BoundedSender::channel(8, 4096);
     Ok(Self {
       frames,
-      pending_acks: Arc::new(Mutex::new(HashMap::new())),
-      pending_admissions: 1,
+      pending_acks: PendingAdmissions::new(1),
       clock: Arc::new(crate::time::HostWallClock),
       meta: Arc::new(SessionMeta {
         id: crate::SessionId::generate(entropy)?,
@@ -525,7 +534,7 @@ pub(crate) async fn run_session(
   let (writer, mut reader) = connection.into_split();
   let (frames, frames_rx) =
     BoundedSender::channel(context.policy.queue_messages, context.policy.queue_bytes);
-  let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+  let pending_acks = PendingAdmissions::new(context.policy.pending_admissions);
   let alive = Arc::new(AtomicBool::new(true));
   let (retire_tx, retire_rx) = watch::channel(());
   let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(clock_seconds(
@@ -550,8 +559,7 @@ pub(crate) async fn run_session(
   let grant = SessionGrant::for_session(&session, identity.clone());
   let entry = SessionEntry {
     frames: frames.clone(),
-    pending_acks: Arc::clone(&pending_acks),
-    pending_admissions: context.policy.pending_admissions,
+    pending_acks: pending_acks.clone(),
     clock: context.clock.clone(),
     meta: Arc::new(SessionMeta {
       id: session_id,
@@ -564,7 +572,7 @@ pub(crate) async fn run_session(
     class,
     retire: retire_tx,
   };
-  // The final authorization gate (audit 2026-10-23, P1-11): the peer was
+  // The final authorization gate: the peer was
   // admitted against the durable binding before the exchange, but a
   // revocation may have committed while the handshake was completing.
   // Publication re-checks the revoked-subject ledger under the boundary
@@ -715,7 +723,7 @@ pub(crate) async fn run_session(
   // body channels close without an end marker. Every hop fed by THIS
   // session incarnation terminates downstream explicitly — the winner's
   // routes registered by a replacement session for the same peer are a
-  // different identity and stay untouched (audit P1-4).
+  // different identity and stay untouched.
   let (interrupted, relays) = fail_pending_waits(&pending_acks);
   if interrupted > 0 {
     debug!(interrupted, "session closed pending admissions");
@@ -797,18 +805,16 @@ pub(crate) fn retire(entry: &SessionEntry) {
 /// Drains one session's pending admission acks, failing every local
 /// waiter with the typed interruption, and returns the count plus the
 /// forwarded hops' upstream senders for the caller's relay handling.
-fn fail_pending_waits(pending_acks: &PendingAcks) -> (usize, Vec<(TraceId, BoundedSender)>) {
+fn fail_pending_waits(pending_acks: &PendingAdmissions) -> (usize, Vec<(TraceId, BoundedSender)>) {
+  let drained = pending_acks.drain();
+  let interrupted = drained.len();
   let mut relays = Vec::new();
-  let mut interrupted = 0_usize;
-  if let Ok(mut pending) = pending_acks.lock() {
-    interrupted = pending.len();
-    for (trace_id, ack) in pending.drain() {
-      match ack {
-        PendingAck::Wait { notify, .. } => {
-          let _ = notify.send(Err(ErrorKind::StreamInterrupted));
-        }
-        PendingAck::Relay { upstream } => relays.push((trace_id, upstream)),
+  for (trace_id, ack) in drained {
+    match ack {
+      PendingAck::Wait { notify, .. } => {
+        let _ = notify.send(Err(ErrorKind::StreamInterrupted));
       }
+      PendingAck::Relay { upstream } => relays.push((trace_id, upstream)),
     }
   }
   (interrupted, relays)
@@ -854,8 +860,7 @@ pub(crate) fn test_entry(entropy: &dyn crate::api::Entropy) -> (SessionEntry, Bo
   let (frames, receiver) = test_queue(256, 8 * 1_024 * 1_024);
   let entry = SessionEntry {
     frames,
-    pending_acks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-    pending_admissions: MAX_PENDING_ADMISSIONS,
+    pending_acks: PendingAdmissions::new(MAX_PENDING_ADMISSIONS),
     clock: Arc::new(crate::time::HostWallClock),
     meta: Arc::new(SessionMeta {
       id: crate::SessionId::generate(entropy).unwrap(),
@@ -938,7 +943,7 @@ mod authorization_boundary_tests {
     assert!(!ledger.contains(&subject));
   }
 
-  /// The boundary is one exclusive section (audit 2026-10-23, P1-11): a
+  /// The boundary is one exclusive section: a
   /// second acquirer — the other side of the revocation/publication
   /// pair — waits until the first releases, so the two critical sections
   /// can never interleave.
@@ -978,7 +983,7 @@ mod authorization_boundary_tests {
 #[cfg(test)]
 mod pending_admission_tests {
   use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{Arc, Mutex, atomic::AtomicBool},
     time::{Duration, UNIX_EPOCH},
   };
@@ -986,12 +991,14 @@ mod pending_admission_tests {
   use tokio::sync::{oneshot, watch};
 
   use super::{
-    BoundedSender, DialClass, DialDirection, PendingAck, PendingAcks, RouteTable, SessionEntry,
-    SessionMeta,
+    BoundedSender, DialClass, DialDirection, PendingAck, RouteTable, SessionEntry, SessionMeta,
   };
   use crate::{
-    ErrorKind, NodeId, ProtocolTag, StreamMetadata, StreamTarget, TraceId, packet::StaticBody,
-    routing::outbound::run_outbound, storage::contract::helpers::ManualClock,
+    ErrorKind, NodeId, ProtocolTag, StreamMetadata, StreamTarget, TraceId,
+    packet::StaticBody,
+    routing::outbound::run_outbound,
+    session::{DeliveryLeg, pending::PendingAdmissions},
+    storage::contract::helpers::ManualClock,
   };
 
   fn node(value: u8) -> NodeId {
@@ -1002,21 +1009,22 @@ mod pending_admission_tests {
   /// admissions, ready for one more outbound pump.
   fn saturated_entry(pending_admissions: usize) -> SessionEntry {
     let (frames, _frames_rx) = BoundedSender::channel(8, 1 << 20);
-    let pending_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(pending_admissions);
     for seed in 0..pending_admissions {
       let trace_id = TraceId::parse(&format!("trace-{seed:021}")).unwrap();
-      pending_acks.lock().unwrap().insert(
-        trace_id,
-        PendingAck::Relay {
-          upstream: frames.clone(),
-        },
-      );
+      pending_acks
+        .try_reserve_admission(
+          &trace_id,
+          PendingAck::Relay {
+            upstream: frames.clone(),
+          },
+        )
+        .unwrap();
     }
     let (retire, _) = watch::channel(());
     SessionEntry {
       frames,
       pending_acks,
-      pending_admissions,
       clock: Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1))),
       meta: Arc::new(SessionMeta {
         id: crate::SessionId::parse("session-000000000000000000001").unwrap(),
@@ -1041,6 +1049,7 @@ mod pending_admission_tests {
     let request = crate::packet::OutboundRequest {
       trace_id: TraceId::parse("trace-000000000000000000099").unwrap(),
       target: StreamTarget::Exact(node(2)),
+      routing_policy: crate::RoutingPolicy::DIRECT,
       load_balancer: None,
       max_hops: 1,
       protocol: ProtocolTag::parse("radiata.woooo.tech/protocols/test").unwrap(),
@@ -1051,11 +1060,11 @@ mod pending_admission_tests {
     };
     let routes: RouteTable = Arc::new(Mutex::new(BTreeMap::new()));
     run_outbound(
-      entry,
+      DeliveryLeg::Session(entry),
       node(1),
       request,
       routes,
-      false,
+      None,
       None,
       Arc::new(crate::node::EventHub::new()),
     )

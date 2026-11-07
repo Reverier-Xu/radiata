@@ -83,7 +83,7 @@ fn page_spec(
           )
         })?;
       let cursor =
-        PageCursor::from_provider_bytes(bytes.into_boxed_slice().into()).map_err(bad_request)?;
+        PageCursor::new(bytes.into_boxed_slice().into()).map_err(bad_request)?;;
       PageSpec::after(cursor, limit).map_err(bad_request)
     }
     _ => PageSpec::first(limit).map_err(bad_request),
@@ -97,7 +97,7 @@ async fn status(state: State<SharedState>) -> Json<Value> {
   let member_count = members.as_ref().map_or(0, |page| page.items().len());
   // The library annotates every member page entry with its lifecycle
   // status (active / left / cleaned), so an operator — and the scenario
-  // tests — can tell live members from departed evidence (finding #9).
+  // tests — can tell live members from departed evidence.
   let member_statuses: std::collections::BTreeMap<String, String> = members
     .as_ref()
     .map(|page| {
@@ -729,7 +729,7 @@ async fn stream_probe(state: State<SharedState>) -> Result<Json<Value>, (StatusC
     .send(
       StreamTarget::Exact(peer),
       ProtocolTag::parse("radiata.woooo.tech/protocols/probe").unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 8).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 8).unwrap(),
       body,
     )
     .await
@@ -834,7 +834,7 @@ async fn routed_probe(
   // The budget covers the mesh's longest simple path: routes are
   // loop-free by validation, so a generous budget only costs one check
   // per hop while an 8-hop cap silently fails long relay chains.
-  let policy = StreamPolicy::new(RoutingPolicy::Direct, 128)
+  let policy = StreamPolicy::new(RoutingPolicy::DIRECT, 128)
     .map_err(internal_error)?
     .load_balancer(QualifiedTag::parse(FIRST_MATCH_BALANCER).map_err(bad_request)?);
   let started = std::time::Instant::now();

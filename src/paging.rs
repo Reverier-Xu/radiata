@@ -170,12 +170,6 @@ impl PageCursor {
     Ok(Self(value))
   }
 
-  /// Builds a cursor from provider bytes under the same emptiness rule
-  /// as [`Self::new`].
-  pub fn from_provider_bytes(value: Arc<[u8]>) -> Result<Self> {
-    Self::new(value)
-  }
-
   /// The opaque cursor bytes.
   pub fn as_bytes(&self) -> &[u8] {
     &self.0
@@ -362,13 +356,13 @@ mod tests {
   fn cursor_constructors_agree_on_the_emptiness_rule() {
     let value: Arc<[u8]> = Arc::from(b"tail-key".to_vec());
     let built = super::PageCursor::new(Arc::clone(&value)).unwrap();
-    let provided = super::PageCursor::from_provider_bytes(Arc::clone(&value)).unwrap();
+    let provided = super::PageCursor::new(Arc::clone(&value)).unwrap();
     assert_eq!(built, provided);
     assert_eq!(built.as_bytes(), b"tail-key");
 
     let empty: Arc<[u8]> = Arc::from(Vec::new());
     assert!(super::PageCursor::new(Arc::clone(&empty)).is_err());
-    assert!(super::PageCursor::from_provider_bytes(empty).is_err());
+    assert!(super::PageCursor::new(empty).is_err());
   }
 
   /// The end-of-stream rule: a page that ends exactly at the store's last

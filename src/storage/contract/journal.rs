@@ -821,7 +821,7 @@ async fn identity_records_same_purpose_journal_residue_resolves_twice_from_evide
 
   // The recovery resolutions are idempotent evidence reads: both return
   // committed, neither parks on the ready-state refusal, and both stay
-  // well under the old code's 5-second ready-refusal timeout.
+  // well under the 5-second ready-refusal timeout.
   let started = std::time::Instant::now();
   assert!(
     store

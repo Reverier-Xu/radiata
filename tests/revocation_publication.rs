@@ -1,5 +1,5 @@
 //! Public-API integration test for the revocation/publication
-//! authorization boundary (audit 2026-10-23, P1-11).
+//! authorization boundary.
 //!
 //! A member handshake is admitted against the durable trusted binding
 //! and then spends its round trips completing. The revocation that
@@ -213,8 +213,8 @@ async fn trust_status(issuer: &NodeHandle, member: &NodeId) -> Option<TrustStatu
     .map(|view| view.status())
 }
 
-/// Audit P1-11's interleaving, driven end to end: the handshake passes
-/// its binding checks, the revocation commits while the handshake is
+/// The revocation/publication interleaving, driven end to end: the handshake
+/// passes its binding checks, the revocation commits while the handshake is
 /// mid-flight, the handshake then completes — and the session it would
 /// publish never survives under the revoked identity (publication is
 /// refused at the shared authorization boundary, and the durable state

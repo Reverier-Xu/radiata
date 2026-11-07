@@ -457,7 +457,6 @@ async fn json_adapter_reports_os_crash_durable_after_observed_barrier() {
   assert!(storage.capabilities().has_ordered_scan());
   assert!(storage.capabilities().has_reconciliation());
   assert!(storage.capabilities().has_exclusive_lifetime_lock());
-  assert!(!storage.capabilities().has_transactional_migration());
   storage.flush().await.unwrap();
 }
 

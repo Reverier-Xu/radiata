@@ -443,7 +443,7 @@ impl Engine {
     // the next drain close the round (quiescence DONE) while our
     // question is still in flight, which re-opens the door to a second
     // negotiation for the same divergence (the duplicate-delivery
-    // amplifier the budget lane measured).
+    // amplifier).
     if !matches!(message, Message::Hint { .. }) {
       self.awaiting_response = false;
     }
@@ -1602,7 +1602,7 @@ mod tests {
     assert_eq!(pair.b.len(), 5);
   }
 
-  /// A1: the row-removal seam. A removed row leaves the index, marks
+  /// The row-removal seam. A removed row leaves the index, marks
   /// its digest dirty (the peer's fingerprints still carry it until the
   /// next exchange), and a repeated removal is a no-op. Superseded
   /// identities therefore leave the derived view instead of
@@ -1639,7 +1639,7 @@ mod tests {
     assert!(quiet.is_empty(), "an unchanged rescan emits nothing");
   }
 
-  /// B3: the eager-delta piggyback. A healthy-link local change carries
+  /// The eager-delta piggyback. A healthy-link local change carries
   /// the changed rows on the hint (bounded by the row budget); the
   /// plain drive carries none; and a root exchange (the prime) consumes
   /// the candidacy so primed rows never piggyback onto a later hint.

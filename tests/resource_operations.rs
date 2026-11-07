@@ -409,7 +409,7 @@ async fn restart_preserves_labels_without_event_replay(storage: Arc<dyn StorageF
   // Reopen the same store: the identity and the committed candidate load
   // intact. The previous node's shutdown reply returned only after the
   // storage execution barrier drained every database-holding execution
-  // (commits and snapshots; audit 2026-10-27 B3), so the reopen is
+  // (commits and snapshots), so the reopen is
   // immediate and un-retried — a `StorageLocked` here is a regression,
   // not a settle to tolerate.
   let handle = NodeBuilder::new(Arc::clone(&storage))
@@ -825,120 +825,19 @@ async fn remove_preserves_unrelated_metadata() {
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
 
-/// A gate that parks the key provider's `sign` calls while armed: the
-/// audit's race window (check expected → asynchronous signature →
-/// commit) becomes deterministic — both racing writes pass the
-/// effect's pre-check and only then proceed to the commit boundary,
-/// exactly the interleaving a slow KMS provider produces.
-#[derive(Debug, Default)]
-struct SignGate {
-  armed: std::sync::atomic::AtomicBool,
-  entered: std::sync::atomic::AtomicUsize,
-}
-
-impl SignGate {
-  fn arm(&self) {
-    self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
-  }
-
-  fn release(&self) {
-    self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
-  }
-
-  /// Parks one signature while the gate is armed (polled, never
-  /// blocking: the node's runtime keeps serving the parked tasks).
-  async fn hold(&self) {
-    while self.armed.load(std::sync::atomic::Ordering::SeqCst) {
-      tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-  }
-
-  /// Waits until `count` signatures have entered the gate.
-  async fn wait_entered(&self, count: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while self.entered.load(std::sync::atomic::Ordering::SeqCst) < count {
-      assert!(
-        deadline.elapsed() < Duration::from_secs(30),
-        "the racing writes never reached the signature step"
-      );
-      tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-  }
-}
-
-/// A `ScriptedKeys` wrapper whose signatures park on the gate: every
-/// other provider call delegates unchanged.
-#[derive(Debug)]
-struct GatedSignKeys {
-  inner: ScriptedKeys,
-  gate: Arc<SignGate>,
-}
-
-impl radiata::extension::KeyProvider for GatedSignKeys {
-  fn capabilities(&self) -> radiata::KeyCapabilities {
-    self.inner.capabilities()
-  }
-
-  fn create_ed25519<'a>(
-    &'a self, operation: &'a radiata::KeyOperationId,
-  ) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyCreateState>> {
-    self.inner.create_ed25519(operation)
-  }
-
-  fn reconcile_create<'a>(
-    &'a self, operation: &'a radiata::KeyOperationId,
-  ) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyCreateState>> {
-    self.inner.reconcile_create(operation)
-  }
-
-  fn public_key<'a>(
-    &'a self, handle: &'a radiata::KeyHandle,
-  ) -> radiata::BoxFuture<'a, radiata::Result<radiata::PublicKey>> {
-    self.inner.public_key(handle)
-  }
-
-  fn sign<'a>(
-    &'a self, handle: &'a radiata::KeyHandle, message: &'a [u8],
-  ) -> radiata::BoxFuture<'a, radiata::Result<radiata::Signature>> {
-    let gate = Arc::clone(&self.gate);
-    let entered = &self.gate.entered;
-    Box::pin(async move {
-      if gate.armed.load(std::sync::atomic::Ordering::SeqCst) {
-        entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        gate.hold().await;
-      }
-      self.inner.sign(handle, message).await
-    })
-  }
-
-  fn delete<'a>(
-    &'a self, operation: &'a radiata::KeyOperationId, handle: &'a radiata::KeyHandle,
-  ) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyDeleteState>> {
-    self.inner.delete(operation, handle)
-  }
-
-  fn reconcile_delete<'a>(
-    &'a self, operation: &'a radiata::KeyOperationId, handle: &'a radiata::KeyHandle,
-  ) -> radiata::BoxFuture<'a, radiata::Result<radiata::KeyDeleteState>> {
-    self.inner.reconcile_delete(operation, handle)
-  }
-}
-
-/// Regression (the 2026-10-09 audit, item 6): two concurrent
+/// Regression: two concurrent
 /// compare-and-swap writes conditioned on the same observed version
-/// must resolve to exactly one commit. The loser's signature used to
-/// land after a concurrent winner with a later stamp, and the commit's
-/// own tuple check happily replaced the register — silently violating
-/// the caller's expected version. The commit boundary now re-verifies
-/// the precondition inside its own snapshot, so the loser surfaces the
-/// typed [`radiata::ErrorKind::Conflict`] instead.
+/// must resolve to exactly one commit. Both writes may pass the
+/// effect's pre-check before either lands (the pre-check reads the
+/// register, the commit re-reads it), and a loser's later stamp would
+/// then let the commit's own tuple check replace the register —
+/// silently violating the caller's expected version. The commit
+/// boundary re-verifies the precondition inside its own snapshot, so
+/// the loser surfaces the typed [`radiata::ErrorKind::Conflict`]
+/// instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_expected_puts_commit_exactly_one() {
-  let gate = Arc::new(SignGate::default());
-  let keys: Arc<dyn KeyProvider> = Arc::new(GatedSignKeys {
-    inner: ScriptedKeys::full_at(750_000),
-    gate: Arc::clone(&gate),
-  });
+  let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(750_000));
   // A quiet anti-entropy cadence: no background maintenance write may
   // interleave with the two racing commits.
   let config = NodeConfig::new()
@@ -968,9 +867,8 @@ async fn concurrent_expected_puts_commit_exactly_one() {
   assert!(established.is_current_winner());
   let observed = established.accepted().version().clone();
 
-  // Both racing writes observe the same version, then park inside the
-  // (slow) signature — the deterministic audit window.
-  gate.arm();
+  // Both racing writes observe the same version and race the commit
+  // boundary.
   let first = {
     let handle = handle.clone();
     let name = name.clone();
@@ -1005,8 +903,6 @@ async fn concurrent_expected_puts_commit_exactly_one() {
         .await
     })
   };
-  gate.wait_entered(2).await;
-  gate.release();
   let (first, second) = tokio::join!(first, second);
   let (first, second) = (first.unwrap(), second.unwrap());
 

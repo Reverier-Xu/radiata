@@ -12,25 +12,24 @@
 //! only the status query and this cadence; below target with at least one
 //! session everything keeps working.
 //!
-//! The tick runs on the dedicated maintenance worker (audit 2026-10-09
-//! item 3), never inline in the supervisor's select loop, and every
-//! selected member carries ALL of its published endpoints: each dial of
-//! a member rotates that member to its next endpoint with the same
-//! per-member endpoint-level failover the recovery plane applies
-//! (remaining-items list P2-5), so a multi-homed member whose first
-//! endpoint is unreachable is retried on the others.
+//! The tick runs on the dedicated maintenance worker, never inline in
+//! the supervisor's select loop, and every selected member carries ALL of
+//! its published endpoints: each dial of a member rotates that member to
+//! its next endpoint with the same
+//! per-member endpoint-level failover the recovery plane applies, so a
+//! multi-homed member whose first endpoint is unreachable is retried on
+//! the others.
 //!
 //! The one deliberate exception to "healthy means dial nothing" is the
-//! bridge probe (audit finding #1's residual boundary): EVERY healthy
-//! node that still has unconnected members — two sub-partitions each
-//! internally meshed at or above the degree target, including nodes
-//! holding surplus app-initiated sessions above the target — would
-//! otherwise never re-bridge, because the deficit budget is zero
-//! (`degree_plan`) and the recovery controller quiesces on any one
-//! route. At most once per probe interval the tick dials ONE uniformly
-//! random unconnected member through the ordinary maintenance dial
-//! path. The interval bracket alone bounds the dial rate — one dial per
-//! node per five minutes, whatever the session count — and a failed
+//! bridge probe: EVERY healthy node that still has unconnected members —
+//! two sub-partitions each internally meshed at or above the degree
+//! target, including nodes holding surplus app-initiated sessions above
+//! the target — would otherwise never re-bridge, because the deficit
+//! budget is zero (`degree_plan`) and the recovery controller quiesces on
+//! any one route. At most once per probe interval the tick dials ONE
+//! uniformly random unconnected member through the ordinary maintenance
+//! dial path. The interval bracket alone bounds the dial rate — one dial
+//! per node per five minutes, whatever the session count — and a failed
 //! probe dial is recorded at debug level only: a refused or stalled
 //! peer is the probe's expected outcome while a partition persists,
 //! never an error condition.
@@ -114,9 +113,8 @@ pub(super) struct ProbeLedger {
 }
 
 /// Runs the degree-maintenance worker: one long-lived task that owns the
-/// maintenance cadence — the tick the supervisor's select loop used to
-/// await inline (audit 2026-10-09 item 3), so a slow member-table scan
-/// or a stalled dial batch no longer parks control-plane reads and
+/// maintenance cadence, so a slow member-table scan or a stalled dial
+/// batch never parks control-plane reads and
 /// packet admission behind it.
 ///
 /// Overlap policy — SKIP, never queue: the worker is a single task that
@@ -126,8 +124,8 @@ pub(super) struct ProbeLedger {
 /// state (and its dials are already bounded by the in-flight counter),
 /// so a skipped tick only delays the next deficit batch — queueing
 /// would stack stale plans behind a slow store for no gain. Bounded
-/// accounting (audit item 4's lesson): exactly one task for the node's
-/// lifetime, aborted and awaited by the shutdown path.
+/// accounting: exactly one task for the node's lifetime, aborted and
+/// awaited by the shutdown path.
 pub(super) async fn run_maintenance_worker(state: Arc<TickState>) {
   let mut shutdown = state.shutdown.clone();
   let mut timer = tokio::time::interval(DEGREE_MAINTENANCE_TICK_PERIOD);
@@ -179,7 +177,7 @@ impl TickState {
     if plan.dial_budget == 0 {
       // Healthy at target, fully offline (recovery owns it), or nothing
       // left to reach. The healthy-at-target case with unconnected
-      // members left is audit finding #1's residual boundary — neither
+      // members left is the plane's residual boundary — neither
       // plane dials — so the low-frequency bridge probe takes over.
       return self.bridge_probe_tick(&local, &members, &connected, &plan);
     }
@@ -188,8 +186,7 @@ impl TickState {
     // deficit with concurrent dials, or a slow mesh doubles its own
     // dial load every tick. This gate skips the whole tick when the
     // budget is already exhausted; the spawn loop below re-checks per
-    // spawn, because a PARTIALLY free budget must not overshoot either
-    // (audit finding #5).
+    // spawn, because a PARTIALLY free budget must not overshoot either.
     if self
       .maintenance_pending
       .load(std::sync::atomic::Ordering::Relaxed)
@@ -211,15 +208,15 @@ impl TickState {
       &connected,
       self.entropy.as_ref(),
     )?;
-    // Per-member endpoint rotation (remaining-items list P2-5): every
-    // dial of a member advances that member's OWN serial, wrapping per
-    // member — the same per-member `recovery_endpoint` rotation the
-    // recovery plane applies, through one shared serial map. A member
+    // Per-member endpoint rotation: every dial of a member advances that
+    // member's OWN serial, wrapping per member — the same per-member
+    // `recovery_endpoint` rotation the recovery plane applies, through
+    // one shared serial map. A member
     // whose dialed endpoint is unreachable is retried on its next
     // endpoint by the next tick that selects it, regardless of which
     // members any one tick happens to select.
     for (peer, endpoints) in dials {
-      // In-flight bound re-check per spawn (audit finding #5): the
+      // In-flight bound re-check per spawn: the
       // pre-batch gate compares the counter to the budget once, but
       // previous ticks' dials can still hold slots when this batch
       // starts, so spawning the whole batch would admit up to
@@ -250,9 +247,9 @@ impl TickState {
   }
 
   /// One bridge-probe decision for an otherwise quiescent maintenance
-  /// plane (the dial budget is zero): audit finding #1's residual
-  /// boundary — two sub-partitions each internally meshed at/above the
-  /// degree target — never re-bridges on its own, because the deficit
+  /// plane (the dial budget is zero): the residual boundary — two
+  /// sub-partitions each internally meshed at/above the degree target —
+  /// never re-bridges on its own, because the deficit
   /// budget is zero and the recovery controller quiesces on any one
   /// authenticated route. The probe is deliberately slow and bounded:
   /// it fires for EVERY healthy node with at least one unconnected
@@ -594,14 +591,8 @@ mod tests {
   ) {
     let node = member_id(seed);
     let endpoints = vec![crate::Endpoint::parse(endpoint).unwrap()];
-    let descriptor = crate::membership::NodeDescriptorV1::new(
-      node.clone(),
-      member_key(seed),
-      endpoints,
-      1,
-      false,
-      1,
-    );
+    let descriptor =
+      crate::membership::NodeDescriptorV1::new(node.clone(), member_key(seed), endpoints, 1, 1);
     crate::membership::store::store_descriptor_ctx(
       supervisor.context().unwrap().store(),
       supervisor.dependencies.entropy.as_ref(),
@@ -615,8 +606,8 @@ mod tests {
   }
 
   /// A caller-registered transport whose connect future counts the
-  /// attempt and then panics mid-dial: P2-12's exact shape — a custom
-  /// transport future unwinding through the dial task. The attempt
+  /// attempt and then panics mid-dial — a custom transport future
+  /// unwinding through the dial task. The attempt
   /// counter is the observable: it rising again after the panic proves a
   /// later dial still launched, which the leaked in-flight counter made
   /// impossible.
@@ -717,14 +708,13 @@ mod tests {
     holder.abort();
   }
 
-  /// Endpoint-level failover for the degree plane (remaining-items list
-  /// P2-5): a multi-homed member whose first endpoint is unreachable
-  /// is dialed on its SECOND endpoint by the next maintenance tick —
+  /// Endpoint-level failover for the degree plane: a multi-homed member
+  /// whose first endpoint is unreachable is dialed on its SECOND endpoint
+  /// by the next maintenance tick —
   /// the same `recovery_endpoint` rotation the recovery plane applies,
-  /// so maintenance dials no longer hammer a dead first endpoint
-  /// forever. Under the old single-endpoint projection the second tick
-  /// dialed the first endpoint again and the second listener never saw
-  /// a connection.
+  /// so maintenance dials never hammer a dead first endpoint forever. A
+  /// single-endpoint projection would dial the first endpoint again and
+  /// the second listener would never see a connection.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn maintenance_dials_rotate_to_the_second_endpoint_when_the_first_stalls() {
     let (reference, config) = test_support::reference_and_config();
@@ -797,7 +787,7 @@ mod tests {
     second_holder.abort();
   }
 
-  /// The same in-flight bound for the deficit path (audit finding #5):
+  /// The same in-flight bound for the deficit path:
   /// with one dial still parked from the previous tick, the next tick
   /// must hold the batch AT the dial budget instead of overshooting to
   /// `2*dial_budget - 1` — the pre-batch gate alone admits the
@@ -964,7 +954,7 @@ mod tests {
     );
   }
 
-  /// Audit finding #1's residual boundary: two sub-partitions each
+  /// The bridge probe's residual boundary: two sub-partitions each
   /// internally meshed at/above the degree target never re-bridge —
   /// the deficit budget is zero and the recovery controller quiesces
   /// on any one route. The bridge probe heals it: a healthy node with
@@ -1091,9 +1081,9 @@ mod tests {
     holder.abort();
   }
 
-  /// A03: the over-target restriction is gone. Every healthy node with
+  /// Every healthy node with
   /// unconnected members probes — a node holding surplus app-initiated
-  /// sessions above `target + 1` no longer stays blind to the far side
+  /// sessions above `target + 1` never stays blind to the far side
   /// of a partition until a session drop: the probe fires at its
   /// interval even at six sessions over a target of four, and the
   /// interval bracket stays the sole storm bound.
@@ -1109,7 +1099,7 @@ mod tests {
     let (port, connections, holder) = silent_peer().await;
 
     // An eight-node cluster (k(8) = 4) with SIX live sessions — two
-    // above the old `target + slack` bound — and one unconnected member
+    // above the probe's `target + slack` bound — and one unconnected member
     // (107), so the probe's uniform pick is deterministic and the
     // silent listener counts the dial.
     for seed in 101..=106 {
@@ -1128,7 +1118,7 @@ mod tests {
     assert_eq!(
       view.sessions(),
       6,
-      "the surplus sessions sit above the retired target + slack bound"
+      "the surplus sessions sit above the target + slack bound"
     );
     assert_eq!(view.state(), crate::ConnectionDegreeState::Healthy);
 
@@ -1514,7 +1504,7 @@ mod tests {
     }
   }
 
-  /// A03: a failed probe dial is an expected outcome, never an error:
+  /// A failed probe dial is an expected outcome, never an error:
   /// the refusal is recorded at debug level only (no warn/error
   /// escalation anywhere on the degree plane), the tick itself stays
   /// `Ok`, the in-flight slot releases, and the re-armed bracket probes
@@ -1688,7 +1678,7 @@ mod tests {
     );
   }
 
-  /// P2-12's maintenance shape: a caller-supplied transport whose
+  /// The maintenance shape: a caller-supplied transport whose
   /// connect future panics mid-dial must not strand its in-flight slot.
   /// The manual `fetch_add`/`fetch_sub` pair decremented after the
   /// await, so the panic skipped the decrement — and both the deficit

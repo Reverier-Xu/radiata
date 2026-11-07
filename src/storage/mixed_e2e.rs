@@ -41,11 +41,15 @@ async fn open_metadata(factory: &Arc<dyn StorageFactory>) -> MetadataStore {
 }
 
 /// The logical families: every domain except the storage-internal receipt
-/// bookkeeping, whose entries carry per-store transaction identifiers.
+/// bookkeeping, whose entries carry per-store transaction identifiers, and
+/// the node-local families, whose content follows each store's own commit
+/// order (two stores that converge through different orders legitimately
+/// hold different rows).
 fn logical_families() -> Vec<crate::storage::families::MetadataFamily> {
   metadata_families()
     .into_iter()
     .filter(|family| family.domain() != crate::storage::families::MetadataDomain::Receipt)
+    .filter(|family| family.replicated())
     .collect()
 }
 
@@ -64,15 +68,14 @@ fn descriptor(node: &NodeId, revision: u64, seed: [u8; 32]) -> NodeDescriptorV1 
     key,
     vec![crate::Endpoint::parse("wss://127.0.0.1:64000").unwrap()],
     revision,
-    false,
     1,
   )
 }
 
 fn resource_record(
-  seed_index: u8, writer: &NodeId, uri: &str, timestamp_millis: u64, seed: [u8; 32],
+  seed_index: u8, writer: &NodeId, uri: &str, timestamp_millis: i64,
 ) -> ResourceRecordV1 {
-  ResourceRecordV1::sign(
+  ResourceRecordV1::new(
     ResourceName::parse(&format!("radiata.woooo.tech/resources/mixed-{seed_index}")).unwrap(),
     LabelValue::parse("document").unwrap(),
     crate::ResourceUri::parse(uri).unwrap(),
@@ -86,7 +89,6 @@ fn resource_record(
     writer.clone(),
     0,
     false,
-    &ed25519_dalek::SigningKey::from_bytes(&seed),
   )
   .unwrap()
 }
@@ -94,12 +96,14 @@ fn resource_record(
 /// Seeds one record into every caller-writable metadata family through
 /// one cross-family transaction. Excluded: the reserved receipt-internal
 /// bookkeeping namespace, the pending-transaction journal written by the
-/// commit machinery itself, and the two record namespaces whose pages
-/// decode real record encodings (they are exercised by the real records
-/// and the convergence lanes instead).
+/// commit machinery itself, the node-local families (written only by their
+/// owning commit's own transaction), and the two record namespaces whose
+/// pages decode real record encodings (they are exercised by the real
+/// records and the convergence lanes instead).
 fn seedable_family_tags() -> Vec<&'static str> {
   metadata_families()
     .iter()
+    .filter(|family| family.replicated())
     .map(crate::storage::families::MetadataFamily::namespace_tag)
     .filter(|tag| *tag != crate::storage::families::INTERNAL_NAMESPACE)
     .filter(|tag| *tag != crate::storage::families::PENDING_NAMESPACE)
@@ -261,16 +265,8 @@ mod cross_backend {
     let seed = [7_u8; 32];
     put_descriptor(&side_a, &descriptor(&node, 1, seed)).await;
     put_descriptor(&side_b, &descriptor(&writer(2), 1, [9_u8; 32])).await;
-    put_resource(
-      &side_a,
-      &resource_record(1, &writer(1), "u://a1", 2_000, seed),
-    )
-    .await;
-    put_resource(
-      &side_b,
-      &resource_record(2, &writer(2), "u://b1", 3_000, [9_u8; 32]),
-    )
-    .await;
+    put_resource(&side_a, &resource_record(1, &writer(1), "u://a1", 2_000)).await;
+    put_resource(&side_b, &resource_record(2, &writer(2), "u://b1", 3_000)).await;
 
     converge([&side_a, &side_b]).await;
 

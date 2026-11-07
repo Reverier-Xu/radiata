@@ -9,11 +9,10 @@
 use std::{sync::Arc, time::Duration};
 
 use radiata::{
-  BoxFuture, Endpoint, ErrorKind, EventOptions, EventReceive, LoadBalancingPolicy, NodeBuilder,
-  NodeConfig, NodeHandle, NodeId, PageSpec, ProtocolDefinition, ProtocolTag, ResourceChanged,
-  ResourceLabels, ResourceName, ResourceUri, ResourceWrite, Result, RoutingPolicy, Selector,
-  SessionChanged, ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget,
-  extension::KeyProvider,
+  BoxFuture, Endpoint, ErrorKind, EventOptions, EventReceive, NodeBuilder, NodeConfig, NodeHandle,
+  PageSpec, ProtocolDefinition, ProtocolTag, ResourceChanged, ResourceLabels, ResourceName,
+  ResourceUri, ResourceWrite, Result, RoutingPolicy, Selector, SessionChanged, ShutdownReason,
+  StreamMetadata, StreamPolicy, StreamTarget, extension::KeyProvider,
 };
 
 mod common;
@@ -21,8 +20,7 @@ mod common;
 use common::{MemoryStorageFactory, ScriptedKeys};
 
 const SYNC_INTERVAL: Duration = Duration::from_millis(50);
-const ECHO_PROTOCOL: &str = "radiata.woooo.tech/protocols/facade-echo";
-const LOAD_BALANCER: &str = "example.org/balancers/first-match";
+const ECHO_PROTOCOL: &str = "example.org/protocols/facade-echo";
 
 struct Node {
   handle: NodeHandle,
@@ -53,29 +51,6 @@ impl radiata::PacketConsumer for EchoCollector {
 }
 
 /// Selects the first matching candidate in canonical order.
-#[derive(Debug)]
-struct FirstMatch;
-
-impl LoadBalancingPolicy for FirstMatch {
-  fn select<'a>(
-    &'a self, _selector: &'a Selector, candidates: &'a dyn radiata::CandidateNodeReader,
-  ) -> BoxFuture<'a, Result<NodeId>> {
-    Box::pin(async move {
-      let page = candidates.next_matching_nodes(_selector, None, 1).await?;
-      page
-        .items()
-        .first()
-        .map(|member| member.node_id().clone())
-        .ok_or_else(|| {
-          radiata::Error::provider(
-            radiata::ProviderErrorKind::Unsupported,
-            radiata::ProviderErrorContext::LoadBalancingPolicy,
-          )
-        })
-    })
-  }
-}
-
 /// A small opaque body for the echo packet.
 fn echo_body(
   chunk: &'static [u8],
@@ -99,12 +74,6 @@ async fn start_node(seed: u64, echo: bool) -> Node {
           radiata::FeatureTag::parse("radiata.woooo.tech/features/session-core").unwrap(),
         ),
         Arc::new(EchoCollector::default()),
-      )
-      .unwrap();
-    extensions
-      .register_load_balancer(
-        radiata::QualifiedTag::parse(LOAD_BALANCER).unwrap(),
-        Arc::new(FirstMatch),
       )
       .unwrap();
     builder = builder.extensions(extensions);
@@ -596,16 +565,17 @@ async fn facade_core_only_operations() {
   }
 
   // Label-selected packet delivery: the issuer targets the matching-node
-  // selector through the registered first-match policy.
+  // selector through the built-in first-match load balancer the default
+  // path installs.
   let selector = Selector::parse("example.org/labels/zone=edge").unwrap();
   let packet = issuer
     .handle
     .open_stream(
       StreamTarget::MatchingNodes(selector),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1)
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1)
         .unwrap()
-        .load_balancer(radiata::QualifiedTag::parse(LOAD_BALANCER).unwrap()),
+        .load_balancer(radiata::QualifiedTag::parse(radiata::DefaultLoadBalancer::TAG).unwrap()),
       StreamMetadata::new(),
     )
     .unwrap();
@@ -796,7 +766,7 @@ async fn resource_labels_never_enable_protocols() {
     .open_stream(
       StreamTarget::Exact(member.handle.local_node().await.unwrap().node_id().clone()),
       ProtocolTag::parse(ECHO_PROTOCOL).unwrap(),
-      StreamPolicy::new(RoutingPolicy::Direct, 1).unwrap(),
+      StreamPolicy::new(RoutingPolicy::DIRECT, 1).unwrap(),
       StreamMetadata::new(),
     )
     .unwrap_err();

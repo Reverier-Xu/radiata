@@ -5,10 +5,9 @@
 //! aggregate), `HINT` (best-effort changed-range notice), `OFFER` (my
 //! fingerprints for negotiated ranges), `NEED` (the ranges whose rows I
 //! lack), `ROWS` (row payloads), and `DONE` (round-close receipt). The
-//! shapes follow `docs/research/06-architecture-proposal.md` §3; the
-//! lane field rides every message — not just `ROOT` — because one
-//! protocol stream carries all four lanes and dispatch happens at the
-//! session seam.
+//! shapes follow the reconcile v1 message design; the lane field rides
+//! every message — not just `ROOT` — because one protocol stream carries
+//! all four lanes and dispatch happens at the session seam.
 //!
 //! Every body is canonical CBOR through the crate's single canonical
 //! encoder/decoder (`crate::protocol::cbor`): decode re-encodes and
@@ -62,7 +61,10 @@ pub(crate) const KIND_DONE: u8 = 6;
 
 /// One reconciliation lane: an independently converging key space. The
 /// registry is closed — an unknown lane code fails closed at decode,
-/// and an engine never accepts a message for another lane.
+/// and an engine never accepts a message for another lane. The wire-code
+/// maps ([`LaneId::code`], [`LaneId::from_code`]) and the lane set
+/// ([`LaneId::all`]) derive from the lane registry
+/// ([`super::lane::LANES`]): each lane's own module carries its `CODE`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum LaneId {
   /// Member descriptor rows.
@@ -73,39 +75,6 @@ pub(crate) enum LaneId {
   Resources,
   /// Leave/cleanup/revocation/checkpoint rows.
   Tombstones,
-}
-
-impl LaneId {
-  /// Every lane, in wire-code order.
-  #[cfg(test)]
-  pub(crate) const ALL: [Self; 4] = [
-    Self::Descriptors,
-    Self::Trust,
-    Self::Resources,
-    Self::Tombstones,
-  ];
-
-  /// The immutable wire code of the lane.
-  pub(crate) const fn code(self) -> u8 {
-    match self {
-      Self::Descriptors => 1,
-      Self::Trust => 2,
-      Self::Resources => 3,
-      Self::Tombstones => 4,
-    }
-  }
-
-  /// Resolves a wire code to a lane; unknown codes are `None` and fail
-  /// closed at the decode boundary.
-  pub(crate) const fn from_code(code: u8) -> Option<Self> {
-    match code {
-      1 => Some(Self::Descriptors),
-      2 => Some(Self::Trust),
-      3 => Some(Self::Resources),
-      4 => Some(Self::Tombstones),
-      _ => None,
-    }
-  }
 }
 
 /// The tombstone lane's row-key kind byte: one key space for the four
@@ -132,6 +101,15 @@ pub(crate) enum TombstoneKind {
 }
 
 impl TombstoneKind {
+  /// Every tombstone kind, in wire-code order: the single closed set the
+  /// lane's scan and namespace map derive from.
+  pub(crate) const ALL: [Self; 4] = [
+    Self::Leave,
+    Self::Cleanup,
+    Self::Revocation,
+    Self::Checkpoint,
+  ];
+
   /// The kind byte that prefixes one tombstone-lane row key.
   pub(crate) const fn prefix(self) -> u8 {
     match self {
@@ -407,66 +385,81 @@ struct DoneWire {
 /// violations (over-bound lists, inverted ranges, unknown lanes) fail
 /// closed before any byte is emitted.
 pub(crate) fn encode(message: &Message) -> Result<Vec<u8>> {
+  // The lane code resolves through the lane registry: the lane field
+  // rides every message, and a code the registry does not list cannot be
+  // emitted (the decode side fails closed on it in return).
+  let code = message.lane().code();
   match message {
-    Message::Root { lane, count, xor } => encode_canonical(
+    Message::Root {
+      lane: _,
+      count,
+      xor,
+    } => encode_canonical(
       &RootWire {
         kind: KIND_ROOT,
-        lane: lane.code(),
+        lane: code,
         count: *count,
         xor: *xor,
       },
       RECONCILE_CBOR_LIMITS,
     ),
-    Message::Hint { lane, ranges, rows } => {
+    Message::Hint {
+      lane: _,
+      ranges,
+      rows,
+    } => {
       let ranges = ranges_to_wire(ranges)?;
       let rows = rows_to_wire(rows)?;
       encode_canonical(
         &HintWire {
           kind: KIND_HINT,
-          lane: lane.code(),
+          lane: code,
           ranges,
           rows,
         },
         RECONCILE_CBOR_LIMITS,
       )
     }
-    Message::Offer { lane, ranges } => {
+    Message::Offer { lane: _, ranges } => {
       let ranges = ranges_to_wire(ranges)?;
       encode_canonical(
         &OfferWire {
           kind: KIND_OFFER,
-          lane: lane.code(),
+          lane: code,
           ranges,
         },
         RECONCILE_CBOR_LIMITS,
       )
     }
-    Message::Need { lane, bounds } => {
+    Message::Need { lane: _, bounds } => {
       let bounds = bounds_to_wire(bounds)?;
       encode_canonical(
         &NeedWire {
           kind: KIND_NEED,
-          lane: lane.code(),
+          lane: code,
           bounds,
         },
         RECONCILE_CBOR_LIMITS,
       )
     }
-    Message::Rows { lane, rows } => {
+    Message::Rows { lane: _, rows } => {
       let rows = rows_to_wire(rows)?;
       encode_canonical(
         &RowsWire {
           kind: KIND_ROWS,
-          lane: lane.code(),
+          lane: code,
           rows,
         },
         RECONCILE_CBOR_LIMITS,
       )
     }
-    Message::Done { lane, round_token } => encode_canonical(
+    Message::Done {
+      lane: _,
+      round_token,
+    } => encode_canonical(
       &DoneWire {
         kind: KIND_DONE,
-        lane: lane.code(),
+        lane: code,
         round_token: *round_token,
       },
       RECONCILE_CBOR_LIMITS,
@@ -859,12 +852,12 @@ mod tests {
   /// The lane registry is closed and bijective on its codes.
   #[test]
   fn reconcile_wire_lane_registry_is_closed() {
-    let codes: Vec<u8> = LaneId::ALL.iter().map(|lane| lane.code()).collect();
-    for (index, lane) in LaneId::ALL.into_iter().enumerate() {
+    let codes: Vec<u8> = LaneId::all().map(|lane| lane.code()).collect();
+    for lane in LaneId::all() {
       assert_eq!(LaneId::from_code(lane.code()), Some(lane));
       assert!(
-        LaneId::ALL[..index]
-          .iter()
+        LaneId::all()
+          .filter(|other| *other != lane)
           .all(|other| other.code() != lane.code()),
         "duplicate lane code: {lane:?}"
       );

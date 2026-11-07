@@ -34,8 +34,11 @@ use std::sync::Arc;
 use minicbor::{Decode, Encode, bytes::ByteVec};
 
 use super::{
-  canonical::canonical_record, lifecycle::LocalIdentityContext, records,
-  records::metadata_namespace, signature::verify_strict,
+  canonical::canonical_record,
+  lifecycle::LocalIdentityContext,
+  records,
+  records::{FLAT_RECORD_LIMITS, metadata_namespace},
+  signature::verify_strict,
 };
 /// The durable namespace of cleanup tombstone records.
 pub(crate) use crate::storage::families::CLEANUP_NAMESPACE;
@@ -49,27 +52,24 @@ pub(crate) const CLEANUP_RECORD_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/cl
 /// The signature domain of the issuer-signed cleanup tombstone.
 pub(crate) const CLEANUP_RECORD_DOMAIN: &[u8] = b"radiata.woooo.tech/crypto/v1/cleanup-record";
 
-/// Canonical-decoder bounds for the flat cleanup record.
-const CLEANUP_LIMITS: crate::protocol::CborLimits = crate::protocol::CborLimits::new(1, 8, 1_024);
-
 canonical_record! {
   wire CleanupRecordWire for CleanupRecordV1 vis [pub(crate)] {
     schema CLEANUP_RECORD_SCHEMA,
     version u16 1,
-    limits CLEANUP_LIMITS,
+    limits FLAT_RECORD_LIMITS,
     decode [strict remap "cleanup record", canonical "cleanup record canonical form", header_err "cleanup record schema"]
     fields {
       #[n(2)] subject = subject: String => node()
       #[n(3)] subject_key = subject_key: ByteVec => key32("cleanup record key")
       #[n(4)] issuer = issuer: String => node()
-      #[n(5)] timestamp_millis = timestamp_millis: u64 => stamp()
+      #[n(5)] timestamp_millis = timestamp_millis: i64 => stamp()
       #[n(6)] signature = signature: ByteVec => sig("cleanup record signature")
     }
     signed_body wire CleanupRecordBodyWire fn encode_signed_body {
       #[n(2)] subject: &NodeId as subject: String => node()
       #[n(3)] subject_key: &PublicKey as subject_key: ByteVec => key32()
       #[n(4)] issuer: &NodeId as issuer: String => node()
-      #[n(5)] timestamp_millis: u64 as timestamp_millis: u64 => stamp()
+      #[n(5)] timestamp_millis: i64 as timestamp_millis: i64 => stamp()
     }
   }
 }
@@ -80,13 +80,13 @@ pub(crate) struct CleanupRecordV1 {
   subject: NodeId,
   subject_key: PublicKey,
   issuer: NodeId,
-  timestamp_millis: u64,
+  timestamp_millis: i64,
   signature: Signature,
 }
 
 impl CleanupRecordV1 {
   pub(crate) const fn new(
-    subject: NodeId, subject_key: PublicKey, issuer: NodeId, timestamp_millis: u64,
+    subject: NodeId, subject_key: PublicKey, issuer: NodeId, timestamp_millis: i64,
     signature: Signature,
   ) -> Self {
     Self {
@@ -98,7 +98,7 @@ impl CleanupRecordV1 {
     }
   }
 
-  pub(crate) const fn timestamp_millis(&self) -> u64 {
+  pub(crate) const fn timestamp_millis(&self) -> i64 {
     self.timestamp_millis
   }
 
@@ -285,12 +285,12 @@ canonical_record! {
   wire CheckpointWire for CleanupCheckpointV1 vis [pub(crate)] {
     schema CHECKPOINT_SCHEMA,
     version u16 1,
-    limits CLEANUP_LIMITS,
+    limits FLAT_RECORD_LIMITS,
     decode [strict remap "cleanup checkpoint", canonical "cleanup checkpoint canonical form", header_err "cleanup checkpoint schema"]
     fields {
       /// The GC epoch watermark: host wall-clock UNIX milliseconds. Removal
       /// tombstones stamped at or before this watermark are collected.
-      #[n(2)] watermark_millis = watermark_millis: u64 => stamp()
+      #[n(2)] watermark_millis = watermark_millis: i64 => stamp()
       /// The member that issued the epoch (hygiene provenance only; the
       /// record is unsigned by design — violations degrade to metadata
       /// hygiene issues, never security failures).
@@ -307,12 +307,12 @@ canonical_record! {
 /// leave/cleanup tombstone retires the binding it pins with it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CleanupCheckpointV1 {
-  watermark_millis: u64,
+  watermark_millis: i64,
   issuer: NodeId,
 }
 
 impl CleanupCheckpointV1 {
-  pub(crate) const fn new(watermark_millis: u64, issuer: NodeId) -> Self {
+  pub(crate) const fn new(watermark_millis: i64, issuer: NodeId) -> Self {
     Self {
       watermark_millis,
       issuer,
@@ -320,8 +320,14 @@ impl CleanupCheckpointV1 {
   }
 }
 
-fn checkpoint_key() -> StoreKey {
-  StoreKey::new(Arc::from(b"checkpoint".to_vec()))
+/// The cleanup checkpoint singleton's store key bytes: one row in the
+/// checkpoint namespace, addressed by exactly this string. The single
+/// source for the key, so the writer, the readers, and the reconcile
+/// lane all address the same row.
+pub(crate) const CHECKPOINT_KEY: &[u8] = b"checkpoint";
+
+pub(crate) fn checkpoint_key() -> StoreKey {
+  StoreKey::new(Arc::from(CHECKPOINT_KEY))
 }
 
 fn checkpoint_namespace() -> Result<StoreNamespace> {
@@ -338,7 +344,7 @@ fn checkpoint_namespace() -> Result<StoreNamespace> {
 /// design, and no peer receipt is ever owed or tracked).
 pub(crate) async fn issue_checkpoint_ctx(
   context: &LocalIdentityContext, entropy: &dyn Entropy,
-) -> Result<u64> {
+) -> Result<i64> {
   let store = context.store();
   let _permit = store.write_permit().await;
   // Inside the writer exclusion no other committer can interleave, so
@@ -391,9 +397,13 @@ pub(crate) async fn issue_checkpoint_ctx(
   }
 }
 
-/// The latest local checkpoint watermark, if any.
-pub(crate) async fn latest_checkpoint_millis_ctx(store: &MetadataStore) -> Result<Option<u64>> {
-  let snapshot = store.snapshot().await?;
+/// The latest local checkpoint watermark, read from one snapshot: the
+/// scan side self-serves it (the reconcile tombstones lane judges its
+/// collected rows against the same store instant its snapshot lists),
+/// while the store handle wrapper below opens that snapshot.
+pub(crate) async fn latest_checkpoint_millis(
+  snapshot: &(dyn crate::provider::StoreSnapshot + '_),
+) -> Result<Option<i64>> {
   let Some(value) = snapshot
     .get(&checkpoint_namespace()?, &checkpoint_key())
     .await?
@@ -403,6 +413,11 @@ pub(crate) async fn latest_checkpoint_millis_ctx(store: &MetadataStore) -> Resul
   Ok(Some(
     CleanupCheckpointV1::decode(value.as_bytes())?.watermark_millis,
   ))
+}
+
+/// The latest local checkpoint watermark, if any.
+pub(crate) async fn latest_checkpoint_millis_ctx(store: &MetadataStore) -> Result<Option<i64>> {
+  latest_checkpoint_millis(store.snapshot().await?.as_ref()).await
 }
 
 /// Persists one checkpoint received over sync: max-wins by watermark, so
@@ -442,15 +457,17 @@ pub(crate) async fn persist_checkpoint_ctx(
   Ok(())
 }
 
-/// The checkpoint GC pass: after sync rounds, delete the collected
-/// leave and cleanup tombstones stamped at or before the latest local
-/// checkpoint watermark, retiring each record's pinned subject binding
+/// The checkpoint GC pass: delete the collected leave and cleanup
+/// tombstones stamped at or before the latest local checkpoint watermark,
+/// retiring each record's pinned subject binding
 /// in the same transaction (a re-bound subject keeps its new binding,
 /// and a revoked subject keeps the binding its permanent revocation
 /// constrains — see [`records::collect_tombstones_before`]). Bounded
 /// per pass; a raced delete conflicts and stays for the next pass.
 /// Revocation records are never collected here (permanent), and live
-/// entries are never touched (the filter is removal-only).
+/// entries are never touched (the filter is removal-only). The runtime
+/// cadence owner is the recovery worker's retention sweeps
+/// (`runtime/retention.rs`), gated on the checkpoint existing.
 pub(crate) async fn collect_collected_tombstones_ctx(
   store: &MetadataStore, entropy: &dyn Entropy,
 ) -> Result<usize> {
@@ -471,7 +488,7 @@ pub(crate) async fn collect_collected_tombstones_ctx(
 /// the watermark never consumes the batch, so a fresh head cannot hide
 /// the collectible tail behind it.
 async fn collect_cleanup_before_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy, watermark: u64,
+  store: &MetadataStore, entropy: &dyn Entropy, watermark: i64,
 ) -> Result<usize> {
   let namespace = metadata_namespace(CLEANUP_NAMESPACE)?;
   let collectible = records::scan_collectible_records(
@@ -502,9 +519,9 @@ mod tests {
 
   use super::{
     CHECKPOINT_NAMESPACE, CLEANUP_RECORD_DOMAIN, CleanupCheckpointV1, CleanupRecordV1,
-    cleaned_nodes_ctx, collect_collected_tombstones_ctx, is_cleaned_ctx, issue_checkpoint_ctx,
-    known_cleanup_records_ctx, latest_checkpoint_millis_ctx, metadata_namespace,
-    persist_cleanup_record_ctx, sign_cleanup_record,
+    checkpoint_key, cleaned_nodes_ctx, collect_collected_tombstones_ctx, is_cleaned_ctx,
+    issue_checkpoint_ctx, known_cleanup_records_ctx, latest_checkpoint_millis_ctx,
+    metadata_namespace, persist_cleanup_record_ctx, sign_cleanup_record,
   };
   use crate::{
     ErrorKind, NodeId, PublicKey, Signature,
@@ -526,9 +543,9 @@ mod tests {
   /// knowledge) at an explicit watermark, so GC tests order tombstone
   /// stamps against it deterministically.
   async fn install_checkpoint(
-    context: &lifecycle::LocalIdentityContext, entropy: &dyn crate::api::Entropy, watermark: u64,
+    context: &lifecycle::LocalIdentityContext, entropy: &dyn crate::api::Entropy, watermark: i64,
   ) {
-    use crate::{StoreExpectation, StoreKey, StoreOperation, StoreValue};
+    use crate::{StoreExpectation, StoreOperation, StoreValue};
     let checkpoint = CleanupCheckpointV1::new(watermark, context.identity().node().clone());
     let snapshot = context.store().snapshot().await.unwrap();
     let transaction = context
@@ -538,7 +555,7 @@ mod tests {
         snapshot.revision().clone(),
         vec![StoreOperation::Put {
           namespace: metadata_namespace(CHECKPOINT_NAMESPACE).unwrap(),
-          key: StoreKey::new(Arc::from(b"checkpoint".to_vec())),
+          key: checkpoint_key(),
           expected: StoreExpectation::Absent,
           value: StoreValue::new(Arc::from(checkpoint.encode().unwrap())),
         }],
@@ -555,7 +572,7 @@ mod tests {
   /// the checkpoint GC can order it against watermarks.
   async fn stamped_tombstone(
     context: &lifecycle::LocalIdentityContext, keys: &Arc<ScriptedKeys>, subject: &NodeId,
-    subject_key: &PublicKey, stamp: u64,
+    subject_key: &PublicKey, stamp: i64,
   ) -> CleanupRecordV1 {
     let identity = context.identity();
     let body =
@@ -691,7 +708,7 @@ mod tests {
   /// binding must be retained for the record to verify.
   fn foreign_tombstone(
     issuer: &NodeId, signing: &ed25519_dalek::SigningKey, subject: &NodeId,
-    subject_key: &PublicKey, stamp: u64,
+    subject_key: &PublicKey, stamp: i64,
   ) -> CleanupRecordV1 {
     use ed25519_dalek::Signer as _;
     let body = CleanupRecordV1::encode_signed_body(subject, subject_key, issuer, stamp).unwrap();
@@ -708,8 +725,7 @@ mod tests {
   /// Two verified cleanups of the same binding from different issuers
   /// (the partitioned-cleanup scenario) merge deterministically: the
   /// earliest signed stamp wins regardless of delivery order, and a
-  /// re-delivery of the losing record never rolls the winner back
-  /// (audit A01).
+  /// re-delivery of the losing record never rolls the winner back.
   #[tokio::test]
   async fn partitioned_cleanup_records_merge_to_the_earliest_stamp() {
     let factory = reference_factory();
@@ -808,7 +824,7 @@ mod tests {
 
   /// An exact-stamp tie breaks deterministically on the canonical
   /// encoding: the lexicographic minimum wins in both delivery orders,
-  /// so tied partitioned cleanups still converge (audit A01).
+  /// so tied partitioned cleanups still converge.
   #[tokio::test]
   async fn tied_cleanup_records_break_deterministically_on_the_encoding() {
     let factory = reference_factory();
@@ -898,7 +914,7 @@ mod tests {
   }
 
   /// The merge never launders a different binding: a stored cleanup
-  /// record pinning another subject key still fails closed (audit A01).
+  /// record pinning another subject key still fails closed.
   #[tokio::test]
   async fn cleanup_records_over_different_bindings_still_fail_closed() {
     let factory = reference_factory();

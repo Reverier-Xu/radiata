@@ -129,7 +129,7 @@ def member_statuses(node: int) -> dict:
 
 def wait_member_status(node_id: str, expected: str, nodes: list[int], deadline_s: float = 60):
     """Every node must annotate the node_id with the expected lifecycle
-    status (finding #9 fixed: member pages distinguish live members from
+    status (member pages distinguish live members from
     departed evidence)."""
     started = time.monotonic()
     while True:
@@ -367,7 +367,7 @@ def main() -> None:
     write_resource(6, "demo.org/resources/conflict", "written-on-side-B")
     time.sleep(2)
     # The baseline digest is read from each side's WRITER: the non-writer
-    # nodes may not even hold their own side's write (finding #10).
+    # nodes may not even hold their own side's write.
     side_a_digest = digest_of(2, "demo.org/resources/conflict")
     side_b_digest = digest_of(6, "demo.org/resources/conflict")
     fmt = lambda d: (d or "None")[:12] + ".."

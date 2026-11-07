@@ -411,21 +411,14 @@ impl Tasks {
   /// the node stopped: the table's post-shutdown state is not part of
   /// the public contract.
   pub async fn get(&self, id: crate::TaskId) -> Result<Option<crate::view::TaskView>> {
-    self.require_running()?;
-    Ok(self.client()?.observer.table.view(&id))
+    self.runtime.get_task(id)
   }
 
   /// Tasks in canonical id order (= admission order, newest last).
   /// Local read like [`Tasks::get`]; see its shutdown note.
   pub async fn list(&self, page: PageSpec) -> Result<crate::view::TaskPage> {
-    self.require_running()?;
     let cursor = page.cursor().cloned();
-    let limit = page.limit().clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
-    self
-      .client()?
-      .observer
-      .table
-      .page_views(cursor.as_ref().map(|cursor| cursor.as_bytes()), limit)
+    self.runtime.page_tasks(cursor.as_ref(), page.limit())
   }
 
   /// Awaits one task's terminal phase and resolves with its terminal
@@ -440,13 +433,10 @@ impl Tasks {
   pub async fn wait(&self, id: crate::TaskId) -> Result<crate::view::TaskView> {
     self.require_running()?;
     let client = self.client()?;
-    let Some((kind, _)) = client.observer.table.status(&id) else {
-      return Err(crate::Error::not_found("task"));
-    };
     // The watch/shutdown arbitration is the observer's own (shared
     // with [`crate::Task::wait`]); only the terminal read differs —
     // this wait resolves with the view, not the typed output.
-    client.observer.await_terminal(&id, &kind).await?;
+    client.observer.await_terminal(&id).await?;
     client
       .observer
       .table
@@ -460,12 +450,21 @@ impl Tasks {
   /// [`TaskReconciler`](crate::TaskReconciler); anything else is
   /// [`crate::ErrorKind::Unsupported`]. The admitted [`Task`] resolves
   /// with `()` on the reconciler's success — the workflow's observations
-  /// ride the handle the reconciler itself received.
+  /// ride the handle the reconciler itself received, and its optional
+  /// output bytes ride the task's
+  /// [`TaskOutput`](crate::TaskOutput) payload.
   ///
   /// Admission-time failures are the pure shape checks (a stopped node,
   /// the reserved domain, an unregistered kind); every reconciler error
-  /// is effect-time, retried within the bounded extension schedule, and
-  /// surfaces on the task's `wait`.
+  /// is effect-time and surfaces on the task's `wait`. Only the
+  /// reconciler's explicit
+  /// [`ReconcileDecision::Retry`](crate::ReconcileDecision::Retry)
+  /// decision re-arms the bounded extension retry schedule; a returned
+  /// `Err` or an explicit
+  /// [`ReconcileDecision::Failed`](crate::ReconcileDecision::Failed)
+  /// decision terminalizes the task as failed with that error, never
+  /// retried — re-driving a failed workflow is the caller's own
+  /// re-submission.
   pub async fn submit(&self, spec: crate::CustomTaskSpec) -> Result<Task<()>> {
     let client = self.client()?.clone();
     if spec.kind().domain() == crate::protocol::tag::BUILTIN_DOMAIN {
@@ -475,26 +474,32 @@ impl Tasks {
       return Err(crate::Error::unsupported("task kind"));
     };
     self.require_running()?;
-    let kind = TaskKind::Extension(spec.kind().clone());
+    let kind = TaskKind::from(spec.kind().clone());
     let handle = self.handle.clone();
     let effect: TaskEffect = Arc::new(move |_deps, attempt| {
       let reconciler = Arc::clone(&reconciler);
       let handle = handle.clone();
       let spec = spec.clone();
       Box::pin(async move {
-        let context = crate::ReconcileContext {
-          handle,
-          spec,
-          attempt: attempt.attempt,
-          last_error: attempt.last_error,
-        };
+        let context =
+          crate::ReconcileContext::new(handle, spec, attempt.attempt, attempt.last_error);
         match reconciler.reconcile(context).await {
           Ok(crate::ReconcileDecision::Succeeded) => {
-            Ok(EffectOutcome::new(TaskOutput::Extension(())))
+            Ok(EffectOutcome::new(TaskOutput::new(Arc::from([]))))
           }
-          // The explicit no-progress decision re-arms the same bounded
-          // extension schedule an error rides, as the typed overload.
-          Ok(crate::ReconcileDecision::Retry) => Err(crate::Error::overloaded("custom task retry")),
+          Ok(crate::ReconcileDecision::SucceededWithOutput(bytes)) => {
+            Ok(EffectOutcome::new(TaskOutput::new(bytes.into())))
+          }
+          // The explicit no-progress decision is the only re-arm path:
+          // it rides the bounded extension schedule as the typed
+          // overload marker the next attempt's context reads.
+          Ok(crate::ReconcileDecision::Retry) => Ok(EffectOutcome::Retry(
+            crate::Error::overloaded("custom task retry"),
+          )),
+          // The explicit terminal-failure decision and a returned error
+          // both terminalize the task with their error; nothing retries
+          // either.
+          Ok(crate::ReconcileDecision::Failed(error)) => Err(error.to_error()),
           Err(error) => Err(error),
         }
       })

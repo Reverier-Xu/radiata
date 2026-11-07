@@ -5,13 +5,31 @@
 //! and streams the matching catalog in canonical name order through the
 //! store's ordered scans. Pages are bounded and cursor-continued, so a
 //! population-sized catalog never materializes as one allocation. A record
-//! whose current winner is a signed removal reads as absent: removal
-//! evidence stays internal.
+//! whose current winner is a removal reads as absent: removal evidence
+//! stays internal.
 
 use super::{RESERVED_TYPE_LABEL_KEY, RESERVED_URI_LABEL_KEY, ResourceRecordV1};
 use crate::{
   QualifiedTag, ResourceLabels, ResourceVersion, Result, Selector, storage::MetadataStore,
 };
+
+/// The accessor resolving one reserved label to its record field.
+type ReservedLabelAccessor = fn(&ResourceRecordV1) -> &str;
+
+/// The reserved labels and the record field each resolves to. A reserved
+/// label is data here, so adding one never touches the lookup.
+const RESERVED_LABELS: [(&str, ReservedLabelAccessor); 2] = [
+  (RESERVED_TYPE_LABEL_KEY, resource_type_label),
+  (RESERVED_URI_LABEL_KEY, resource_uri_label),
+];
+
+fn resource_type_label(record: &ResourceRecordV1) -> &str {
+  record.resource_type().as_str()
+}
+
+fn resource_uri_label(record: &ResourceRecordV1) -> &str {
+  record.resource_uri().as_str()
+}
 
 /// Whether `record`'s full label space satisfies `selector`: the reserved
 /// type/URI labels resolve to the record's reserved fields and every other
@@ -19,15 +37,15 @@ use crate::{
 pub(crate) fn record_matches(record: &ResourceRecordV1, selector: &Selector) -> bool {
   fn lookup<'a>(record: &'a ResourceRecordV1) -> impl Fn(&QualifiedTag) -> Option<&'a str> {
     move |tag| {
-      if tag.as_str() == RESERVED_TYPE_LABEL_KEY {
-        Some(record.resource_type().as_str())
-      } else if tag.as_str() == RESERVED_URI_LABEL_KEY {
-        Some(record.resource_uri().as_str())
-      } else {
-        crate::LabelKey::from_label_tag(tag)
-          .and_then(|key| record.labels().get(&key))
-          .map(|value| value.as_str())
-      }
+      RESERVED_LABELS
+        .iter()
+        .find(|(key, _)| *key == tag.as_str())
+        .map(|(_, accessor)| accessor(record))
+        .or_else(|| {
+          crate::LabelKey::from_label_tag(tag)
+            .and_then(|key| record.labels().get(&key))
+            .map(|value| value.as_str())
+        })
     }
   }
   selector.matches_with(lookup(record))
@@ -75,16 +93,11 @@ pub(crate) async fn select_page_ctx(
 mod tests {
   use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-  use ed25519_dalek::SigningKey;
-
   use super::{super::store, select_page_ctx};
   use crate::{
     LabelKey, LabelSet, LabelValue, NodeId, ResourceName, ResourceUri, Selector,
     api::SystemEntropy, provider::StorageFactory, storage::MetadataStore,
   };
-
-  const SEED: [u8; 32] = [41; 32];
-  const OTHER_SEED: [u8; 32] = [42; 32];
 
   fn writer() -> NodeId {
     NodeId::parse("node-000000000000000000041").unwrap()
@@ -98,12 +111,11 @@ mod tests {
     ResourceName::parse(&format!("radiata.woooo.tech/resources/sel-{seed:03}")).unwrap()
   }
 
-  /// One signed record with a distinguishable reserved type, URI, and
+  /// One record with a distinguishable reserved type, URI, and
   /// custom label per seed.
   #[allow(clippy::too_many_arguments)]
   fn record(
-    seed: u8, timestamp_millis: u64, writer: &NodeId, removal_rank: u64, removed: bool,
-    key_seed: [u8; 32],
+    seed: u8, timestamp_millis: i64, writer: &NodeId, removal_rank: u64, removed: bool,
   ) -> super::ResourceRecordV1 {
     let labels = LabelSet::new()
       .insert(
@@ -116,7 +128,7 @@ mod tests {
         .unwrap(),
       )
       .unwrap();
-    super::ResourceRecordV1::sign(
+    super::ResourceRecordV1::new(
       name(seed),
       LabelValue::parse(if seed.is_multiple_of(2) {
         "document"
@@ -130,7 +142,6 @@ mod tests {
       writer.clone(),
       removal_rank,
       removed,
-      &SigningKey::from_bytes(&key_seed),
     )
     .unwrap()
   }
@@ -153,24 +164,6 @@ mod tests {
       store::ResourceCommitOutcome::Installed(_) | store::ResourceCommitOutcome::Superseded(_) => {}
       other => panic!("seed record must commit deterministically, got {other:?}"),
     }
-  }
-
-  /// Trusts `node` with the public key of `key_seed` so synced records
-  /// verify (the membership descriptor is the trust anchor).
-  async fn trust(store: &MetadataStore, node: &NodeId, key_seed: [u8; 32]) {
-    let public_key =
-      crate::PublicKey::from_bytes(SigningKey::from_bytes(&key_seed).verifying_key().to_bytes());
-    let descriptor = crate::membership::NodeDescriptorV1::new(
-      node.clone(),
-      public_key,
-      vec![crate::Endpoint::parse("wss://sel:9000").unwrap()],
-      1,
-      false,
-      1,
-    );
-    crate::membership::store::store_descriptor_ctx(store, &SystemEntropy, &descriptor)
-      .await
-      .unwrap();
   }
 
   /// Every selected name across the full cursor walk.
@@ -201,7 +194,7 @@ mod tests {
   async fn selection_matches_reserved_and_custom_labels() {
     let store = open_store().await;
     for seed in 1..=4_u8 {
-      install(&store, &record(seed, 1_000, &writer(), 0, false, SEED)).await;
+      install(&store, &record(seed, 1_000, &writer(), 0, false)).await;
     }
 
     let cases: [(&str, &[u8]); 7] = [
@@ -241,7 +234,7 @@ mod tests {
   async fn selection_pages_are_bounded_and_cursor_complete() {
     let store = open_store().await;
     for seed in 1..=70_u8 {
-      install(&store, &record(seed, 1_000, &writer(), 0, false, SEED)).await;
+      install(&store, &record(seed, 1_000, &writer(), 0, false)).await;
     }
     let all = Selector::parse("radiata.woooo.tech/resources/type").unwrap();
 
@@ -265,17 +258,17 @@ mod tests {
     assert_eq!(walked, sorted, "selection order is canonical name order");
   }
 
-  /// A winner that is a signed removal reads as absent; a losing removal
+  /// A winner that is a removal reads as absent; a losing removal
   /// never hides the live winner.
   #[tokio::test]
   async fn removed_winners_read_as_absent() {
     let store = open_store().await;
-    install(&store, &record(1, 1_000, &writer(), 0, false, SEED)).await;
+    install(&store, &record(1, 1_000, &writer(), 0, false)).await;
     // A removal with a greater tuple wins and hides the resource.
-    install(&store, &record(1, 2_000, &writer(), 1, true, SEED)).await;
+    install(&store, &record(1, 2_000, &writer(), 1, true)).await;
     // A removal with a losing tuple leaves the live record observable.
-    install(&store, &record(2, 1_000, &writer(), 0, false, SEED)).await;
-    install(&store, &record(2, 500, &writer(), 1, true, SEED)).await;
+    install(&store, &record(2, 1_000, &writer(), 0, false)).await;
+    install(&store, &record(2, 500, &writer(), 1, true)).await;
 
     let all = Selector::parse("radiata.woooo.tech/resources/type").unwrap();
     let walked = select_all(&store, &all, 64).await;
@@ -289,19 +282,11 @@ mod tests {
   async fn converged_members_return_identical_ordered_selections() {
     let store_a = open_store().await;
     let store_b = open_store().await;
-    trust(&store_a, &writer(), SEED).await;
-    trust(&store_a, &other_writer(), OTHER_SEED).await;
-    trust(&store_b, &writer(), SEED).await;
-    trust(&store_b, &other_writer(), OTHER_SEED).await;
 
     // Concurrent writers publish overlapping names with competing tuples.
     for seed in 1..=6_u8 {
-      install(&store_a, &record(seed, 1_000, &writer(), 0, false, SEED)).await;
-      install(
-        &store_b,
-        &record(seed, 2_000, &other_writer(), 0, false, OTHER_SEED),
-      )
-      .await;
+      install(&store_a, &record(seed, 1_000, &writer(), 0, false)).await;
+      install(&store_b, &record(seed, 2_000, &other_writer(), 0, false)).await;
     }
 
     // Converge through the same emit/apply path the anti-entropy driver

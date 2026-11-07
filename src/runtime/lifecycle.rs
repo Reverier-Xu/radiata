@@ -58,6 +58,20 @@ impl LifecycleSnapshot {
   }
 }
 
+/// The leave plane's signal from the task manager (and, for the fatal
+/// case, the leave effect itself) to the supervisor's control loop. A
+/// successful leave starts the active-leave shutdown; a leave whose
+/// network teardown failed after it began cannot leave the node running —
+/// its listeners and sessions are already down — so it starts the fatal
+/// shutdown with the failure's kind instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeaveSignal {
+  /// The leave task published `Succeeded`.
+  Complete,
+  /// The leave failed after its teardown began.
+  Fatal(crate::ErrorKind),
+}
+
 pub(crate) enum Control {
   Shutdown {
     reply: oneshot::Sender<ShutdownOutcome>,
@@ -94,6 +108,10 @@ pub(crate) enum Control {
     cursor: Option<crate::PageCursor>,
     limit: usize,
     reply: oneshot::Sender<Result<crate::ResourcePage>>,
+  },
+  WatchResources {
+    from: Option<u64>,
+    reply: oneshot::Sender<Result<crate::ResourceWatch>>,
   },
   PageListeners {
     cursor: Option<crate::PageCursor>,
@@ -182,6 +200,36 @@ impl RuntimeClient {
       .tasks
       .as_ref()
       .ok_or_else(|| Error::not_ready("node tasks"))
+  }
+
+  /// One task's current status, when live or inside the bounded terminal
+  /// history. The read is local (no supervisor round trip) and refuses
+  /// typed once the node stopped: the table's post-shutdown state is not
+  /// part of the public contract.
+  pub(crate) fn get_task(&self, id: crate::TaskId) -> Result<Option<crate::view::TaskView>> {
+    self.require_running_tasks()?;
+    Ok(self.task_client()?.observer.table.view(&id))
+  }
+
+  /// Tasks in canonical id order (= admission order, newest last). Local
+  /// read like [`Self::get_task`]; see its shutdown note.
+  pub(crate) fn page_tasks(
+    &self, cursor: Option<&crate::PageCursor>, limit: usize,
+  ) -> Result<crate::view::TaskPage> {
+    self.require_running_tasks()?;
+    let limit = limit.clamp(1, crate::paging::MAX_VIEW_PAGE_ITEMS);
+    self
+      .task_client()?
+      .observer
+      .table
+      .page_views(cursor.map(|cursor| cursor.as_bytes()), limit)
+  }
+
+  fn require_running_tasks(&self) -> Result<()> {
+    if self.status() != NodeStatus::Running {
+      return Err(Error::shutting_down("node tasks"));
+    }
+    Ok(())
   }
 
   pub(crate) fn status(&self) -> NodeStatus {

@@ -4,10 +4,16 @@
 //! in strict sequence into the admitted stream's bounded body channel;
 //! ends terminate streams; acks resolve pending outbound admissions
 //! (the origin-side counterpart lives in `crate::routing::outbound`).
+//! The origin-side delivery legs live here too: [`DeliveryLeg`] is the
+//! outbound pump's next hop — a live session's frame queue, or the node
+//! itself admitting and consuming the stream in-process — so local
+//! self-delivery is one hop of the same pump, sharing the admission body
+//! and the pending-admission model, with only the `deliver_*` trio
+//! diverging.
 
 use std::{
   collections::HashMap,
-  sync::{Arc, atomic::Ordering},
+  sync::{Arc, Mutex, atomic::Ordering},
   time::Duration,
 };
 
@@ -16,19 +22,20 @@ use tracing::{debug, trace, warn};
 
 use super::{
   driver::EstablishedSession,
-  stream::{BoundedSender, SessionFrame, SessionPacketContext, clock_seconds},
+  stream::{BoundedSender, SessionEntry, SessionFrame, SessionPacketContext, clock_seconds},
 };
 use crate::{
   Error, ErrorKind, NodeId, ProtocolTag, Result, StreamMetadata, TraceId,
   packet::{
-    IncomingStream, PacketReplyContext, RouteState, StreamItem, channel_body,
-    wire::{self, AckFrame, AckStatus, ChunkFrame, OpenFrame},
+    IncomingStream, PacketReplyContext, StreamItem, channel_body,
+    wire::{self, AckFrame, AckStatus, ChunkFrame, EndFrame, EndReason, OpenFrame},
   },
   protocol::wire::PacketKind,
   routing::{
-    forward::{self, PendingAck, PendingAcks, SessionIdentity},
-    table::{record_terminal_failure, update_route},
+    forward::{self, PendingAck, SessionIdentity},
+    table::record_terminal_failure,
   },
+  session::pending::PendingAdmissions,
   transport::connection::ConnectionReader,
 };
 
@@ -105,7 +112,7 @@ struct AdmittedStream {
   stream: mpsc::Sender<StreamItem>,
   next_sequence: u64,
   context: crate::Digest,
-  admitted_at_millis: u64,
+  admitted_at_millis: i64,
   /// Whether this stream already spent its single bounded drain grace. One
   /// grace per stream is what keeps the shared reader's stall bounded by
   /// [`INCOMING_STREAM_DRAIN_PATIENCE`] independently of the stream's
@@ -115,18 +122,16 @@ struct AdmittedStream {
 
 /// UNIX-milliseconds from the injected wall clock, used for the admission
 /// timestamps reported in acknowledgements so simulation controls them too.
-fn clock_millis(clock: &dyn crate::time::WallClock) -> u64 {
+fn clock_millis(clock: &dyn crate::time::WallClock) -> i64 {
   crate::time::to_millis(clock.now())
 }
 
-/// The read loop's frame source: one receive wake plus the shared pong
-/// stamp. Abstracted so liveness tests can feed synthetic wakes without
-/// a TLS connection.
+/// The read loop's frame source: one receive wake. Abstracted so
+/// liveness tests can feed synthetic wakes without a TLS connection.
 pub(super) trait FrameSource {
   fn receive_event(
     &mut self,
   ) -> futures_util::future::BoxFuture<'_, crate::Result<Option<crate::transport::Received>>>;
-  fn pong_last_seen(&self) -> u64;
 }
 
 impl FrameSource for ConnectionReader {
@@ -134,10 +139,6 @@ impl FrameSource for ConnectionReader {
     &mut self,
   ) -> futures_util::future::BoxFuture<'_, crate::Result<Option<crate::transport::Received>>> {
     Box::pin(ConnectionReader::receive_event(self))
-  }
-
-  fn pong_last_seen(&self) -> u64 {
-    ConnectionReader::pong_last_seen(self)
   }
 }
 
@@ -184,7 +185,7 @@ impl Drop for ConsumerDrainGuard {
 /// orderly exit below.
 pub(super) async fn read_loop(
   source: &mut impl FrameSource, grant: &SessionGrant, context: &SessionPacketContext,
-  frames: &BoundedSender, pending_acks: &PendingAcks,
+  frames: &BoundedSender, pending_acks: &PendingAdmissions,
   last_activity: &Arc<std::sync::atomic::AtomicU64>,
 ) {
   // Registered at entry: the cancellation path must drain consumers too.
@@ -212,14 +213,13 @@ pub(super) async fn read_loop(
 /// reap and the guard's teardown.
 async fn read_loop_frames(
   source: &mut impl FrameSource, grant: &SessionGrant, context: &SessionPacketContext,
-  frames: &BoundedSender, pending_acks: &PendingAcks,
+  frames: &BoundedSender, pending_acks: &PendingAdmissions,
   last_activity: &Arc<std::sync::atomic::AtomicU64>, consumers: &mut ConsumerDrainGuard,
 ) {
   let mut incoming: HashMap<TraceId, AdmittedStream> = HashMap::new();
-  let mut last_pong_seen = source.pong_last_seen();
   loop {
-    // Audit finding #8: completed consumer entries are reaped on every
-    // receive wake, so finished tasks no longer accumulate for the whole
+    // Completed consumer entries are reaped on every
+    // receive wake, so finished tasks never accumulate for the whole
     // session's life. Non-blocking on purpose: still-running consumers are
     // left untouched for the guard's `Drop`, which keeps handing the full
     // remaining set to the node-scoped drain on every exit path.
@@ -227,15 +227,11 @@ async fn read_loop_frames(
     let message = match source.receive_event().await {
       Ok(Some(crate::transport::Received::Message(message))) => message,
       Ok(Some(crate::transport::Received::Pong)) => {
-        // A peer pong is a keepalive response: reflect it into the
-        // injected clock's activity mark so the liveness observer sees
-        // one time source. This wake is what lets a frame-silent but
+        // A peer pong is a keepalive response: stamp the session's
+        // activity mark from the injected clock so the liveness observer
+        // sees one time source. This wake is what lets a frame-silent but
         // responsive peer survive the idle deadline.
-        let pong = source.pong_last_seen();
-        if pong != last_pong_seen {
-          last_pong_seen = pong;
-          last_activity.store(clock_seconds(context.clock.as_ref()), Ordering::Relaxed);
-        }
+        last_activity.store(clock_seconds(context.clock.as_ref()), Ordering::Relaxed);
         continue;
       }
       Ok(None) => {
@@ -259,217 +255,175 @@ async fn read_loop_frames(
       break;
     };
     trace!(kind = ?kind, "session frame received");
-    match kind {
-      PacketKind::Open => match wire::decode_open(&message.body, context.parser_limits()) {
-        Ok(open) => {
-          // A routed frame addressed elsewhere is forwarded; everything
-          // else goes through the local admission path.
-          let routed = open.destination != *context.local() && open.route.is_some();
-          if routed {
-            forward::open(
-              &context.local().clone(),
-              grant.peer(),
-              grant.identity(),
-              open,
-              frames,
-              &context.sessions,
-              &context.forwarding,
-              &context.registry,
-              context.route_policy(),
-              context.forwarding_capacity(),
-              context.relay_hop_deadline(),
-            )
-            .await;
-          } else if admit_open(
-            open,
-            grant,
-            context,
-            frames,
-            &mut incoming,
-            &mut consumers.consumers,
-          )
-          .await
-          .is_err()
-          {
-            break;
-          }
-        }
-        Err(_) => {
-          warn!("malformed packet open frame");
-          break;
-        }
-      },
-      PacketKind::Chunk => match wire::decode_chunk(&message.body, context.parser_limits()) {
-        Ok(chunk) => {
-          let trace = chunk.trace_id.clone();
-          if forward::contains(&context.forwarding, &trace) {
-            forward::relay_chunk(&context.forwarding, chunk).await;
-          } else if !forward_chunk(chunk, &mut incoming, frames).await {
-            warn!(trace_id = %trace, "incoming chunk sequence violation; closing session");
-            break;
-          }
-        }
-        Err(_) => {
-          warn!("malformed packet chunk frame");
-          break;
-        }
-      },
-      PacketKind::End => match wire::decode_end(&message.body, context.parser_limits()) {
-        Ok(end) => {
-          trace!(trace_id = %end.trace_id, reason = ?end.reason, "incoming stream ended");
-          if forward::contains(&context.forwarding, &end.trace_id) {
-            forward::relay_end(&context.forwarding, end).await;
-            continue;
-          }
-          if let Some(admitted) = incoming.remove(&end.trace_id) {
-            // The typed terminal reason survives the relay: a completed
-            // end closes the body normally; an interrupted end (the
-            // sending leg died mid-stream) surfaces exactly one typed
-            // `StreamInterrupted` to the consumer instead of a silent
-            // truncation.
-            let terminal = match end.reason {
-              wire::EndReason::Completed => StreamItem::End,
-              wire::EndReason::Interrupted => StreamItem::Interrupted,
-            };
-            // The terminal is queued without waiting for the consumer: a
-            // consumer that never drains its window is the stream's own
-            // overload condition, not a reason to stall every other frame
-            // of the session (acks, pongs, other streams). The reserved
-            // terminal slot guarantees the queue succeeds for a live
-            // consumer; a failure means the consumer is gone, and dropping
-            // the sender still ends the body prefix with exactly one typed
-            // `StreamInterrupted`.
-            if admitted.stream.try_send(terminal).is_err() {
-              warn!(
-                trace_id = %end.trace_id,
-                "incoming consumer did not drain its terminal; stream interrupted"
-              );
-            }
-          } else {
-            // A lost consumer means its session task aborted mid-stream:
-            // surface it loudly, because silence here looks like a lost
-            // packet downstream.
-            warn!(trace_id = %end.trace_id, "end frame for unknown incoming stream");
-          }
-        }
-        Err(_) => {
-          warn!("malformed packet end frame");
-          break;
-        }
-      },
-      PacketKind::Ack => match wire::decode_ack(&message.body, context.parser_limits()) {
-        Ok(ack) => {
-          // Acknowledgement attribution: an
-          // acknowledgement steers a forwarded hop only when it arrives on
-          // that hop's current downstream attempt. A late acknowledgement
-          // from a superseded branch (the hop deadline expired or the
-          // attempt failed and the open was re-dispatched elsewhere) is
-          // dropped: it must not consume the live attempt's pending
-          // entry, clear its retry arm, or flip its route record.
-          if !forward::ack_from_current_downstream(&context.forwarding, pending_acks, &ack.trace_id)
-          {
-            debug!(
-              trace_id = %ack.trace_id,
-              status = ?ack.status,
-              "late acknowledgement from a superseded branch dropped"
-            );
-          } else if ack.status != crate::packet::wire::AckStatus::Admitted
-            && forward::owns_discovering(&context.forwarding, &ack.trace_id)
-          {
-            // A failure for a trace this node is still discovering (it
-            // forwarded the open and the destination has not admitted it
-            // yet) belongs to this hop's branch search: the failed
-            // attempt's pending entry is consumed and the next untried
-            // branch is re-dispatched, instead of relaying the failure
-            // upstream. Every other acknowledgement resolves the session's
-            // pending admission exactly as before.
-            forward::on_downstream_failure(
-              &context.forwarding,
-              &ack.trace_id,
-              &context.sessions,
-              context.relay_hop_deadline(),
-            )
-            .await;
-          } else {
-            if ack.status == crate::packet::wire::AckStatus::Admitted {
-              forward::mark_admitted(&context.forwarding, &ack.trace_id);
-            }
-            if !resolve_ack(ack.clone(), pending_acks) {
-              // The one-shot admission waiter is gone. An origin's
-              // waiter is simply finished; an admitted forwarding hop
-              // instead owns the stream for its whole life and carries
-              // the report upstream itself — a legitimate mid-stream
-              // failure from the bound downstream session must not be
-              // dropped as a superseded branch's latecomer (audit
-              // P1-8).
-              forward::relay_admitted_ack(&context.forwarding, &ack);
-            }
-            // A late failure for an admitted stream (a downstream hop
-            // died mid-flight) still terminates the origin's route
-            // observation. This writer races the origin pump's
-            // end-of-stream `Delivered`, and the route table's monotonic
-            // terminal machine converges them deterministically: the
-            // failure overrides a recorded `Delivered`, and once recorded
-            // it refuses every later update — so, when the report
-            // reaches this node, the origin's record ends
-            // `Failed(StreamInterrupted)` under either ordering
-            // (remaining items 2026-10-10, P2-3).
-            if ack.status == crate::packet::wire::AckStatus::Failed {
-              // The pre-read decides what this flip owns: a record that
-              // was not yet `Failed` transitions here, so subscribers get
-              // the `RouteChanged` nudge the refused pump tail no longer
-              // emits (remaining items 2026-10-10, P2-3). The durable
-              // twin mirrors exactly the flip: the revision fires only
-              // for caller traffic with an origin-side identity — an
-              // already-failed record is final, a relay hop or a
-              // destination rejection carries no identity to persist,
-              // and internal control traffic stays out of the durable
-              // trace store on this path too — so the same trace id's
-              // durable terminal ends `Failed(StreamInterrupted)` under
-              // either writer ordering instead of keeping the pump tail's
-              // `Delivered` for the whole retention window (remaining
-              // items 2026-10-10, P2-7).
-              let prior = context.routes.lock().ok().and_then(|table| {
-                let record = table.get(&ack.trace_id)?;
-                if matches!(record.state, RouteState::Failed(_)) {
-                  None
-                } else {
-                  Some((record.selected_node.clone(), record.internal))
-                }
-              });
-              update_route(&context.routes, &ack.trace_id, |record| {
-                record.update(RouteState::Failed(ErrorKind::StreamInterrupted));
-              });
-              if let Some((destination, internal)) = prior {
-                context
-                  .events
-                  .emit(crate::RouteChanged::new(crate::RouteHandle::from_trace_id(
-                    ack.trace_id.clone(),
-                  )));
-                if let (Some(trace), Some(destination)) =
-                  (context.trace.as_ref(), destination.filter(|_| !internal))
-                {
-                  trace.revise_terminal_failure(
-                    ack.trace_id.clone(),
-                    context.local().clone(),
-                    destination,
-                    ErrorKind::StreamInterrupted,
-                  );
-                }
-              }
-            }
-          }
-        }
-        Err(_) => {
-          warn!("malformed packet ack frame");
-          break;
-        }
-      },
+    let open_session = match kind {
+      PacketKind::Open => {
+        handle_open(
+          &message.body,
+          grant,
+          context,
+          frames,
+          &mut incoming,
+          &mut consumers.consumers,
+        )
+        .await
+      }
+      PacketKind::Chunk => handle_chunk(&message.body, context, &mut incoming, frames).await,
+      PacketKind::End => handle_end(&message.body, context, &mut incoming).await,
+      PacketKind::Ack => handle_ack(&message.body, context, pending_acks).await,
+    };
+    if !open_session {
+      break;
     }
   }
   // The frame loop exits without dropping the guard: `read_loop` owns it
   // and its `Drop` hands the JoinSet to the node-scoped drain task on this
   // orderly exit and on every cancellation path alike.
+}
+
+/// One frame-kind handler's verdict for the session: `true` keeps the
+/// read loop open, `false` closes it (a malformed frame, or an admission
+/// or sequence violation).
+type FrameVerdict = bool;
+
+/// The `Open` handler: a routed frame addressed elsewhere is forwarded;
+/// everything else goes through the local admission path. A malformed
+/// open closes the session.
+async fn handle_open(
+  body: &[u8], grant: &SessionGrant, context: &SessionPacketContext, frames: &BoundedSender,
+  incoming: &mut HashMap<TraceId, AdmittedStream>, consumers: &mut JoinSet<()>,
+) -> FrameVerdict {
+  let Ok(open) = wire::decode_open(body, context.parser_limits()) else {
+    warn!("malformed packet open frame");
+    return false;
+  };
+  let routed = open.destination != *context.local() && open.route.is_some();
+  if routed {
+    forward::open(
+      &context.local().clone(),
+      grant.peer(),
+      grant.identity(),
+      open,
+      frames,
+      &context.sessions,
+      &context.forwarding,
+      context.registry.routing(),
+      context.route_policy(),
+      context.forwarding_capacity(),
+      context.relay_hop_deadline(),
+    )
+    .await;
+  } else if admit_open(open, grant, context, frames, incoming, consumers)
+    .await
+    .is_err()
+  {
+    return false;
+  }
+  true
+}
+
+/// The `Chunk` handler: a chunk for a trace this node forwards is
+/// relayed downstream; otherwise it flows in sequence into the admitted
+/// incoming stream. A malformed chunk, or a sequence violation, closes
+/// the session.
+async fn handle_chunk(
+  body: &[u8], context: &SessionPacketContext, incoming: &mut HashMap<TraceId, AdmittedStream>,
+  frames: &BoundedSender,
+) -> FrameVerdict {
+  let Ok(chunk) = wire::decode_chunk(body, context.parser_limits()) else {
+    warn!("malformed packet chunk frame");
+    return false;
+  };
+  let trace = chunk.trace_id.clone();
+  if forward::contains(&context.forwarding, &trace) {
+    forward::relay_chunk(&context.forwarding, chunk).await;
+  } else if !forward_chunk(chunk, incoming, frames).await {
+    warn!(trace_id = %trace, "incoming chunk sequence violation; closing session");
+    return false;
+  }
+  true
+}
+
+/// The `End` handler: an end for a forwarded trace is relayed
+/// downstream; otherwise it terminates the admitted incoming stream with
+/// its typed terminal. A malformed end closes the session.
+async fn handle_end(
+  body: &[u8], context: &SessionPacketContext, incoming: &mut HashMap<TraceId, AdmittedStream>,
+) -> FrameVerdict {
+  let Ok(end) = wire::decode_end(body, context.parser_limits()) else {
+    warn!("malformed packet end frame");
+    return false;
+  };
+  trace!(trace_id = %end.trace_id, reason = ?end.reason, "incoming stream ended");
+  if forward::contains(&context.forwarding, &end.trace_id) {
+    forward::relay_end(&context.forwarding, end).await;
+    return true;
+  }
+  if let Some(admitted) = incoming.remove(&end.trace_id) {
+    // The typed terminal reason survives the relay: a completed
+    // end closes the body normally; an interrupted end (the
+    // sending leg died mid-stream) surfaces exactly one typed
+    // `StreamInterrupted` to the consumer instead of a silent
+    // truncation.
+    let terminal = match end.reason {
+      wire::EndReason::Completed => StreamItem::End,
+      wire::EndReason::Interrupted => StreamItem::Interrupted,
+    };
+    // The terminal is queued without waiting for the consumer: a
+    // consumer that never drains its window is the stream's own
+    // overload condition, not a reason to stall every other frame
+    // of the session (acks, pongs, other streams). The reserved
+    // terminal slot guarantees the queue succeeds for a live
+    // consumer; a failure means the consumer is gone, and dropping
+    // the sender still ends the body prefix with exactly one typed
+    // `StreamInterrupted`.
+    if admitted.stream.try_send(terminal).is_err() {
+      warn!(
+        trace_id = %end.trace_id,
+        "incoming consumer did not drain its terminal; stream interrupted"
+      );
+    }
+  } else {
+    // A lost consumer means its session task aborted mid-stream:
+    // surface it loudly, because silence here looks like a lost
+    // packet downstream.
+    warn!(trace_id = %end.trace_id, "end frame for unknown incoming stream");
+  }
+  true
+}
+
+/// The `Ack` handler: the whole routing-plane acknowledgement decision
+/// lives in [`forward::on_session_ack`]; this shell decodes the frame and
+/// closes the session on a malformed one.
+async fn handle_ack(
+  body: &[u8], context: &SessionPacketContext, pending_acks: &PendingAdmissions,
+) -> FrameVerdict {
+  let Ok(ack) = wire::decode_ack(body, context.parser_limits()) else {
+    warn!("malformed packet ack frame");
+    return false;
+  };
+  forward::on_session_ack(
+    &forward::SessionAckContext {
+      forwarding: &context.forwarding,
+      sessions: &context.sessions,
+      routes: &context.routes,
+      events: &context.events,
+      trace: context.trace.as_ref(),
+      local: &context.local,
+      relay_hop_deadline: context.relay_hop_deadline(),
+    },
+    ack,
+    pending_acks,
+  )
+  .await;
+  true
+}
+
+/// The admission decision one open resolves to: the wire status and the
+/// admission wall-clock time reported for it (the original admission time
+/// for an identical retransmission).
+struct StreamAdmission {
+  status: AckStatus,
+  admitted_at_millis: i64,
 }
 
 /// Validates one open frame against the authenticated session and the
@@ -489,27 +443,74 @@ async fn admit_open(
   let trace_id = open.trace_id.clone();
   let ack_protocol = open.protocol.clone();
   let local = context.local().clone();
-  let mut reack_admitted_at: Option<u64> = None;
-  let status = 'status: {
-    // The routing envelope re-validates against the session-authenticated
-    // holder before anything else (the chain itself then authenticates the
-    // original source; a direct frame authenticates only through the exact
-    // source-peer match). Forwarding work belongs to the route forwarder;
-    // this admission boundary never branches a body, so any frame that
-    // does not arrive exactly here fails closed without a consumer.
-    if !matches!(
-      crate::routing::receive_open_envelope(
-        trace_id.clone(),
-        open.source.clone(),
-        open.destination.clone(),
-        open.route.clone(),
-        &local,
-        grant.peer(),
-      ),
-      Ok(crate::routing::RouteProgress::Arrive)
-    ) {
-      break 'status AckStatus::Unsupported;
+  // The routing envelope re-validates against the session-authenticated
+  // holder before anything else (the chain itself then authenticates the
+  // original source; a direct frame authenticates only through the exact
+  // source-peer match). Forwarding work belongs to the route forwarder;
+  // this admission boundary never branches a body, so any frame that does
+  // not arrive exactly here fails closed without a consumer.
+  let admission = if matches!(
+    crate::routing::receive_open_envelope(
+      trace_id.clone(),
+      open.source.clone(),
+      open.destination.clone(),
+      open.route.clone(),
+      &local,
+      grant.peer(),
+    ),
+    Ok(crate::routing::RouteProgress::Arrive)
+  ) {
+    admit_stream(
+      open,
+      |feature| grant.selected_features().contains(feature),
+      context,
+      incoming,
+      consumers,
+    )?
+  } else {
+    StreamAdmission {
+      status: AckStatus::Unsupported,
+      admitted_at_millis: clock_millis(context.clock.as_ref()),
     }
+  };
+  let ack = AckFrame {
+    trace_id: trace_id.clone(),
+    status: admission.status,
+    admitted_at_millis: admission.admitted_at_millis,
+  };
+  debug!(
+    trace_id = %ack.trace_id,
+    protocol = %ack_protocol,
+    ?ack.status,
+    "packet admission outcome"
+  );
+  let body = wire::encode_ack(&ack)?;
+  frames
+    .send(SessionFrame {
+      kind: PacketKind::Ack,
+      body,
+    })
+    .await
+    .map_err(|_| Error::stream_interrupted("packet session"))
+}
+
+/// The one admission body shared by the inbound open path and local
+/// self-delivery: the immutable opening context's duplicate handling, the
+/// protocol registration and owning-feature gate, the bounded incoming
+/// stream table, the consumer lifecycle permit, and the consumer spawn.
+/// `owns_feature` is the caller's gate — the negotiated session selection
+/// for an inbound open, the node's own implemented features for a local
+/// stream — so the two admission paths cannot drift. The body awaits
+/// nothing: the table lock the local delivery leg holds across it is
+/// never held across a suspension.
+fn admit_stream(
+  open: OpenFrame, owns_feature: impl Fn(&crate::FeatureTag) -> bool,
+  context: &SessionPacketContext, incoming: &mut HashMap<TraceId, AdmittedStream>,
+  consumers: &mut JoinSet<()>,
+) -> Result<StreamAdmission> {
+  let trace_id = open.trace_id.clone();
+  let mut reack_admitted_at: Option<i64> = None;
+  let status = 'status: {
     // The immutable opening context decides duplicate handling: an
     // identical retransmission reports the current admission status
     // without invoking the consumer twice; a conflicting one fails closed.
@@ -530,12 +531,8 @@ async fn admit_open(
       Some(_) => break 'status AckStatus::Unsupported,
       None => {}
     }
-    match context.registry.protocol(&open.protocol) {
-      Some(registration)
-        if grant
-          .selected_features()
-          .contains(registration.definition.owning_feature()) =>
-      {
+    match context.registry.protocol(&open.protocol)? {
+      Some(registration) if owns_feature(registration.definition.owning_feature()) => {
         // Saturation prioritises conflicts over genuinely new streams:
         // identical duplicates were already answered above, conflicting
         // ones failed closed above, and only a new stream receives the
@@ -550,7 +547,7 @@ async fn admit_open(
         // handed to the consumer task: a stream whose wire stream ends still
         // holds its slot until the accept future finishes, so the node-wide
         // budget — not the per-session table — bounds the running consumer
-        // population (audit P1-2).
+        // population.
         let Some(permit) = context.live_consumers.reserve() else {
           debug!(
             trace_id = %trace_id,
@@ -622,25 +619,151 @@ async fn admit_open(
       }
     }
   };
-  let ack = AckFrame {
-    trace_id: trace_id.clone(),
+  Ok(StreamAdmission {
     status,
     admitted_at_millis: reack_admitted_at.unwrap_or_else(|| clock_millis(context.clock.as_ref())),
-  };
-  debug!(
-    trace_id = %ack.trace_id,
-    protocol = %ack_protocol,
-    ?ack.status,
-    "packet admission outcome"
-  );
-  let body = wire::encode_ack(&ack)?;
-  frames
-    .send(SessionFrame {
-      kind: PacketKind::Ack,
-      body,
-    })
-    .await
-    .map_err(|_| Error::stream_interrupted("packet session"))
+  })
+}
+
+/// The node-level local-delivery plane: the admitted-stream table and the
+/// pending-admission map every local delivery leg of this node shares —
+/// the local counterpart of one session's read loop (one table, one queue
+/// bound, one duplicate detector, one pending map). Because the table is
+/// shared instead of per-pump, duplicate detection and the session queue's
+/// message budget bound the local path exactly like the session path.
+pub(crate) struct LocalDelivery {
+  incoming: Mutex<HashMap<TraceId, AdmittedStream>>,
+  pending_acks: PendingAdmissions,
+}
+
+impl LocalDelivery {
+  /// One plane per node incarnation; `bound` mirrors the per-session
+  /// pending-admission bound the wire path uses.
+  pub(crate) fn new(bound: usize) -> Self {
+    Self {
+      incoming: Mutex::new(HashMap::new()),
+      pending_acks: PendingAdmissions::new(bound),
+    }
+  }
+}
+
+/// The local node as one delivery leg of the outbound pump: the stream is
+/// admitted through the node-level [`LocalDelivery`] table — the same
+/// admission body an inbound open runs — and consumed in-process. The leg
+/// owns its delivery's consumer drain guard (its drop hands spawned
+/// consumers to the node-scoped drain) and removes its table entry on
+/// drop, so an interrupted pump cannot strand its admission in the shared
+/// table.
+pub(crate) struct LocalLeg {
+  plane: Arc<LocalDelivery>,
+  packet: Arc<SessionPacketContext>,
+  consumers: ConsumerDrainGuard,
+  trace_id: TraceId,
+}
+
+impl LocalLeg {
+  /// Builds one leg for one locally addressed stream. Born in the
+  /// admission task, moved through the pump handoff, and dropped when the
+  /// pump task ends — every drop point runs inside a runtime context, so
+  /// the guard's drain spawn is always legal.
+  pub(crate) fn new(packet: &Arc<SessionPacketContext>, trace_id: TraceId) -> Self {
+    Self {
+      plane: Arc::clone(&packet.local_delivery),
+      consumers: ConsumerDrainGuard {
+        consumers: JoinSet::new(),
+        drains: Arc::clone(&packet.task_drains),
+      },
+      packet: Arc::clone(packet),
+      trace_id,
+    }
+  }
+
+  /// The local leg's open: the same admission body an inbound open runs,
+  /// with the node's own registry as the owning-feature gate (the node
+  /// offer supports exactly its registry's features — the same gate the
+  /// negotiated session selection applies to an inbound open). The pump's
+  /// pending waiter resolves on the spot with the admission outcome, the
+  /// local counterpart of a destination's acknowledgement frame.
+  async fn deliver_open(&mut self, open: OpenFrame) -> Result<(), ErrorKind> {
+    let admission = {
+      let mut incoming = self
+        .plane
+        .incoming
+        .lock()
+        .map_err(|_| ErrorKind::Internal)?;
+      admit_stream(
+        open,
+        |feature| self.packet.registry.feature_digest(feature).is_some(),
+        &self.packet,
+        &mut incoming,
+        &mut self.consumers.consumers,
+      )
+      .map_err(|error| error.kind())?
+    };
+    if let Some(PendingAck::Wait { notify, .. }) = self.plane.pending_acks.take(&self.trace_id) {
+      let _ = notify.send(match admission.status.to_kind() {
+        Some(kind) => Err(kind),
+        None => Ok(crate::time::from_millis(admission.admitted_at_millis)),
+      });
+    }
+    Ok(())
+  }
+
+  /// The local leg's chunk: one `StreamItem` into the admitted stream's
+  /// bounded body channel. This pump feeds one stream, so the consumer's
+  /// window is plain backpressure — the session reader's bounded overload
+  /// policy exists to keep a shared connection responsive, which does not
+  /// apply here. A closed channel means the consumer is gone.
+  async fn deliver_chunk(&self, chunk: ChunkFrame) -> Result<(), ErrorKind> {
+    let stream = {
+      let incoming = self
+        .plane
+        .incoming
+        .lock()
+        .map_err(|_| ErrorKind::Internal)?;
+      incoming
+        .get(&chunk.trace_id)
+        .map(|admitted| admitted.stream.clone())
+        .ok_or(ErrorKind::StreamInterrupted)?
+    };
+    stream
+      .send(StreamItem::Chunk(Arc::from(chunk.bytes.as_slice())))
+      .await
+      .map_err(|_| ErrorKind::StreamInterrupted)
+  }
+
+  /// The local leg's typed terminal: the reserved terminal slot carries
+  /// it into a live consumer's channel, and the table entry leaves the
+  /// shared table — the local counterpart of the read loop's end handler.
+  /// `false` means the terminal did not reach a consumer.
+  fn deliver_end(&self, reason: EndReason) -> bool {
+    let terminal = match reason {
+      EndReason::Completed => StreamItem::End,
+      EndReason::Interrupted => StreamItem::Interrupted,
+    };
+    let admitted = self
+      .plane
+      .incoming
+      .lock()
+      .ok()
+      .and_then(|mut incoming| incoming.remove(&self.trace_id));
+    admitted
+      .map(|admitted| admitted.stream.try_send(terminal).is_ok())
+      .unwrap_or(false)
+  }
+}
+
+impl Drop for LocalLeg {
+  fn drop(&mut self) {
+    // The shared node-level table outlives this pump: a leg whose pump
+    // ended before its typed terminal (an aborted task, a shutdown) must
+    // not strand its admission in the table and its slot in the queue
+    // bound. A completed stream already removed its entry; the removal is
+    // then a no-op.
+    if let Ok(mut incoming) = self.plane.incoming.lock() {
+      incoming.remove(&self.trace_id);
+    }
+  }
 }
 
 /// Forwards one chunk to its admitted stream in strict sequence order.
@@ -649,7 +772,7 @@ async fn admit_open(
 /// Delivery never awaits the consumer's window unboundedly: the shared
 /// session reader must stay responsive to the pongs, acknowledgements, and
 /// other streams of the same session, so one stalled consumer cannot park
-/// the whole connection (audit P1-9). The per-stream window is the
+/// the whole connection. The per-stream window is the
 /// flow-control bound. A full window first spends the stream's single
 /// [`INCOMING_STREAM_DRAIN_PATIENCE`] grace — a burst whose frames were
 /// already buffered by the transport can reach the reader before the
@@ -740,47 +863,6 @@ async fn forward_chunk(
   }
 }
 
-/// Resolves one pending outbound admission. The admitting node is this
-/// session's authenticated peer, so the acknowledgement can name it for
-/// the synchronous sender's `DeliveryAck`. Returns whether a pending
-/// entry was resolved: an admitted forwarding hop's waiter was already
-/// consumed when admission resolved, and its later flow-control events
-/// relay upstream through the hop itself instead (audit P1-8).
-fn resolve_ack(ack: AckFrame, pending_acks: &PendingAcks) -> bool {
-  let entry = pending_acks
-    .lock()
-    .map(|mut pending| pending.remove(&ack.trace_id))
-    .ok()
-    .flatten();
-  let Some(entry) = entry else {
-    return false;
-  };
-  match entry {
-    PendingAck::Wait { notify, .. } => {
-      // The single AckStatus→kind mapping lives on the wire type; `Admitted`
-      // carries the admission time and every rejection its typed kind.
-      let outcome = match ack.status.to_kind() {
-        None => Ok(crate::time::from_millis(ack.admitted_at_millis)),
-        Some(kind) => Err(kind),
-      };
-      trace!(trace_id = %ack.trace_id, ?ack.status, "admission ack resolved");
-      let _ = notify.send(outcome);
-    }
-    PendingAck::Relay { upstream } => {
-      // Relay the destination's acknowledgement to the previous hop with
-      // its status preserved.
-      if let Ok(body) = wire::encode_ack(&AckFrame {
-        trace_id: ack.trace_id.clone(),
-        status: ack.status,
-        admitted_at_millis: ack.admitted_at_millis,
-      }) {
-        upstream.try_send(SessionFrame::new(PacketKind::Ack, body));
-      }
-    }
-  }
-  true
-}
-
 /// Digests the immutable opening context of one open frame (endpoints,
 /// protocol, canonical metadata): identical retransmissions produce the
 /// same digest; any mutation produces a different one. Metadata values
@@ -809,6 +891,121 @@ fn opening_context_digest(
     bytes.extend_from_slice(value);
   }
   crate::identity::signature::body_digest(&bytes)
+}
+
+/// One delivery leg of the origin-side outbound pump: the stream's next
+/// hop. The session leg carries the wire frames over a live session's
+/// bounded frame queue; the local leg admits and consumes the stream
+/// in-process. The legs share the pending-admission map, the clock, and
+/// aliveness — the pump registers its admission wait and withdraws a
+/// never-queued open through either one — and only the `deliver_*` trio
+/// diverges: where the open, the chunks, and the typed terminal go.
+pub(crate) enum DeliveryLeg {
+  Session(SessionEntry),
+  Local(LocalLeg),
+}
+
+impl DeliveryLeg {
+  /// The leg's pending-admission map: the origin's one-shot admission
+  /// waiters (and, on a forwarded session, the hops' relays) register
+  /// here.
+  pub(crate) fn pending_acks(&self) -> &PendingAdmissions {
+    match self {
+      Self::Session(entry) => &entry.pending_acks,
+      Self::Local(leg) => &leg.plane.pending_acks,
+    }
+  }
+
+  /// The leg's wall clock: the pending waiters' queue stamps come from
+  /// the same clock the liveness observer reads.
+  pub(crate) fn clock(&self) -> &Arc<dyn crate::time::WallClock> {
+    match self {
+      Self::Session(entry) => &entry.clock,
+      Self::Local(leg) => &leg.packet.clock,
+    }
+  }
+
+  /// Whether the leg can carry the stream's open: a session whose reader
+  /// loop is gone cannot; the local node always can.
+  pub(crate) fn alive(&self) -> bool {
+    match self {
+      Self::Session(entry) => entry.alive(),
+      Self::Local(_) => true,
+    }
+  }
+
+  /// Delivers the open frame: the session leg encodes it and queues it on
+  /// the session's bounded frame queue; the local leg admits the stream
+  /// and resolves the pump's pending waiter on the spot. The pump awaits
+  /// the leg's pending-admission resolution before streaming any body
+  /// chunk.
+  pub(crate) async fn deliver_open(&mut self, open: OpenFrame) -> Result<(), ErrorKind> {
+    match self {
+      Self::Session(entry) => {
+        let body = wire::encode_open(&open).map_err(|error| error.kind())?;
+        entry
+          .frames
+          .send(SessionFrame {
+            kind: PacketKind::Open,
+            body,
+          })
+          .await
+          .map_err(|_| ErrorKind::StreamInterrupted)
+      }
+      Self::Local(leg) => leg.deliver_open(open).await,
+    }
+  }
+
+  /// Delivers one ordered body chunk (already re-chunked to the wire
+  /// bound by the pump): the session leg encodes it and queues it on the
+  /// session's bounded frame queue; the local leg feeds the admitted
+  /// stream's body channel.
+  pub(crate) async fn deliver_chunk(&self, chunk: ChunkFrame) -> Result<(), ErrorKind> {
+    match self {
+      Self::Session(entry) => {
+        let encoded = wire::encode_chunk(&chunk).map_err(|error| error.kind())?;
+        entry
+          .frames
+          .send(SessionFrame {
+            kind: PacketKind::Chunk,
+            body: encoded,
+          })
+          .await
+          .map_err(|_| ErrorKind::StreamInterrupted)
+      }
+      Self::Local(leg) => leg.deliver_chunk(chunk).await,
+    }
+  }
+
+  /// Delivers the stream's typed terminal. Returns whether the terminal
+  /// reached the leg: the session leg encodes it and waits for queue
+  /// capacity — the terminal is the last frame the stream contributes, so
+  /// the writer either drains it or the connection dies and the queue
+  /// closes; the local leg's reserved terminal slot guarantees it for a
+  /// live consumer.
+  pub(crate) async fn deliver_end(&self, trace_id: &TraceId, reason: EndReason) -> bool {
+    match self {
+      Self::Session(entry) => {
+        let Ok(body) = wire::encode_end(&EndFrame {
+          trace_id: trace_id.clone(),
+          reason,
+        }) else {
+          return false;
+        };
+        entry
+          .frames
+          .send_waiting(SessionFrame::new(PacketKind::End, body))
+          .await
+          .is_ok()
+      }
+      Self::Local(leg) => leg.deliver_end(reason),
+    }
+  }
+
+  /// Removes a pending admission that never reached the leg.
+  pub(crate) fn withdraw_pending(&self, trace_id: &TraceId) {
+    self.pending_acks().withdraw(trace_id);
+  }
 }
 
 #[cfg(test)]
@@ -1059,7 +1256,7 @@ mod admission_tests {
 #[cfg(test)]
 mod read_loop_liveness_tests {
   use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{
       Arc, Mutex,
       atomic::{AtomicU64, Ordering},
@@ -1079,7 +1276,10 @@ mod read_loop_liveness_tests {
     identity::testing::SequenceEntropy,
     node::EventHub,
     routing::forward::SessionIdentity,
-    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    session::{
+      pending::PendingAdmissions,
+      stream::{SessionPacketContext, SessionPolicy, test_queue},
+    },
     storage::contract::helpers::ManualClock,
     transport::Received,
   };
@@ -1102,11 +1302,13 @@ mod read_loop_liveness_tests {
   }
 
   /// A frame source that answers every wake with a keepalive pong (the
-  /// wire shape of a responsive but application-silent peer) and then
-  /// ends the session orderly.
+  /// wire shape of a responsive but application-silent peer), advancing
+  /// the injected clock before each wake, and then ends the session
+  /// orderly.
   struct PongSource {
     remaining: u32,
-    now: u64,
+    clock: Arc<ManualClock>,
+    second: u64,
   }
 
   impl FrameSource for PongSource {
@@ -1114,7 +1316,10 @@ mod read_loop_liveness_tests {
       let pong = self.remaining > 0;
       if pong {
         self.remaining -= 1;
-        self.now += 1;
+        self.second += 1;
+        self
+          .clock
+          .set(UNIX_EPOCH + Duration::from_secs(self.second));
       }
       Box::pin(async move {
         if pong {
@@ -1124,17 +1329,15 @@ mod read_loop_liveness_tests {
         }
       })
     }
-
-    fn pong_last_seen(&self) -> u64 {
-      self.now
-    }
   }
 
   fn context(clock: Arc<dyn crate::time::WallClock>) -> SessionPacketContext {
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    let mut registry = crate::ExtensionRegistry::new();
+    registry.register_default().unwrap();
     SessionPacketContext::new(
       node(1),
-      Arc::new(crate::ExtensionRegistry::new()),
+      Arc::new(registry),
       SessionPolicy::new(
         8,
         1 << 20,
@@ -1163,10 +1366,10 @@ mod read_loop_liveness_tests {
   }
 
   /// A frame-silent peer that answers keepalive pings must stay alive:
-  /// every pong wake reflects the injected clock into the session's
-  /// activity mark, so the liveness observer (pinned separately) never
-  /// sees the idle deadline lapse. Before the fix the pong was swallowed
-  /// inside the transport receive and the activity mark never advanced.
+  /// every pong wake stamps the session's activity mark from the
+  /// injected clock, so the liveness observer (pinned separately) never
+  /// sees the idle deadline lapse. A pong swallowed inside the transport
+  /// receive would leave the activity mark unadvanced.
   #[tokio::test]
   async fn pong_wakes_reflect_activity_for_frame_silent_peers() {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
@@ -1174,12 +1377,13 @@ mod read_loop_liveness_tests {
     let last_activity = Arc::new(AtomicU64::new(1));
     let mut source = PongSource {
       remaining: 3,
-      now: 0,
+      clock: Arc::clone(&clock),
+      second: 1_000,
     };
     let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
 
     read_loop(
       &mut source,
@@ -1191,12 +1395,12 @@ mod read_loop_liveness_tests {
     )
     .await;
 
-    // The pong wakes advanced the activity mark to the injected clock's
-    // current seconds (the pong stamp changes are what the loop saw).
+    // Each pong wake stamped the activity mark from the injected clock,
+    // which the source advanced before every wake.
     assert_eq!(
       last_activity.load(Ordering::SeqCst),
-      1_000,
-      "the pong wakes must refresh the session activity mark"
+      1_003,
+      "the pong wakes must stamp the session activity mark from the injected clock"
     );
   }
 
@@ -1207,10 +1411,6 @@ mod read_loop_liveness_tests {
   impl FrameSource for SilentSource {
     fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
       Box::pin(std::future::pending())
-    }
-
-    fn pong_last_seen(&self) -> u64 {
-      0
     }
   }
 
@@ -1225,7 +1425,7 @@ mod read_loop_liveness_tests {
     let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(AtomicU64::new(1));
 
     // The silent source parks the loop; the bounded timeout cancels it.
@@ -1261,12 +1461,13 @@ mod read_loop_liveness_tests {
     let clock = Arc::new(ManualClock::new(UNIX_EPOCH + Duration::from_secs(1_000)));
     let mut source = PongSource {
       remaining: 0,
-      now: 0,
+      clock: Arc::clone(&clock),
+      second: 1_000,
     };
     let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(AtomicU64::new(1));
 
     read_loop(
@@ -1302,7 +1503,7 @@ mod read_loop_liveness_tests {
     let grant = grant();
     let context = context(Arc::clone(&clock) as Arc<dyn crate::time::WallClock>);
     let (frames, _receiver) = test_queue(8, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(AtomicU64::new(1));
 
     // The loop borrows the guard, so the set stays observable between the
@@ -1336,7 +1537,8 @@ mod read_loop_liveness_tests {
     // the source ends the session orderly.
     let mut source = PongSource {
       remaining: 0,
-      now: 0,
+      clock: Arc::clone(&clock),
+      second: 1_000,
     };
     read_loop_frames(
       &mut source,
@@ -1349,8 +1551,8 @@ mod read_loop_liveness_tests {
     )
     .await;
 
-    // Exactly the still-running entry remains pending; before the fix all
-    // four accumulated until teardown. The in-life reap registered no
+    // Exactly the still-running entry remains pending; a reap that only
+    // ran at teardown would accumulate all four. The in-life reap registers no
     // teardown drain of its own.
     assert_eq!(
       consumers.consumers.len(),
@@ -1380,7 +1582,6 @@ mod read_loop_liveness_tests {
 #[cfg(test)]
 mod ack_attribution_tests {
   use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
   };
@@ -1399,11 +1600,12 @@ mod ack_attribution_tests {
     },
     routing::{
       RouteContext,
-      forward::{
-        ForwardingHop, HopPhase, PendingAck, PendingAcks, RetryState, SessionIdentity, register,
-      },
+      forward::{ForwardingHop, HopPhase, PendingAck, RetryState, SessionIdentity, register},
     },
-    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    session::{
+      pending::PendingAdmissions,
+      stream::{SessionPacketContext, SessionPolicy, test_queue},
+    },
     transport::{Received, connection::Message},
   };
 
@@ -1437,17 +1639,15 @@ mod ack_attribution_tests {
         }
       })
     }
-
-    fn pong_last_seen(&self) -> u64 {
-      0
-    }
   }
 
   fn context() -> SessionPacketContext {
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    let mut registry = crate::ExtensionRegistry::new();
+    registry.register_default().unwrap();
     SessionPacketContext::new(
       node(1),
-      Arc::new(crate::ExtensionRegistry::new()),
+      Arc::new(registry),
       SessionPolicy::new(
         8,
         1 << 20,
@@ -1499,14 +1699,14 @@ mod ack_attribution_tests {
 
   fn hop_on(
     upstream: crate::session::stream::BoundedSender,
-    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAcks,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAdmissions,
     downstream_session: SessionIdentity,
   ) -> ForwardingHop {
     let trace_id = trace(9);
     ForwardingHop {
       upstream,
       downstream,
-      downstream_acks: Arc::clone(&downstream_acks),
+      downstream_acks: downstream_acks.clone(),
       upstream_session: other_session(3, 1),
       downstream_session,
       relay_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1520,7 +1720,7 @@ mod ack_attribution_tests {
           metadata: crate::StreamMetadata::new(),
           route: None,
         },
-        context: RouteContext::new(trace_id, node(3), node(9), 8),
+        context: RouteContext::new(trace_id, node(3), node(9), Vec::new(), 8),
         candidates: Vec::new(),
         downstream_acks,
       })),
@@ -1532,7 +1732,7 @@ mod ack_attribution_tests {
   /// admission acknowledgement already consumed from the pending map.
   fn admitted_hop_on(
     upstream: crate::session::stream::BoundedSender,
-    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAcks,
+    downstream: crate::session::stream::BoundedSender, downstream_acks: PendingAdmissions,
     downstream_session: SessionIdentity,
   ) -> ForwardingHop {
     let mut hop = hop_on(upstream, downstream, downstream_acks, downstream_session);
@@ -1546,7 +1746,8 @@ mod ack_attribution_tests {
   /// dropped the queue". The source ends the session orderly after the
   /// acknowledgement, so the loop always terminates within the timeout.
   async fn deliver_ack(
-    grant: &SessionGrant, context: &SessionPacketContext, pending_acks: &PendingAcks, body: Vec<u8>,
+    grant: &SessionGrant, context: &SessionPacketContext, pending_acks: &PendingAdmissions,
+    body: Vec<u8>,
   ) -> (
     crate::session::stream::BoundedSender,
     crate::session::stream::BoundedReceiver,
@@ -1588,13 +1789,16 @@ mod ack_attribution_tests {
     // try (any bogus failure handling would exhaust it and fail the
     // route upstream immediately).
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let live_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
-    live_acks.lock().unwrap().insert(
-      trace_id.clone(),
-      PendingAck::Relay {
-        upstream: upstream_tx.clone(),
-      },
-    );
+    let live_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
+    live_acks
+      .try_reserve_admission(
+        &trace_id,
+        PendingAck::Relay {
+          upstream: upstream_tx.clone(),
+        },
+      )
+      .unwrap();
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
     register(
       &context.forwarding,
@@ -1602,7 +1806,7 @@ mod ack_attribution_tests {
       hop_on(
         upstream_tx,
         downstream_tx,
-        Arc::clone(&live_acks),
+        live_acks.clone(),
         // A different session than the one delivering the late ack: the
         // hop already re-dispatched to another branch.
         other_session(7, 5),
@@ -1612,7 +1816,8 @@ mod ack_attribution_tests {
 
     // The superseded branch's session map: its entry was already
     // consumed when the hop re-dispatched.
-    let stale_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let stale_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let body = crate::packet::wire::encode_ack(&AckFrame {
       trace_id: trace_id.clone(),
       status: AckStatus::Failed,
@@ -1631,7 +1836,7 @@ mod ack_attribution_tests {
       &trace_id
     ));
     // The live attempt's pending entry survived.
-    assert!(live_acks.lock().unwrap().contains_key(&trace_id));
+    assert!(live_acks.contains(&trace_id));
     // Nothing failed upstream and no frame left the stale session.
     use futures_util::FutureExt;
     assert!(upstream_rx.recv().now_or_never().is_none());
@@ -1643,7 +1848,7 @@ mod ack_attribution_tests {
   /// admission waiter was consumed by the admission acknowledgement: the
   /// admitted phase carries the ownership, so the report still travels
   /// upstream instead of being dropped as a superseded branch's
-  /// latecomer (audit P1-8).
+  /// latecomer.
   #[tokio::test]
   async fn post_admission_failure_from_the_bound_session_relays_upstream() {
     let trace_id = trace(9);
@@ -1654,7 +1859,8 @@ mod ack_attribution_tests {
     // the session's pending map is empty and the hop alone represents the
     // stream from here on.
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let session_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
     register(
       &context.forwarding,
@@ -1662,7 +1868,7 @@ mod ack_attribution_tests {
       admitted_hop_on(
         upstream_tx,
         downstream_tx,
-        Arc::clone(&session_acks),
+        session_acks.clone(),
         grant.identity().clone(),
       ),
     )
@@ -1704,7 +1910,7 @@ mod ack_attribution_tests {
   /// The admitted hop's ownership is the exact downstream incarnation, not
   /// the peer: a post-admission failure from a replacement session of the
   /// same peer is another generation's traffic and is dropped rather than
-  /// steered through the live stream (audit P1-4, P1-8).
+  /// steered through the live stream.
   #[tokio::test]
   async fn post_admission_failure_from_another_incarnation_is_dropped() {
     let trace_id = trace(9);
@@ -1714,7 +1920,8 @@ mod ack_attribution_tests {
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
     // The hop's bound attempt is another incarnation of the delivering
     // peer, so its pending map is not the one this session acknowledges on.
-    let bound_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let bound_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
     register(
       &context.forwarding,
@@ -1722,13 +1929,14 @@ mod ack_attribution_tests {
       admitted_hop_on(
         upstream_tx,
         downstream_tx,
-        Arc::clone(&bound_acks),
+        bound_acks.clone(),
         other_session(2, 7),
       ),
     )
     .unwrap();
 
-    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let session_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let body = crate::packet::wire::encode_ack(&AckFrame {
       trace_id: trace_id.clone(),
       status: AckStatus::Failed,
@@ -1761,7 +1969,8 @@ mod ack_attribution_tests {
     let context = context();
 
     let (upstream_tx, mut upstream_rx) = test_queue(16, usize::MAX);
-    let session_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let session_acks: PendingAdmissions =
+      PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let (downstream_tx, _downstream_rx) = test_queue(16, usize::MAX);
     register(
       &context.forwarding,
@@ -1769,7 +1978,7 @@ mod ack_attribution_tests {
       admitted_hop_on(
         upstream_tx,
         downstream_tx,
-        Arc::clone(&session_acks),
+        session_acks.clone(),
         grant.identity().clone(),
       ),
     )
@@ -1792,7 +2001,7 @@ mod ack_attribution_tests {
 #[cfg(test)]
 mod durable_mirror_tests {
   use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
   };
@@ -1810,9 +2019,12 @@ mod durable_mirror_tests {
     },
     routing::{
       forward::SessionIdentity,
-      trace::{TracePhase, TraceRecord, TraceSink, TraceTransition},
+      trace::{TraceRecord, TraceSink},
     },
-    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    session::{
+      pending::PendingAdmissions,
+      stream::{SessionPacketContext, SessionPolicy, test_queue},
+    },
     transport::{Received, connection::Message},
   };
 
@@ -1847,10 +2059,6 @@ mod durable_mirror_tests {
         }
       })
     }
-
-    fn pong_last_seen(&self) -> u64 {
-      0
-    }
   }
 
   /// A packet context carrying a real durable trace sink and the given
@@ -1858,9 +2066,11 @@ mod durable_mirror_tests {
   /// be observed on both planes at once.
   fn context_with(sink: TraceSink, routes: crate::routing::RouteTable) -> SessionPacketContext {
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
+    let mut registry = crate::ExtensionRegistry::new();
+    registry.register_default().unwrap();
     SessionPacketContext::new(
       node(1),
-      Arc::new(crate::ExtensionRegistry::new()),
+      Arc::new(registry),
       SessionPolicy::new(
         8,
         1 << 20,
@@ -1910,7 +2120,7 @@ mod durable_mirror_tests {
     .unwrap();
     let mut source = AckSource { body };
     let (frames, _frames_rx) = test_queue(8, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     tokio::time::timeout(
@@ -1972,13 +2182,12 @@ mod durable_mirror_tests {
     );
   }
 
-  /// The durable twin's mirror of the in-memory flip (remaining items
-  /// 2026-10-10, P2-7): a late failed acknowledgement that flips the
-  /// origin's in-memory record to `Failed(StreamInterrupted)` also
-  /// revises the durable terminal that already recorded `Delivered` —
-  /// the realistic ordering, since the failure report trails the pump
-  /// tail — so the durable trace ends failed exactly like the in-memory
-  /// record instead of keeping `Delivered` for the whole retention
+  /// The durable twin's mirror of the in-memory flip: a late failed
+  /// acknowledgement that flips the origin's in-memory record to
+  /// `Failed(StreamInterrupted)` also revises the durable terminal that already
+  /// recorded `Delivered` — the realistic ordering, since the failure report
+  /// trails the pump tail — so the durable trace ends failed exactly like the
+  /// in-memory record instead of keeping `Delivered` for the whole retention
   /// window.
   #[tokio::test]
   async fn late_failure_revises_the_durable_delivered_twin() {
@@ -1993,13 +2202,13 @@ mod durable_mirror_tests {
     sink
       .record(
         TraceRecord::new(trace_id.clone(), node(1), node(9), sink.clock_now())
-          .with_transition(TraceTransition::Delivered, sink.clock_now()),
+          .with_transition(RouteState::Delivered, sink.clock_now()),
       )
       .await;
 
     let records = deliver_failed_ack(&sink, &routes, &trace_id).await;
 
-    // The in-memory record ends failed (the P2-3 contract, unchanged).
+    // The in-memory record ends failed (the terminal contract, unchanged).
     let memory = routes.lock().unwrap().get(&trace_id).cloned().unwrap();
     assert_eq!(
       memory.state,
@@ -2013,7 +2222,7 @@ mod durable_mirror_tests {
     assert_eq!(records[0].destination(), &node(9));
     assert_eq!(
       records[0].phase(),
-      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+      &RouteState::Failed(ErrorKind::StreamInterrupted)
     );
   }
 
@@ -2047,7 +2256,7 @@ mod durable_mirror_tests {
     assert_eq!(records[0].destination(), &node(9));
     assert_eq!(
       records[0].phase(),
-      &TracePhase::Failed(ErrorKind::StreamInterrupted)
+      &RouteState::Failed(ErrorKind::StreamInterrupted)
     );
   }
 
@@ -2070,7 +2279,7 @@ mod durable_mirror_tests {
 #[cfg(test)]
 mod slow_consumer_tests {
   use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
   };
@@ -2090,7 +2299,10 @@ mod slow_consumer_tests {
       wire::{BASE_SCHEMA_ID, PacketKind},
     },
     routing::forward::SessionIdentity,
-    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    session::{
+      pending::PendingAdmissions,
+      stream::{SessionPacketContext, SessionPolicy, test_queue},
+    },
     transport::{Received, connection::Message},
   };
 
@@ -2103,7 +2315,7 @@ mod slow_consumer_tests {
   }
 
   const FEATURE: &str = "radiata.woooo.tech/features/data-messages";
-  const PROTOCOL: &str = "radiata.woooo.tech/protocols/test-echo";
+  const PROTOCOL: &str = "example.org/protocols/test-echo";
 
   /// The authenticated grant of a session that selected the test
   /// protocol's owning feature: admission requires the negotiated
@@ -2161,10 +2373,6 @@ mod slow_consumer_tests {
     fn receive_event(&mut self) -> BoxFuture<'_, crate::Result<Option<Received>>> {
       let message = self.messages.pop_front();
       Box::pin(async move { Ok(message.map(Received::Message)) })
-    }
-
-    fn pong_last_seen(&self) -> u64 {
-      0
     }
   }
 
@@ -2308,6 +2516,7 @@ mod slow_consumer_tests {
   /// Builds the registry + read loop plumbing around one consumer.
   fn session_for(consumer: Arc<DrainingConsumer>) -> SessionPacketContext {
     let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
     registry
       .register_protocol(
         ProtocolDefinition::new(
@@ -2352,15 +2561,15 @@ mod slow_consumer_tests {
     )
   }
 
-  /// Regression (audit P1-9): a consumer that never drains its bounded
+  /// Regression: a consumer that never drains its bounded
   /// window must not stall the session's shared read loop. The window
   /// (`INCOMING_STREAM_CHUNKS`) fills, the overflowing chunk spends the
   /// stream's single drain grace, the grace expires, and the explicit
   /// overload policy terminates the stream — the origin learns it through
   /// a typed failed acknowledgement, the consumer later observes exactly
   /// one typed interruption — and the reader keeps processing frames after
-  /// the overload until the orderly end. Before the fix the reader parked
-  /// on the full channel and the session went mute.
+  /// the overload until the orderly end. A reader parked
+  /// on the full channel would leave the session mute.
   #[tokio::test]
   async fn an_undrained_window_terminates_the_stream_without_stalling_the_reader() {
     let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
@@ -2369,6 +2578,7 @@ mod slow_consumer_tests {
       terminal: Arc::new(Mutex::new(None)),
     });
     let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
     registry
       .register_protocol(
         ProtocolDefinition::new(
@@ -2381,7 +2591,7 @@ mod slow_consumer_tests {
     let context = context(Arc::new(registry));
     let grant = grant();
     let (frames, mut frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // The window fills, then the next chunk overflows it and spends the
@@ -2463,6 +2673,7 @@ mod slow_consumer_tests {
       terminal: Arc::new(Mutex::new(None)),
     });
     let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
     registry
       .register_protocol(
         ProtocolDefinition::new(
@@ -2475,7 +2686,7 @@ mod slow_consumer_tests {
     let context = context(Arc::new(registry));
     let grant = grant();
     let (frames, mut frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // A body that fits the window: the wire end queues as the terminal
@@ -2532,7 +2743,7 @@ mod slow_consumer_tests {
     }
   }
 
-  /// Regression (the P1-9 follow-up): a burst of wire slices above the
+  /// Regression: a burst of wire slices above the
   /// window can reach the shared reader before the consumer task is first
   /// scheduled — the transport already buffered every slice. The bounded
   /// drain grace keeps that legitimate burst from being misread as
@@ -2544,7 +2755,7 @@ mod slow_consumer_tests {
     let context = session_for(Arc::clone(&consumer));
     let grant = grant();
     let (frames, mut frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // Two slices above the window: the overflowing slice spends the
@@ -2611,7 +2822,7 @@ mod slow_consumer_tests {
     let context = session_for(Arc::clone(&consumer));
     let grant = grant();
     let (frames, mut frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // The stalled stream fills its window and spends its grace on the next
@@ -2686,7 +2897,7 @@ mod slow_consumer_tests {
 #[cfg(test)]
 mod consumer_lifecycle_tests {
   use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
   };
@@ -2705,12 +2916,15 @@ mod consumer_lifecycle_tests {
       wire::{BASE_SCHEMA_ID, PacketKind},
     },
     routing::forward::SessionIdentity,
-    session::stream::{SessionPacketContext, SessionPolicy, test_queue},
+    session::{
+      pending::PendingAdmissions,
+      stream::{SessionPacketContext, SessionPolicy, test_queue},
+    },
     transport::{Received, connection::Message},
   };
 
   const FEATURE: &str = "radiata.woooo.tech/features/data-messages";
-  const PROTOCOL: &str = "radiata.woooo.tech/protocols/test-echo";
+  const PROTOCOL: &str = "example.org/protocols/test-echo";
 
   fn node(value: u8) -> NodeId {
     NodeId::parse(&format!("node-{value:021}")).unwrap()
@@ -2772,10 +2986,6 @@ mod consumer_lifecycle_tests {
       let message = self.messages.pop_front();
       Box::pin(async move { Ok(message.map(Received::Message)) })
     }
-
-    fn pong_last_seen(&self) -> u64 {
-      0
-    }
   }
 
   fn open_message(seed: u32, peer: u8) -> Message {
@@ -2813,6 +3023,7 @@ mod consumer_lifecycle_tests {
   /// production-scale population.
   fn context(consumer: Arc<GatedConsumer>, budget: usize) -> Arc<SessionPacketContext> {
     let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
     registry
       .register_protocol(
         ProtocolDefinition::new(
@@ -2872,7 +3083,7 @@ mod consumer_lifecycle_tests {
     }
   }
 
-  /// Regression (audit P1-2): the wire stream's end frees the per-session
+  /// Regression: the wire stream's end frees the per-session
   /// table slot, but the consumer's lifecycle slot is held until the accept
   /// future finishes — the post-EOF work is legitimate and is never
   /// cancelled at the wire end. Repeated complete streams accumulate their
@@ -2888,7 +3099,7 @@ mod consumer_lifecycle_tests {
     let context = context(Arc::clone(&consumer), 8);
     let grant = grant(2, 1);
     let (frames, _frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // Four complete wire streams: every End frees the table entry, so the
@@ -2932,7 +3143,7 @@ mod consumer_lifecycle_tests {
     );
   }
 
-  /// Regression (audit P1-2): past the node-wide budget, a new open is
+  /// Regression: past the node-wide budget, a new open is
   /// refused with the typed `Overloaded` backpressure — never admitted
   /// beyond the running-consumer bound — and no consumer runs for the
   /// refused stream. The slots return once the stalled consumers finish.
@@ -2946,7 +3157,7 @@ mod consumer_lifecycle_tests {
     let context = context(Arc::clone(&consumer), 2);
     let grant = grant(2, 1);
     let (frames, mut frames_rx) = test_queue(16, 1 << 20);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // Two complete wire streams whose consumers stay parked past EOF; the
@@ -3002,7 +3213,7 @@ mod consumer_lifecycle_tests {
     assert_eq!(context.live_consumers.in_use(), 0);
   }
 
-  /// Regression (audit P1-2): a retired session hands its consumers to the
+  /// Regression: a retired session hands its consumers to the
   /// node-scoped drain, and their lifecycle reservations survive that
   /// transfer — and across sessions: the next session's admissions count
   /// against the same node-wide budget, and every reservation returns when
@@ -3015,7 +3226,7 @@ mod consumer_lifecycle_tests {
       accepted: Arc::new(Mutex::new(Vec::new())),
     });
     let context = context(Arc::clone(&consumer), 8);
-    let pending_acks = Arc::new(Mutex::new(HashMap::new()));
+    let pending_acks = PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS);
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     // Session A: one complete stream, then the session ends orderly — the
