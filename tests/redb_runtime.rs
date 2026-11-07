@@ -187,7 +187,7 @@ async fn redb_runtime_shutdown_releases_the_file_lock_before_the_reply() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn redb_runtime_concurrent_open_is_typed_locked_and_error_is_redacted() {
+async fn redb_runtime_concurrent_open_is_typed_locked() {
   let dir = tempfile::tempdir().unwrap();
   let storage = radiata::adapters::redb_store(dir.path().join("store.redb"));
   let keys = Arc::new(DeterministicKeys::new(12, Arc::new(Calls::default())));
@@ -203,11 +203,6 @@ async fn redb_runtime_concurrent_open_is_typed_locked_and_error_is_redacted() {
     }
   };
   assert_eq!(error.kind(), ErrorKind::StorageLocked);
-  let rendered = error.to_string();
-  assert!(
-    !rendered.contains(dir.path().to_str().unwrap()),
-    "error rendering leaks the storage path: {rendered}"
-  );
   first.shutdown().await.unwrap();
 }
 

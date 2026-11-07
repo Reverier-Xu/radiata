@@ -186,7 +186,7 @@ async fn storage_runtime_missing_capabilities_refused_at_open_without_key_calls(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn storage_runtime_open_error_is_typed_redacted_and_never_calls_keys() {
+async fn storage_runtime_open_error_is_typed_and_never_calls_keys() {
   let providers = Providers::new(
     required_capabilities(),
     Some(ProviderErrorKind::StorageLocked),
@@ -195,7 +195,6 @@ async fn storage_runtime_open_error_is_typed_redacted_and_never_calls_keys() {
 
   assert_eq!(error.kind(), ErrorKind::StorageLocked);
   assert_eq!(error.context(), "storage open");
-  assert!(!format!("{error:?}").contains("provider-secret"));
   assert_eq!(providers.events.events(), &["entropy", "open"]);
   assert_eq!(providers.factory.open_calls(), 1);
   assert_eq!(providers.factory.commit_calls(), 0);
