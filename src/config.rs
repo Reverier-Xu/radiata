@@ -2,17 +2,10 @@ use std::{collections::BTreeSet, time::Duration};
 
 use crate::{Error, FeatureTag, Result};
 
-/// The shared zero-refusal contract for every configured bound: a zero
-/// value is a caller mistake, not a "disable" spelling, so every setter
-/// fails typed with the value's own name.
-fn reject_zero<T>(name: &'static str, value: T) -> Result<()>
-where
-  T: ZeroCheck, {
-  value.zero_checked(name)
-}
-
-/// The internal seal over the two bound shapes a config knob takes:
-/// a plain count and a duration.
+/// The zero-refusal contract for every configured bound: a zero value
+/// is a caller mistake, not a "disable" spelling, so every setter fails
+/// typed with the value's own name. The seal covers the two bound
+/// shapes a config knob takes: a plain count and a duration.
 trait ZeroCheck {
   fn zero_checked(&self, name: &'static str) -> Result<()>;
 }
@@ -115,7 +108,7 @@ impl NodeConfig {
   /// the member table (N × interval per round cluster-wide); a cluster
   /// keeping one interval keeps its load predictable (nonzero).
   pub fn with_anti_entropy_interval(mut self, value: Duration) -> Result<Self> {
-    reject_zero("anti-entropy interval", value)?;
+    value.zero_checked("anti-entropy interval")?;
     self.anti_entropy_interval = value;
     Ok(self)
   }
@@ -133,8 +126,8 @@ impl NodeConfig {
   /// budget. Local memory and backpressure only — it never crosses the
   /// wire, so per-device scaling is safe (both nonzero).
   pub fn with_session_queue_limits(mut self, messages: usize, bytes: usize) -> Result<Self> {
-    reject_zero("session queue messages", messages)?;
-    reject_zero("session queue bytes", bytes)?;
+    messages.zero_checked("session queue messages")?;
+    bytes.zero_checked("session queue bytes")?;
     self.session_queue_messages = messages;
     self.session_queue_bytes = bytes;
     Ok(self)
@@ -243,8 +236,8 @@ impl NodeConfig {
   /// The extension channel's budget is configured separately with
   /// [`NodeConfig::with_task_reconcile_extension_slots`].
   pub fn with_task_reconcile_slots(mut self, local: usize, network: usize) -> Result<Self> {
-    reject_zero("local task reconcile slots", local)?;
-    reject_zero("network task reconcile slots", network)?;
+    local.zero_checked("local task reconcile slots")?;
+    network.zero_checked("network task reconcile slots")?;
     self.task_reconcile_local_slots = local;
     self.task_reconcile_network_slots = network;
     Ok(self)
@@ -256,13 +249,13 @@ impl NodeConfig {
   /// local capacity its own child operations need. Purely local
   /// admission, never peer-visible; the value must be nonzero.
   pub fn with_task_reconcile_extension_slots(mut self, extension: usize) -> Result<Self> {
-    reject_zero("extension task reconcile slots", extension)?;
+    extension.zero_checked("extension task reconcile slots")?;
     self.task_reconcile_extension_slots = extension;
     Ok(self)
   }
 
   pub fn with_receipt_retention(mut self, value: Duration) -> Result<Self> {
-    reject_zero("receipt retention", value)?;
+    value.zero_checked("receipt retention")?;
     self.receipt_retention = value;
     Ok(self)
   }
@@ -286,7 +279,7 @@ impl NodeConfig {
   pub fn with_resource_removal_retention(
     mut self, retention: Duration, cap: usize,
   ) -> Result<Self> {
-    reject_zero("resource removal retention", retention)?;
+    retention.zero_checked("resource removal retention")?;
     self.resource_removal_retention = retention;
     self.resource_removal_cap = cap;
     Ok(self)
@@ -300,7 +293,7 @@ impl NodeConfig {
   /// the authentication deadline, which starts only after the connect
   /// returns.
   pub fn with_dial_deadline(mut self, value: Duration) -> Result<Self> {
-    reject_zero("dial deadline", value)?;
+    value.zero_checked("dial deadline")?;
     self.dial_deadline = value;
     Ok(self)
   }
@@ -314,7 +307,7 @@ impl NodeConfig {
   /// keep it uniform across a cluster and tighten it only for
   /// uniformly fast deployments.
   pub fn with_authentication_deadline(mut self, value: Duration) -> Result<Self> {
-    reject_zero("authentication deadline", value)?;
+    value.zero_checked("authentication deadline")?;
     self.authentication_deadline = value;
     Ok(self)
   }
@@ -328,7 +321,7 @@ impl NodeConfig {
   /// a stuck hop would hang to the transitive liveness bound of the
   /// sessions on the path.
   pub fn with_relay_hop_deadline(mut self, value: Duration) -> Result<Self> {
-    reject_zero("relay hop deadline", value)?;
+    value.zero_checked("relay hop deadline")?;
     self.relay_hop_deadline = value;
     Ok(self)
   }
@@ -554,7 +547,7 @@ impl MergeAdmissionLimits {
   /// join pool stays fixed (strangers do not scale with the cluster);
   /// only the member pool grows with the expected member count.
   pub fn for_cluster(expected_members: usize) -> Result<Self> {
-    reject_zero("expected members", expected_members)?;
+    expected_members.zero_checked("expected members")?;
     Ok(Self::scaled(expected_members))
   }
 
@@ -580,10 +573,10 @@ impl MergeAdmissionLimits {
     mut self, source_burst: u32, source_window: Duration, global_burst: u32,
     global_window: Duration,
   ) -> Result<Self> {
-    reject_zero("join source burst", source_burst)?;
-    reject_zero("join global burst", global_burst)?;
-    reject_zero("join source window", source_window)?;
-    reject_zero("join global window", global_window)?;
+    source_burst.zero_checked("join source burst")?;
+    global_burst.zero_checked("join global burst")?;
+    source_window.zero_checked("join source window")?;
+    global_window.zero_checked("join global window")?;
     self.join_source = (source_burst, source_window);
     self.join_global = (global_burst, global_window);
     Ok(self)
@@ -596,10 +589,10 @@ impl MergeAdmissionLimits {
     mut self, source_burst: u32, source_window: Duration, global_burst: u32,
     global_window: Duration,
   ) -> Result<Self> {
-    reject_zero("member source burst", source_burst)?;
-    reject_zero("member global burst", global_burst)?;
-    reject_zero("member source window", source_window)?;
-    reject_zero("member global window", global_window)?;
+    source_burst.zero_checked("member source burst")?;
+    global_burst.zero_checked("member global burst")?;
+    source_window.zero_checked("member source window")?;
+    global_window.zero_checked("member global window")?;
     self.member_source = (source_burst, source_window);
     self.member_global = (global_burst, global_window);
     Ok(self)
@@ -638,9 +631,9 @@ pub struct TraceMetadataLimits {
 
 impl TraceMetadataLimits {
   pub fn new(active: usize, terminal: usize, retention: Duration) -> Result<Self> {
-    reject_zero("active trace metadata", active)?;
-    reject_zero("terminal trace metadata", terminal)?;
-    reject_zero("trace metadata retention", retention)?;
+    active.zero_checked("active trace metadata")?;
+    terminal.zero_checked("terminal trace metadata")?;
+    retention.zero_checked("trace metadata retention")?;
     Ok(Self {
       active,
       terminal,
@@ -701,8 +694,8 @@ impl RecoveryConfig {
     if fan_out == 0 {
       return Err(Error::invalid_input("recovery fan-out"));
     }
-    reject_zero("initial recovery backoff", initial_backoff)?;
-    reject_zero("maximum recovery backoff", maximum_backoff)?;
+    initial_backoff.zero_checked("initial recovery backoff")?;
+    maximum_backoff.zero_checked("maximum recovery backoff")?;
     if initial_backoff > maximum_backoff {
       return Err(Error::invalid_input("recovery policy"));
     }

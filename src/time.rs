@@ -26,6 +26,11 @@
 //!   recovery scheduling) and are never stored as absolute instants;
 //!   `to_seconds` saturates at the epoch, which only makes a pre-epoch reading
 //!   look maximally overdue.
+//!
+//! Not every wall-time encoding lives here: the receipt anchor's
+//! fixed-width wall-time wire codec (`storage/receipt.rs`'s
+//! `encode_wall_time`/`decode_wall_time`) is a wire-format concern and
+//! stays beside the receipt transcript it is frozen into.
 
 use std::{
   fmt,
