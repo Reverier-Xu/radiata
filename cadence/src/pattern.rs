@@ -358,3 +358,501 @@ fn advance_second(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
   }
   Some(())
 }
+
+#[cfg(test)]
+mod tests {
+  use super::{FieldValues, Offset, ParseErrorKind, Pattern};
+
+  /// Parses an input that must be accepted.
+  fn parse_ok(text: &str) -> Pattern {
+    Pattern::parse(text).unwrap_or_else(|error| panic!("{text:?} should parse: {error}"))
+  }
+
+  /// Asserts an input is rejected and returns the failure category.
+  fn rejected(text: &str) -> ParseErrorKind {
+    Pattern::parse(text).expect_err(text).kind()
+  }
+
+  /// Builds field values that must be in-domain.
+  fn values(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> FieldValues {
+    FieldValues::new(year, month, day, hour, minute, second).expect("in-domain values")
+  }
+
+  /// The frozen canonical-form golden corpus: input, canonical rendering.
+  #[test]
+  fn golden_canonical_forms() {
+    let cases = [
+      ("{*}-{*}-{*}T{*}:{*}:{*}", "{*}-{*}-{*}T{*}:{*}:{*}"),
+      ("2026-03-15T00:00:00", "2026-03-15T00:00:00"),
+      ("2026-03-15T00:00:00Z", "2026-03-15T00:00:00Z"),
+      ("2026-03-15T00:00:00+00:00", "2026-03-15T00:00:00+00:00"),
+      ("2026-03-15T09:00:00+09:00", "2026-03-15T09:00:00+09:00"),
+      ("2026-03-15T09:00:00-05:30", "2026-03-15T09:00:00-05:30"),
+      ("2026-{03,09-12}-01T00:00:00", "2026-{03,09-12}-01T00:00:00"),
+      ("2026-{09-12,03}-01T00:00:00", "2026-{03,09-12}-01T00:00:00"),
+      ("{2026,2030-2033}-{03,09-12}-01T00:00:00Z", "{2026,2030-2033}-{03,09-12}-01T00:00:00Z"),
+      ("2026-{01-03,03-05}-01T00:00:00", "2026-{01-05}-01T00:00:00"),
+      ("2026-03-15T{*,07}:{00,30}:59", "2026-03-15T{*}:{00,30}:59"),
+      ("{0059}-{03}-{03}T{03}:{03}:{03}", "{0059}-{03}-{03}T{03}:{03}:{03}"),
+      ("0000-01-01T00:00:00", "0000-01-01T00:00:00"),
+      ("9999-12-31T23:59:59", "9999-12-31T23:59:59"),
+    ];
+    for (input, canonical) in cases {
+      let pattern = parse_ok(input);
+      assert_eq!(pattern.to_string(), canonical, "canonical form of {input:?}");
+      assert_eq!(parse_ok(&pattern.to_string()).to_string(), canonical, "reparse of {input:?}");
+    }
+  }
+
+  /// The frozen reject matrix: every malformation fails closed with the
+  /// right category.
+  #[test]
+  fn reject_matrix() {
+    let skeleton = [
+      "", "*", "2026", "2026-03", "2026-03-15", "2026-03-15T", "2026-03-15T00",
+      "2026-03-15T00:00", "2026-03-15t00:00:00", "2026/03/15T00:00:00", "2026-03-15V00:00:00",
+      "2026-03-15T00-00:00", " 2026-03-15T00:00:00",
+    ];
+    for text in skeleton {
+      assert_eq!(rejected(text), ParseErrorKind::Skeleton, "{text:?}");
+    }
+    // The brace rule: bare *, bare ranges, and bare enumerations fail.
+    let bare = ["*-*-*T*:*:*", "2026-03-15T0-30:00:00", "00:00:00", "2026-03-15T*:00:00"];
+    for text in bare {
+      let kind = rejected(text);
+      assert!(matches!(kind, ParseErrorKind::Skeleton | ParseErrorKind::DigitCount), "{text:?}");
+    }
+    let digit_counts = [
+      "202-03-15T00:00:00", "20260-03-15T00:00:00", "2026-3-15T00:00:00", "2026-013-15T00:00:00",
+      "2026-03-1T00:00:00", "2026-03-15T0:00:00", "2026-03-15T00:0:00", "2026-03-15T00:00:0",
+      "2026-03-15T001:00:00", "{00}-{01}-01T00:00:00", "{32}-{01}-01T00:00:00",
+      "{24}-{01}-01T00:00:00", "{60}-{01}-01T00:00:00", "2026-{03-03-03}-01T00:00:00",
+    ];
+    for text in digit_counts {
+      assert_eq!(rejected(text), ParseErrorKind::DigitCount, "{text:?}");
+    }
+    let domains = [
+      "2026-00-01T00:00:00", "2026-13-01T00:00:00", "2026-03-00T00:00:00", "2026-03-32T00:00:00",
+      "2026-03-15T24:00:00", "2026-03-15T00:60:00", "2026-03-15T00:00:60",
+      "{2026}-{13}-01T00:00:00", "{2026}-{01}-{32}T00:00:00", "2026-03-15T{24}:00:00",
+      "2026-03-15T00:{60}:00", "2026-03-15T00:00:{60}",
+    ];
+    for text in domains {
+      assert_eq!(rejected(text), ParseErrorKind::Domain, "{text:?}");
+    }
+    let ranges = ["2026-{05-02}-01T00:00:00", "2026-03-15T{23-00}:00:00"];
+    for text in ranges {
+      assert_eq!(rejected(text), ParseErrorKind::RangeOrder, "{text:?}");
+    }
+    let duplicates = [
+      "2026-{03,03}-01T00:00:00", "2026-{03,03-03}-01T00:00:00", "2026-{01-05,03}-01T00:00:00",
+      "2026-{01-05,01-05}-01T00:00:00", "{*,*}-{01}-01T00:00:00", "2026-03-15T{00,00}:{00}:00",
+    ];
+    for text in duplicates {
+      assert_eq!(rejected(text), ParseErrorKind::DuplicateElement, "{text:?}");
+    }
+    let offsets = [
+      "2026-03-15T00:00:00x", "2026-03-15T00:00:00Zx", "2026-03-15T00:00:00+", "2026-03-15T00:00:00-",
+      "2026-03-15T00:00:00+24:00", "2026-03-15T00:00:00+00:60", "2026-03-15T00:00:00+1:00",
+      "2026-03-15T00:00:00+0900", "2026-03-15T00:00:00+09:0", "2026-03-15T00:00:00 {*}",
+      "2026-03-15T00:00:00 ", "2026-03-15T00:00:00+5:00", "2026-03-15T00:00:00+005:00",
+    ];
+    for text in offsets {
+      assert_eq!(rejected(text), ParseErrorKind::Offset, "{text:?}");
+    }
+  }
+
+  /// Round-trips: parse, render, reparse — the canonical form is a fixed
+  /// point and the declared frame is preserved.
+  #[test]
+  fn parse_display_parse_round_trips() {
+    let inputs = [
+      "{*}-{*}-{*}T{*}:{*}:{*}",
+      "2026-{03,09-12}-01T00:00:00+09:00",
+      "{2026,2030-2033}-{03,09-12}-01T00:00:00Z",
+      "2026-03-15T{06-18}:{00,30}:{15-45}",
+      "0000-01-01T00:00:00",
+      "9999-12-31T23:59:59-08:00",
+    ];
+    for input in inputs {
+      let first = parse_ok(input);
+      let canonical = first.to_string();
+      let second = parse_ok(&canonical);
+      assert_eq!(second.to_string(), canonical, "fixed point of {input:?}");
+      assert_eq!(second.offset(), first.offset(), "frame of {input:?}");
+    }
+  }
+
+  /// Membership agrees with the brute-force oracle over dense sample
+  /// spaces, including out-of-domain field values (both are pure set
+  /// membership, so they agree everywhere).
+  #[test]
+  fn membership_matches_oracle() {
+    let patterns = [
+      "2026-03-15T00:00:00",
+      "2026-{03,07,09-12}-01T00:00:00Z",
+      "2026-02-29T12:34:56+05:45",
+      "{2025,2026}-{01-12}-{01,15,28-31}T{00,12,23}:{00,29,30,59}:{00,01,59}",
+      "{*}-{*}-{30,31}T{23}:59:59",
+    ];
+    let oracles: Vec<(Pattern, Oracle)> =
+      patterns.iter().map(|text| (parse_ok(text), Oracle::parse(text))).collect();
+    for year in 2025..=2026 {
+      for month in 1..=12u8 {
+        for day in 1..=31u8 {
+          for hour in [0u8, 12, 23] {
+            for minute in [0u8, 29, 30, 59] {
+              for second in [0u8, 1, 59] {
+                let candidate = values(year, month, day, hour, minute, second);
+                for (pattern, oracle) in &oracles {
+                  assert_eq!(
+                    pattern.matches(candidate),
+                    oracle.matches(candidate),
+                    "{pattern:?} at {candidate:?}"
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    // Dense time-of-day sweep on one day.
+    let (pattern, oracle) = (&oracles[3].0, &oracles[3].1);
+    for hour in 0..=23u8 {
+      for minute in 0..=59u8 {
+        for second in 0..=59u8 {
+          let candidate = values(2026, 6, 15, hour, minute, second);
+          assert_eq!(
+            pattern.matches(candidate),
+            oracle.matches(candidate),
+            "{pattern:?} at {candidate:?}"
+          );
+        }
+      }
+    }
+  }
+
+  /// Next-fire agrees with exhaustive second-stepping over dense sample
+  /// spaces, including year, month, day, and leap-day boundaries.
+  #[test]
+  fn next_fire_matches_step_oracle() {
+    let cases: &[(&str, FieldValues)] = &[
+      ("{*}-{*}-{*}T00:00:00Z", values(2026, 3, 15, 12, 30, 45)),
+      ("2026-01-{01,15}T00:00:00", values(2026, 1, 2, 0, 0, 0)),
+      ("2026-{01-12}-{01,15}T00:00:00", values(2026, 1, 2, 6, 30, 0)),
+      ("2024-{02}-{29}T00:00:00Z", values(2024, 2, 1, 0, 0, 0)),
+      ("2026-12-31T23:59:59", values(2026, 12, 31, 0, 0, 0)),
+      ("2026-{02,04}-{30,31}T00:00:00", values(2026, 1, 1, 0, 0, 0)),
+      ("2026-03-15T{*,07}:{00,30}:59", values(2026, 3, 15, 7, 30, 58)),
+    ];
+    for (text, start) in cases {
+      let pattern = parse_ok(text);
+      let oracle = Oracle::parse(text);
+      assert_eq!(
+        pattern.next_fire(*start),
+        oracle_next_fire(&oracle, *start, 12_000_000),
+        "{text:?} from {start:?}"
+      );
+    }
+  }
+
+  /// The next-fire chain stays on the oracle's matched-second sequence.
+  #[test]
+  fn next_fire_chain_matches_oracle() {
+    let text = "{*}-{*}-{*}T{06,18}:{00,30}:00Z";
+    let pattern = parse_ok(text);
+    let oracle = Oracle::parse(text);
+    let mut cursor = values(2026, 2, 27, 12, 0, 0);
+    for _ in 0..24 {
+      let next = pattern.next_fire(cursor).expect("daily-ish pattern always fires");
+      let stepped = oracle_next_fire(&oracle, cursor, 1_000_000).expect("oracle fires too");
+      assert_eq!(next, stepped);
+      assert!(pattern.matches(next), "next_fire output matches");
+      cursor = step(next).expect("chain stays in range");
+    }
+  }
+
+  /// Calendar edges: inclusive start, leap days, never-matching patterns,
+  /// and end-of-month rolls.
+  #[test]
+  fn next_fire_calendar_edges() {
+    // Inclusive: a matching start fires itself.
+    let daily = parse_ok("{*}-{*}-{*}T00:00:00");
+    let midnight = values(2026, 3, 15, 0, 0, 0);
+    assert_eq!(daily.next_fire(midnight), Some(midnight));
+
+    // Leap day: fires in leap years only, never between them.
+    let leap_day = parse_ok("{*}-{02}-{29}T00:00:00Z");
+    assert_eq!(
+      leap_day.next_fire(values(2024, 1, 1, 0, 0, 0)),
+      Some(values(2024, 2, 29, 0, 0, 0))
+    );
+    assert_eq!(leap_day.next_fire(values(2024, 3, 1, 0, 0, 0)), Some(values(2028, 2, 29, 0, 0, 0)));
+    assert_eq!(
+      parse_ok("{2024}-{02}-{29}T00:00:00").next_fire(values(2024, 3, 1, 0, 0, 0)),
+      None
+    );
+
+    // February 30th can never fire; the bounded search returns None.
+    let feb_30 = parse_ok("{*}-{02}-{30}T00:00:00");
+    assert_eq!(feb_30.next_fire(values(2026, 1, 1, 0, 0, 0)), None);
+
+    // End-of-month rolls skip impossible set days.
+    let month_ends = parse_ok("2026-{02,04}-{30,31}T00:00:00");
+    assert_eq!(
+      month_ends.next_fire(values(2026, 1, 1, 0, 0, 0)),
+      Some(values(2026, 4, 30, 0, 0, 0))
+    );
+
+    // Year exhaustion bounds the search.
+    let last = parse_ok("2026-12-31T23:59:59");
+    assert_eq!(
+      last.next_fire(values(2026, 12, 31, 23, 59, 59)),
+      Some(values(2026, 12, 31, 23, 59, 59))
+    );
+    assert_eq!(
+      last.next_fire(values(2026, 12, 31, 23, 59, 58)),
+      Some(values(2026, 12, 31, 23, 59, 59))
+    );
+    assert_eq!(parse_ok("9999-12-31T00:00:00").next_fire(values(9999, 12, 31, 0, 0, 1)), None);
+  }
+
+  /// The offset accessor reports the declared frame, and Display renders
+  /// the offset spellings round-trip-stably.
+  #[test]
+  fn offset_frames() {
+    assert_eq!(parse_ok("2026-03-15T00:00:00").offset(), Offset::Local);
+    assert_eq!(parse_ok("2026-03-15T00:00:00Z").offset(), Offset::Utc);
+    assert_eq!(parse_ok("2026-03-15T00:00:00+00:00").offset(), Offset::Fixed(0));
+    assert_eq!(parse_ok("2026-03-15T00:00:00+05:45").offset(), Offset::Fixed(20_700));
+    assert_eq!(parse_ok("2026-03-15T00:00:00-08:30").offset(), Offset::Fixed(-30_600));
+    for (spelling, expected) in [("Z", "Z"), ("+00:00", "+00:00"), ("-08:30", "-08:30")] {
+      let text = format!("2026-03-15T00:00:00{spelling}");
+      assert_eq!(parse_ok(&text).offset().to_string(), expected);
+    }
+    assert_eq!(parse_ok("2026-03-15T00:00:00").offset().to_string(), "");
+  }
+
+  /// Randomly generated valid patterns round-trip through the canonical
+  /// form with identical semantics. Hand-rolled xorshift with a fixed seed:
+  /// no test dependencies.
+  #[test]
+  fn random_patterns_round_trip() {
+    let mut rng = Rng::new(0x5EED_2026_1114_0808);
+    for _ in 0..256 {
+      let text = random_pattern(&mut rng);
+      let first = parse_ok(&text);
+      let canonical = first.to_string();
+      let second = parse_ok(&canonical);
+      assert_eq!(second.to_string(), canonical, "fixed point of {text:?}");
+      assert_eq!(second.offset(), first.offset());
+      // Semantics agree on a few probe seconds.
+      for probe in [values(2026, 3, 15, 12, 0, 0), values(2024, 2, 29, 23, 59, 59)] {
+        assert_eq!(first.matches(probe), second.matches(probe), "{text:?} at {probe:?}");
+      }
+    }
+  }
+
+  /// A deterministic xorshift* generator (fixed seed, no dependencies).
+  struct Rng(u64);
+
+  impl Rng {
+    fn new(seed: u64) -> Self {
+      Self(seed)
+    }
+
+    fn next(&mut self) -> u64 {
+      let mut x = self.0;
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      self.0 = x;
+      x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+      self.next() % bound
+    }
+  }
+
+  /// Builds one random valid field: a bare literal or a small braced set of
+  /// disjoint literals and ranges (cut from the domain), zero-padded to the
+  /// field width.
+  fn random_field(rng: &mut Rng, min: u16, max: u16, digits: usize) -> String {
+    let render = |value: u16| format!("{value:0digits$}");
+    let span = u64::from(max - min + 1);
+    if rng.below(4) == 0 {
+      return render(min + rng.below(span) as u16);
+    }
+    let count = (1 + rng.below(3)) as usize;
+    let mut cuts: Vec<u64> = Vec::new();
+    while cuts.len() < count * 2 {
+      let cut = rng.below(span);
+      if !cuts.contains(&cut) {
+        cuts.push(cut);
+      }
+    }
+    cuts.sort_unstable();
+    let elements: Vec<String> = cuts
+      .chunks(2)
+      .map(|pair| {
+        let low = min + pair[0] as u16;
+        let high = min + pair[1] as u16;
+        if pair[0] == pair[1] {
+          render(low)
+        } else {
+          format!("{}-{}", render(low), render(high))
+        }
+      })
+      .collect();
+    format!("{{{}}}", elements.join(","))
+  }
+
+  /// Builds one random valid pattern string.
+  fn random_pattern(rng: &mut Rng) -> String {
+    let year = random_field(rng, 0, 9999, 4);
+    let month = random_field(rng, 1, 12, 2);
+    let day = random_field(rng, 1, 31, 2);
+    let hour = random_field(rng, 0, 23, 2);
+    let minute = random_field(rng, 0, 59, 2);
+    let second = random_field(rng, 0, 59, 2);
+    let offset = ["", "Z", "+09:00"][rng.below(3) as usize];
+    format!("{year}-{month}-{day}T{hour}:{minute}:{second}{offset}")
+  }
+
+  /// An independent brute-force oracle: inclusive ranges per field with
+  /// linear scans and its own civil-calendar stepping. Deliberately shares
+  /// no code with the production parser, masks, or search.
+  struct Oracle {
+    year: Vec<(u16, u16)>,
+    month: Vec<(u16, u16)>,
+    day: Vec<(u16, u16)>,
+    hour: Vec<(u16, u16)>,
+    minute: Vec<(u16, u16)>,
+    second: Vec<(u16, u16)>,
+  }
+
+  impl Oracle {
+    /// Parses a pattern with plain string splitting and `u16::from_str`.
+    /// The oracle ignores the offset: frames do not affect matching.
+    fn parse(text: &str) -> Oracle {
+      let (date, rest) = text.split_once('T').expect("oracle: T separator");
+      let time_end = rest.find(['+', '-']).unwrap_or(rest.len());
+      let time = rest[..time_end].trim_end_matches('Z');
+      // Range hyphens live inside braces, so split on '-' but re-merge
+      // brace groups across the splits.
+      let date = date.split('-').fold(Vec::new(), |mut fields: Vec<String>, part| {
+        match fields.last_mut() {
+          Some(last) if last.starts_with('{') && !last.ends_with('}') => {
+            last.push('-');
+            last.push_str(part);
+          }
+          _ => fields.push(part.to_string()),
+        }
+        fields
+      });
+      let mut date_fields = date.iter();
+      let mut time_fields = time.split(':');
+      Oracle {
+        year: Self::field(date_fields.next().expect("year"), 0, 9999),
+        month: Self::field(date_fields.next().expect("month"), 1, 12),
+        day: Self::field(date_fields.next().expect("day"), 1, 31),
+        hour: Self::field(time_fields.next().expect("hour"), 0, 23),
+        minute: Self::field(time_fields.next().expect("minute"), 0, 59),
+        second: Self::field(time_fields.next().expect("second"), 0, 59),
+      }
+    }
+
+    fn field(text: &str, min: u16, max: u16) -> Vec<(u16, u16)> {
+      let inner = text
+        .strip_prefix('{')
+        .map(|rest| rest.strip_suffix('}').expect("oracle: closed set"))
+        .unwrap_or(text);
+      inner
+        .split(',')
+        .map(|element| {
+          if element == "*" {
+            (min, max)
+          } else if let Some((low, high)) = element.split_once('-') {
+            (Self::num(low), Self::num(high))
+          } else {
+            let value = Self::num(element);
+            (value, value)
+          }
+        })
+        .collect()
+    }
+
+    fn num(text: &str) -> u16 {
+      text.parse().expect("oracle: numeric element")
+    }
+
+    fn covered(ranges: &[(u16, u16)], value: u16) -> bool {
+      ranges.iter().any(|&(low, high)| value >= low && value <= high)
+    }
+
+    fn matches(&self, values: FieldValues) -> bool {
+      Self::covered(&self.year, values.year)
+        && Self::covered(&self.month, u16::from(values.month))
+        && Self::covered(&self.day, u16::from(values.day))
+        && Self::covered(&self.hour, u16::from(values.hour))
+        && Self::covered(&self.minute, u16::from(values.minute))
+        && Self::covered(&self.second, u16::from(values.second))
+    }
+  }
+
+  /// Independent civil-calendar day lengths for the stepping oracle.
+  fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+      1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+      4 | 6 | 9 | 11 => 30,
+      2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+      2 => 28,
+      _ => 0,
+    }
+  }
+
+  /// Advances one second with civil-calendar carries; `None` past
+  /// 9999-12-31T23:59:59.
+  fn step(values: FieldValues) -> Option<FieldValues> {
+    let mut next = values;
+    next.second += 1;
+    if next.second == 60 {
+      next.second = 0;
+      next.minute += 1;
+    }
+    if next.minute == 60 {
+      next.minute = 0;
+      next.hour += 1;
+    }
+    if next.hour == 24 {
+      next.hour = 0;
+      next.day += 1;
+    }
+    if next.day > days_in_month(next.year, next.month) {
+      next.day = 1;
+      next.month += 1;
+    }
+    if next.month == 13 {
+      next.month = 1;
+      next.year += 1;
+    }
+    if next.year > 9999 {
+      return None;
+    }
+    Some(next)
+  }
+
+  /// Exhaustive second-stepping next-fire oracle, bounded by `limit` steps.
+  fn oracle_next_fire(oracle: &Oracle, start: FieldValues, limit: u64) -> Option<FieldValues> {
+    let mut cursor = start;
+    for _ in 0..=limit {
+      if oracle.matches(cursor) {
+        return Some(cursor);
+      }
+      cursor = step(cursor)?;
+    }
+    None
+  }
+}
