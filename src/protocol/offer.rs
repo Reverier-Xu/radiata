@@ -158,7 +158,7 @@ impl FeatureOffer {
       |entry| entry.label.as_str(),
       "feature offer supported ordering",
       |entry| {
-        let digest = crate::error::fixed_bytes(entry.digest.as_slice(), "feature offer digest")?;
+        let digest = crate::hex::fixed_bytes(entry.digest.as_slice(), "feature offer digest")?;
         Ok((FeatureTag::parse(&entry.label)?, Digest::from_bytes(digest)))
       },
     )?;

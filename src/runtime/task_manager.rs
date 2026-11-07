@@ -260,7 +260,7 @@ impl EffectOutcome {
 /// from the second attempt on, the previous attempt's typed terminal
 /// error (the custom-kind reconcilers read it through
 /// [`crate::ReconcileContext`]).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AttemptContext {
   pub(crate) attempt: u32,
   pub(crate) last_error: Option<TaskError>,
@@ -1264,6 +1264,7 @@ impl Attempt {
     // nested submission reads it and the admission can refuse a
     // same-class recursive wait (the nested-submit refusal).
     let class = self.policy.slot_class;
+    let attempt = self.attempt.attempt;
     let outcome = RUNNING_EFFECT_CLASS
       .scope(
         class,
@@ -1283,9 +1284,9 @@ impl Attempt {
         // error's kind is not classified here — the decision itself is
         // the re-arm request.
         let policy = retry_policy(&self.kind);
-        if self.attempt.attempt < policy.max_attempts {
+        if attempt < policy.max_attempts {
           AttemptOutcome::Retry {
-            delay: policy.backoff(self.attempt.attempt),
+            delay: policy.backoff(attempt),
             last_error: Some(TaskError::from_error(error)),
           }
         } else {
@@ -1298,9 +1299,9 @@ impl Attempt {
         // classifies it retryable (the network dials' convergence
         // transients); the extension kinds never retry an `Err`.
         let policy = retry_policy(&self.kind);
-        if self.attempt.attempt < policy.max_attempts && policy.class.retryable(error.kind()) {
+        if attempt < policy.max_attempts && policy.class.retryable(error.kind()) {
           AttemptOutcome::Retry {
-            delay: policy.backoff(self.attempt.attempt),
+            delay: policy.backoff(attempt),
             last_error: Some(TaskError::from_error(error)),
           }
         } else {

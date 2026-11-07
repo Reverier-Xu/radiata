@@ -819,7 +819,7 @@ pub(crate) fn clock_seconds(clock: &dyn crate::time::WallClock) -> u64 {
 pub(crate) fn retire_session(table: &SessionTable, peer: &NodeId) -> Result<()> {
   let entry = table
     .lock()
-    .map_err(crate::Error::session_table)?
+    .map_err(|_| crate::Error::poisoned("session table"))?
     .remove(peer);
   if let Some(entry) = entry {
     retire(&entry);
@@ -834,7 +834,9 @@ pub(crate) fn retire_session(table: &SessionTable, peer: &NodeId) -> Result<()> 
 /// connection — a peer observes the teardown either way.
 pub(crate) fn retire_all_sessions(table: &SessionTable) -> Result<()> {
   let entries: Vec<SessionEntry> = {
-    let mut guard = table.lock().map_err(crate::Error::session_table)?;
+    let mut guard = table
+      .lock()
+      .map_err(|_| crate::Error::poisoned("session table"))?;
     std::mem::take(&mut *guard).into_values().collect()
   };
   for entry in &entries {

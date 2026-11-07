@@ -36,7 +36,16 @@ pub(crate) fn decode_array<const LENGTH: usize>(
   value: &str, context: &'static str,
 ) -> Result<[u8; LENGTH]> {
   let bytes = decode(value, context)?;
-  crate::error::fixed_bytes(bytes.as_slice(), context)
+  fixed_bytes(bytes.as_slice(), context)
+}
+
+/// The shared fixed-width byte-slice conversion: every wire decoder that
+/// pulls an exact-length id/key/digest field converts through this one
+/// helper so the length-mismatch error path cannot drift between sites.
+pub(crate) fn fixed_bytes<const LENGTH: usize>(
+  bytes: &[u8], context: &'static str,
+) -> Result<[u8; LENGTH]> {
+  <[u8; LENGTH]>::try_from(bytes).map_err(|_| Error::invalid_input(context))
 }
 
 fn is_hex_digit(byte: u8) -> bool {

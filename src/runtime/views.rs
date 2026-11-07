@@ -30,7 +30,7 @@ fn connected_peers(
   Ok(
     sessions
       .lock()
-      .map_err(Error::session_table)?
+      .map_err(|_| Error::poisoned("session table"))?
       .iter()
       .filter(|(_, entry)| entry.alive())
       .map(|(peer, _)| peer.clone())
@@ -164,7 +164,7 @@ impl Supervisor {
       .dependencies
       .listeners
       .lock()
-      .map_err(Error::listener_registry)?
+      .map_err(|_| Error::poisoned("listener registry"))?
       .iter()
       .map(|(id, (endpoint, ..))| {
         (
@@ -193,7 +193,7 @@ impl Supervisor {
         .dependencies
         .sessions
         .lock()
-        .map_err(Error::session_table)?;
+        .map_err(|_| Error::poisoned("session table"))?;
       sessions
         .iter()
         .filter(|(peer, _)| connected.contains(*peer))
@@ -248,7 +248,7 @@ impl Supervisor {
         .dependencies
         .sessions
         .lock()
-        .map_err(Error::session_table)?;
+        .map_err(|_| Error::poisoned("session table"))?;
       let messages = table.values().map(|entry| entry.queued_messages()).sum();
       let bytes = table.values().map(|entry| entry.queued_bytes()).sum();
       let audit: usize = table.values().map(|entry| entry.queue_audit_delta()).sum();
@@ -259,14 +259,14 @@ impl Supervisor {
         .dependencies
         .routes
         .lock()
-        .map_err(Error::route_records)?;
+        .map_err(|_| Error::poisoned("route records"))?;
       routes.len()
     };
     let connection_tasks = self
       .dependencies
       .connection_tasks
       .lock()
-      .map_err(Error::connection_tasks)?
+      .map_err(|_| Error::poisoned("connection tasks"))?
       .len();
     let background_tasks = tasks.len() + connection_tasks + usize::from(self.sync_driver.is_some());
     let trace_records = self
@@ -318,7 +318,7 @@ impl Supervisor {
         .dependencies
         .sessions
         .lock()
-        .map_err(Error::session_table)?
+        .map_err(|_| Error::poisoned("session table"))?
         .iter()
         .map(|(peer, entry)| {
           (

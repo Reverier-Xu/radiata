@@ -714,7 +714,7 @@ async fn require_members_connected(planes: &EffectPlanes) -> Result<()> {
   let live: std::collections::BTreeSet<NodeId> = planes
     .sessions
     .lock()
-    .map_err(Error::session_table)?
+    .map_err(|_| Error::poisoned("session table"))?
     .iter()
     .filter(|(_, entry)| entry.alive())
     .map(|(peer, _)| peer.clone())
@@ -1622,7 +1622,7 @@ async fn reconcile_listen(
   planes
     .listeners
     .lock()
-    .map_err(Error::listener_registry)?
+    .map_err(|_| Error::poisoned("listener registry"))?
     .insert(id.clone(), (published.clone(), insert_listener, abort));
   // Publish the advertised endpoint so the next anti-entropy tick pages
   // it in the local descriptor (recovery dials peers through published
@@ -1674,7 +1674,7 @@ async fn reconcile_credential(deps: Arc<OperationDeps>, rotate: bool) -> Result<
     .driver
     .issuer()
     .lock()
-    .map_err(Error::join_credential_issuer)?;
+    .map_err(|_| Error::poisoned("join credential issuer"))?;
   let issued = if rotate {
     issuer.rotate(planes.entropy.as_ref(), crate::time::now())?
   } else {
@@ -1692,7 +1692,10 @@ async fn reconcile_credential(deps: Arc<OperationDeps>, rotate: bool) -> Result<
 /// observation moved — the moved supervisor body.
 async fn reconcile_start_recovery(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
   let planes = deps.planes()?;
-  let mut controller = planes.recovery.lock().map_err(Error::recovery_controller)?;
+  let mut controller = planes
+    .recovery
+    .lock()
+    .map_err(|_| Error::poisoned("recovery controller"))?;
   let before = super::recovery::recovery_view(&controller);
   controller.immediate(crate::time::now_seconds());
   let after = super::recovery::recovery_view(&controller);
@@ -1807,7 +1810,7 @@ async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
     let listener_ids: Vec<crate::identity::ListenerId> = planes
       .listeners
       .lock()
-      .map_err(Error::listener_registry)?
+      .map_err(|_| Error::poisoned("listener registry"))?
       .keys()
       .cloned()
       .collect();
@@ -1817,7 +1820,7 @@ async fn reconcile_leave(deps: Arc<OperationDeps>) -> Result<EffectOutcome> {
     let peers: Vec<NodeId> = planes
       .sessions
       .lock()
-      .map_err(Error::session_table)?
+      .map_err(|_| Error::poisoned("session table"))?
       .keys()
       .cloned()
       .collect();

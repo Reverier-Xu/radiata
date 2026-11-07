@@ -96,26 +96,39 @@ impl ListenerView {
   }
 }
 
-/// One bounded page of listener observations.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ListenerPage {
-  items: Vec<ListenerView>,
-  next: Option<crate::PageCursor>,
+/// Generates one bounded page type over its item view: the same
+/// nominal public type, docs, and accessor shape for every paged
+/// surface (items slice, continuation cursor, constructor).
+macro_rules! page_view {
+  ($(#[$doc:meta])* $name:ident, $item:ty) => {
+    $(#[$doc])*
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct $name {
+      items: Vec<$item>,
+      next: Option<crate::PageCursor>,
+    }
+
+    impl $name {
+      pub fn items(&self) -> &[$item] {
+        &self.items
+      }
+
+      pub fn next(&self) -> Option<&crate::PageCursor> {
+        self.next.as_ref()
+      }
+
+      pub(crate) fn new(items: Vec<$item>, next: Option<crate::PageCursor>) -> Self {
+        Self { items, next }
+      }
+    }
+  };
 }
 
-impl ListenerPage {
-  pub fn items(&self) -> &[ListenerView] {
-    &self.items
-  }
-
-  pub fn next(&self) -> Option<&crate::PageCursor> {
-    self.next.as_ref()
-  }
-
-  pub(crate) fn new(items: Vec<ListenerView>, next: Option<crate::PageCursor>) -> Self {
-    Self { items, next }
-  }
-}
+page_view!(
+  /// One bounded page of listener observations.
+  ListenerPage,
+  ListenerView
+);
 
 /// One session-scoped selected feature: the negotiated tag and its exact
 /// definition digest from the authenticated intersection.
@@ -193,26 +206,11 @@ impl SessionView {
   }
 }
 
-/// One bounded page of session observations.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionPage {
-  items: Vec<SessionView>,
-  next: Option<crate::PageCursor>,
-}
-
-impl SessionPage {
-  pub fn items(&self) -> &[SessionView] {
-    &self.items
-  }
-
-  pub fn next(&self) -> Option<&crate::PageCursor> {
-    self.next.as_ref()
-  }
-
-  pub(crate) fn new(items: Vec<SessionView>, next: Option<crate::PageCursor>) -> Self {
-    Self { items, next }
-  }
-}
+page_view!(
+  /// One bounded page of session observations.
+  SessionPage,
+  SessionView
+);
 
 /// The runtime-collected inputs of one observability snapshot: one named
 /// field per well-known counter tag.
@@ -542,26 +540,11 @@ impl NodeMetadataPatch {
   }
 }
 
-/// One bounded page of member observations.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemberPage {
-  items: Vec<MemberView>,
-  next: Option<crate::PageCursor>,
-}
-
-impl MemberPage {
-  pub fn items(&self) -> &[MemberView] {
-    &self.items
-  }
-
-  pub fn next(&self) -> Option<&crate::PageCursor> {
-    self.next.as_ref()
-  }
-
-  pub(crate) fn new(items: Vec<MemberView>, next: Option<crate::PageCursor>) -> Self {
-    Self { items, next }
-  }
-}
+page_view!(
+  /// One bounded page of member observations.
+  MemberPage,
+  MemberView
+);
 
 /// One public resource observation: the winning record's stable name,
 /// its reserved-plus-custom labels, and its exact tuple version.
@@ -599,26 +582,11 @@ impl ResourceView {
   }
 }
 
-/// One bounded page of resource observations.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResourcePage {
-  items: Vec<ResourceView>,
-  next: Option<crate::PageCursor>,
-}
-
-impl ResourcePage {
-  pub fn items(&self) -> &[ResourceView] {
-    &self.items
-  }
-
-  pub fn next(&self) -> Option<&crate::PageCursor> {
-    self.next.as_ref()
-  }
-
-  pub(crate) fn new(items: Vec<ResourceView>, next: Option<crate::PageCursor>) -> Self {
-    Self { items, next }
-  }
-}
+page_view!(
+  /// One bounded page of resource observations.
+  ResourcePage,
+  ResourceView
+);
 
 /// The outcome of one local resource mutation: the accepted
 /// signed candidate plus whether that candidate is the register's current
@@ -786,26 +754,11 @@ impl TopologyEdgeView {
   }
 }
 
-/// One bounded page of topology edges.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TopologyPage {
-  items: Vec<TopologyEdgeView>,
-  next: Option<crate::PageCursor>,
-}
-
-impl TopologyPage {
-  pub fn items(&self) -> &[TopologyEdgeView] {
-    &self.items
-  }
-
-  pub fn next(&self) -> Option<&crate::PageCursor> {
-    self.next.as_ref()
-  }
-
-  pub(crate) fn new(items: Vec<TopologyEdgeView>, next: Option<crate::PageCursor>) -> Self {
-    Self { items, next }
-  }
-}
+page_view!(
+  /// One bounded page of topology edges.
+  TopologyPage,
+  TopologyEdgeView
+);
 
 /// One paged query spec: a bounded first page or a continuation after a
 /// cursor.
@@ -886,26 +839,11 @@ impl TrustedIdentityView {
   }
 }
 
-/// One bounded page of trust observations.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TrustPage {
-  items: Vec<TrustedIdentityView>,
-  next: Option<crate::PageCursor>,
-}
-
-impl TrustPage {
-  pub fn items(&self) -> &[TrustedIdentityView] {
-    &self.items
-  }
-
-  pub fn next(&self) -> Option<&crate::PageCursor> {
-    self.next.as_ref()
-  }
-
-  pub(crate) fn new(items: Vec<TrustedIdentityView>, next: Option<crate::PageCursor>) -> Self {
-    Self { items, next }
-  }
-}
+page_view!(
+  /// One bounded page of trust observations.
+  TrustPage,
+  TrustedIdentityView
+);
 
 /// One admitted operation's observation: the task's identity, kind tag,
 /// and phase, its attempt count, and its terminal error and payload.
@@ -973,8 +911,8 @@ impl TaskView {
   }
 
   /// The typed terminal failure, when the task failed.
-  pub const fn error(&self) -> Option<crate::TaskError> {
-    self.error
+  pub fn error(&self) -> Option<crate::TaskError> {
+    self.error.clone()
   }
 
   /// The succeeded task's output: the payload bytes. For the credential
@@ -999,33 +937,18 @@ impl TaskView {
       created: record.created,
       started: record.started,
       finished: record.finished,
-      error: record.error,
+      error: record.error.clone(),
       output,
     }
   }
 }
 
-/// One bounded page of task observations, in canonical id order
-/// (= admission order, newest last).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskPage {
-  items: Vec<TaskView>,
-  next: Option<crate::PageCursor>,
-}
-
-impl TaskPage {
-  pub fn items(&self) -> &[TaskView] {
-    &self.items
-  }
-
-  pub fn next(&self) -> Option<&crate::PageCursor> {
-    self.next.as_ref()
-  }
-
-  pub(crate) fn new(items: Vec<TaskView>, next: Option<crate::PageCursor>) -> Self {
-    Self { items, next }
-  }
-}
+page_view!(
+  /// One bounded page of task observations, in canonical id order
+  /// (= admission order, newest last).
+  TaskPage,
+  TaskView
+);
 
 /// The connection-degree maintenance state: whether the node's live
 /// authenticated session count has reached its target peer degree.

@@ -771,6 +771,8 @@ async fn resource_labels_never_enable_protocols() {
     )
     .unwrap_err();
   assert_eq!(error.kind(), ErrorKind::Unsupported);
+  // The context names the offending protocol tag (full-detail stance).
+  assert_eq!(error.context(), format!("packet protocol {ECHO_PROTOCOL}"));
 
   for node in [issuer, member] {
     node.handle.shutdown().await.unwrap();

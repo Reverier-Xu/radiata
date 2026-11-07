@@ -27,7 +27,9 @@ pub(crate) type RouteTable = Arc<Mutex<BTreeMap<TraceId, RouteRecord>>>;
 pub(crate) fn insert_route(
   routes: &RouteTable, capacity: usize, record: RouteRecord,
 ) -> Result<()> {
-  let mut table = routes.lock().map_err(Error::route_records)?;
+  let mut table = routes
+    .lock()
+    .map_err(|_| Error::poisoned("route records"))?;
   insert_locked(&mut table, capacity, record)
 }
 

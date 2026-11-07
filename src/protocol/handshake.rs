@@ -815,7 +815,7 @@ where
 fn fixed_bytes<const LENGTH: usize>(
   bytes: &ByteVec, context: &'static str,
 ) -> Result<[u8; LENGTH], HandshakeError> {
-  crate::error::fixed_bytes(bytes.as_slice(), context)
+  crate::hex::fixed_bytes(bytes.as_slice(), context)
     .map_err(|_| HandshakeError::Malformed { context })
 }
 

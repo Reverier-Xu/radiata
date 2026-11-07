@@ -281,8 +281,8 @@ pub type radiata::Endpoint::Err = radiata::Error
 pub fn radiata::Endpoint::from_str(&str) -> radiata::Result<Self>
 pub struct radiata::Error
 impl radiata::Error
-pub fn radiata::Error::caller(&'static str) -> Self
-pub fn radiata::Error::context(&self) -> &'static str
+pub fn radiata::Error::caller(impl core::convert::Into<alloc::borrow::Cow<'static, str>>) -> Self
+pub fn radiata::Error::context(&self) -> &str
 pub fn radiata::Error::kind(&self) -> radiata::ErrorKind
 pub fn radiata::Error::provider(radiata::ProviderErrorKind, radiata::ProviderErrorContext) -> Self
 pub struct radiata::EventOptions
@@ -677,7 +677,7 @@ pub struct radiata::ReconcileContext
 impl radiata::ReconcileContext
 pub const fn radiata::ReconcileContext::attempt(&self) -> u32
 pub const fn radiata::ReconcileContext::handle(&self) -> &radiata::NodeHandle
-pub const fn radiata::ReconcileContext::last_error(&self) -> core::option::Option<radiata::TaskError>
+pub fn radiata::ReconcileContext::last_error(&self) -> core::option::Option<radiata::TaskError>
 pub const fn radiata::ReconcileContext::spec(&self) -> &radiata::CustomTaskSpec
 impl core::fmt::Debug for radiata::ReconcileContext
 pub fn radiata::ReconcileContext::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -951,7 +951,7 @@ pub const fn radiata::TaskChanged::task(&self) -> &radiata::TaskId
 impl radiata::Event for radiata::TaskChanged
 pub struct radiata::TaskError
 impl radiata::TaskError
-pub fn radiata::TaskError::as_str(&self) -> &'static str
+pub fn radiata::TaskError::as_str(&self) -> &str
 pub fn radiata::TaskError::from_error(radiata::Error) -> Self
 pub const fn radiata::TaskError::kind(&self) -> radiata::ErrorKind
 pub struct radiata::TaskId(_)
@@ -1005,7 +1005,7 @@ pub fn radiata::TaskPage::next(&self) -> core::option::Option<&radiata::PageCurs
 pub struct radiata::TaskStatus
 impl radiata::TaskStatus
 pub const fn radiata::TaskStatus::attempts(&self) -> u32
-pub const fn radiata::TaskStatus::error(&self) -> core::option::Option<radiata::TaskError>
+pub fn radiata::TaskStatus::error(&self) -> core::option::Option<radiata::TaskError>
 pub const fn radiata::TaskStatus::phase(&self) -> radiata::TaskPhase
 pub struct radiata::TaskTransition
 impl radiata::TaskTransition
@@ -1019,7 +1019,7 @@ pub struct radiata::TaskView
 impl radiata::TaskView
 pub const fn radiata::TaskView::attempts(&self) -> u32
 pub const fn radiata::TaskView::created(&self) -> std::time::SystemTime
-pub const fn radiata::TaskView::error(&self) -> core::option::Option<radiata::TaskError>
+pub fn radiata::TaskView::error(&self) -> core::option::Option<radiata::TaskError>
 pub const fn radiata::TaskView::finished(&self) -> core::option::Option<std::time::SystemTime>
 pub const fn radiata::TaskView::id(&self) -> &radiata::TaskId
 pub const fn radiata::TaskView::kind(&self) -> &radiata::TaskKind

@@ -133,7 +133,6 @@ pub fn selector_parse(input: &[u8]) -> Option<String> {
     canonical.len() <= crate::routing::SELECTOR_INPUT_MAX_BYTES,
     "selector canonical form exceeded the frozen limit"
   );
-  let _ = FeatureTag::parse("radiata.woooo.tech/features/session-core").ok();
   Some(canonical)
 }
 
