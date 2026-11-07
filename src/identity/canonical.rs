@@ -134,7 +134,7 @@ macro_rules! canonical_record {
         $w.$f
     };
     (@dec key32 ($ctx:expr) $w:ident . $f:ident) => {
-        crate::PublicKey::from_bytes(crate::error::fixed_bytes($w.$f.as_slice(), $ctx)?)
+        crate::PublicKey::from_bytes(crate::hex::fixed_bytes($w.$f.as_slice(), $ctx)?)
     };
     (@dec handle ($($args:tt)*) $w:ident . $f:ident) => {
         crate::KeyHandle::from_provider_bytes(std::sync::Arc::from($w.$f.to_vec()))?
@@ -144,14 +144,14 @@ macro_rules! canonical_record {
     };
     (@dec oid16 ($wrap:ty, $ctx:expr) $w:ident . $f:ident) => {
         <$wrap>::from_operation(crate::OperationId::from_bytes(
-            crate::error::fixed_bytes($w.$f.as_slice(), $ctx)?,
+            crate::hex::fixed_bytes($w.$f.as_slice(), $ctx)?,
         ))
     };
     (@dec stamp ($($args:tt)*) $w:ident . $f:ident) => {
         $w.$f
     };
     (@dec sig ($ctx:expr) $w:ident . $f:ident) => {
-        crate::Signature::from_bytes(crate::error::fixed_bytes($w.$f.as_slice(), $ctx)?)
+        crate::Signature::from_bytes(crate::hex::fixed_bytes($w.$f.as_slice(), $ctx)?)
     };
 
     // ---- decode tail: struct literal, or the validating constructor ----

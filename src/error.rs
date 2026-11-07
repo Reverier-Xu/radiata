@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 /// A stable, secret-safe error category.
 ///
 /// Adding a category only touches this enum and its constructors; the
@@ -101,18 +103,28 @@ pub enum ProviderErrorContext {
   RoutingPolicy,
 }
 
+/// The crate's typed error: a stable [`ErrorKind`] category plus a
+/// human-readable context string.
+///
+/// The context carries full dynamic detail — owned text that may name
+/// the offending value (an unregistered scheme, tag, or kind) — because
+/// radiata is a bottom-layer component and must report what happened:
+/// redaction is an upper layer's policy, and log delivery is
+/// `tracing`'s job. This is not secret hygiene: cryptographic key and
+/// seed material never enters an error context at all (zeroize and
+/// `Debug` masking stay exactly as they are).
 #[derive(Debug, thiserror::Error)]
 #[error("{context}: {kind:?}")]
 pub struct Error {
   kind: ErrorKind,
-  context: &'static str,
+  context: Cow<'static, str>,
 }
 
 impl Error {
   pub fn provider(kind: ProviderErrorKind, context: ProviderErrorContext) -> Self {
     Self {
       kind: kind.into_error_kind(),
-      context: provider_error_context(context),
+      context: Cow::Borrowed(provider_error_context(context)),
     }
   }
 
@@ -123,10 +135,10 @@ impl Error {
   /// (reserved for provider implementations). Consumer code integrating
   /// the crate's errors declares its own business error type and folds
   /// this type in via `#[from]` (thiserror on the consumer side).
-  pub fn caller(context: &'static str) -> Self {
+  pub fn caller(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::CallerError,
-      context,
+      context: context.into(),
     }
   }
 
@@ -134,163 +146,141 @@ impl Error {
     self.kind
   }
 
-  pub fn context(&self) -> &'static str {
-    self.context
+  /// The context text: static phrasing for the fixed seams, dynamic
+  /// text naming the offending value where the failure has one (see
+  /// the type-level stance on full detail).
+  pub fn context(&self) -> &str {
+    &self.context
   }
 
-  pub(crate) const fn invalid_input(context: &'static str) -> Self {
+  pub(crate) fn invalid_input(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::InvalidInput,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn conflict(context: &'static str) -> Self {
+  pub(crate) fn conflict(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::Conflict,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn not_found(context: &'static str) -> Self {
+  pub(crate) fn not_found(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::NotFound,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn not_trusted(context: &'static str) -> Self {
+  pub(crate) fn not_trusted(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::NotTrusted,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn revoked(context: &'static str) -> Self {
+  pub(crate) fn revoked(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::Revoked,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn authentication_failed(context: &'static str) -> Self {
+  pub(crate) fn authentication_failed(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::AuthenticationFailed,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn unsupported(context: &'static str) -> Self {
+  pub(crate) fn unsupported(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::Unsupported,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn unsupported_schema(context: &'static str) -> Self {
+  pub(crate) fn unsupported_schema(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::UnsupportedSchema,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn internal(context: &'static str) -> Self {
+  pub(crate) fn internal(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::Internal,
-      context,
+      context: context.into(),
     }
   }
 
-  /// The poisoned-lock mapper for the shared session table (one named
-  /// construction site per shared table, so lock-poison diagnostics stay
-  /// uniform and never panic).
-  pub(crate) fn session_table<T>(_: T) -> Self {
-    Self::internal("session table")
-  }
-
-  /// The poisoned-lock mapper for the shared task table (the same
-  /// one-named-site-per-table rule as [`Error::session_table`]).
-  pub(crate) fn task_table<T>(_: T) -> Self {
-    Self::internal("task table")
+  /// The poisoned-lock mapper for every shared core table (the session
+  /// and task tables, the extension and listener registries, the route
+  /// records, the recovery controller, the join-credential issuer, and
+  /// the connection-task list): each shared table names its own context
+  /// at exactly one lock-mapping call site, so lock-poison diagnostics
+  /// stay uniform and never panic.
+  pub(crate) fn poisoned(context: &'static str) -> Self {
+    Self::internal(context)
   }
 
   /// Rebuilds an error from its stable parts. The task table stores the
   /// terminal error as its kind-and-context projection; the typed wait
   /// path reconstructs the caller-facing error through this one site.
-  pub(crate) const fn from_parts(kind: ErrorKind, context: &'static str) -> Self {
-    Self { kind, context }
+  pub(crate) fn from_parts(kind: ErrorKind, context: impl Into<Cow<'static, str>>) -> Self {
+    Self {
+      kind,
+      context: context.into(),
+    }
   }
 
-  /// The poisoned-lock mapper for the shared extension registry.
-  pub(crate) fn extension_registry<T>(_: T) -> Self {
-    Self::internal("extension registry")
+  /// The owning counterpart of [`Error::from_parts`]: the task table's
+  /// terminal-error projection consumes an error into its stable parts.
+  pub(crate) fn into_parts(self) -> (ErrorKind, Cow<'static, str>) {
+    (self.kind, self.context)
   }
 
-  /// The poisoned-lock mapper for the shared listener registry (the same
-  /// one-named-site-per-table rule as [`Error::session_table`]).
-  pub(crate) fn listener_registry<T>(_: T) -> Self {
-    Self::internal("listener registry")
-  }
-
-  /// The poisoned-lock mapper for the shared route-record table.
-  pub(crate) fn route_records<T>(_: T) -> Self {
-    Self::internal("route records")
-  }
-
-  /// The poisoned-lock mapper for the shared recovery controller.
-  pub(crate) fn recovery_controller<T>(_: T) -> Self {
-    Self::internal("recovery controller")
-  }
-
-  /// The poisoned-lock mapper for the shared join credential issuer.
-  pub(crate) fn join_credential_issuer<T>(_: T) -> Self {
-    Self::internal("join credential issuer")
-  }
-
-  /// The poisoned-lock mapper for the shared connection-task list.
-  pub(crate) fn connection_tasks<T>(_: T) -> Self {
-    Self::internal("connection tasks")
-  }
-
-  pub(crate) const fn resource_exhausted(context: &'static str) -> Self {
+  pub(crate) fn resource_exhausted(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::ResourceExhausted,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn shutting_down(context: &'static str) -> Self {
+  pub(crate) fn shutting_down(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::ShuttingDown,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn not_ready(context: &'static str) -> Self {
+  pub(crate) fn not_ready(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::NotReady,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn route_unavailable(context: &'static str) -> Self {
+  pub(crate) fn route_unavailable(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::RouteUnavailable,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn stream_interrupted(context: &'static str) -> Self {
+  pub(crate) fn stream_interrupted(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::StreamInterrupted,
-      context,
+      context: context.into(),
     }
   }
 
-  pub(crate) const fn overloaded(context: &'static str) -> Self {
+  pub(crate) fn overloaded(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::Overloaded,
-      context,
+      context: context.into(),
     }
   }
 
@@ -298,16 +288,15 @@ impl Error {
   /// on the session queue: the frame's encoded size alone exceeds the
   /// byte bound, so the rejection is a permanent condition the caller
   /// must fix on its side, never backpressure to wait out.
-  pub(crate) const fn frame_too_large(context: &'static str) -> Self {
+  pub(crate) fn frame_too_large(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::FrameTooLarge,
-      context,
+      context: context.into(),
     }
   }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
 impl ProviderErrorKind {
   /// Projects this provider category onto the stable core category. The
   /// mapping is the single source of truth for the provider subset; keep it
@@ -354,13 +343,4 @@ const fn provider_error_context(context: ProviderErrorContext) -> &'static str {
     ProviderErrorContext::LoadBalancingPolicy => "load balancing policy",
     ProviderErrorContext::RoutingPolicy => "routing policy",
   }
-}
-
-/// The shared fixed-width byte-slice conversion: every wire decoder that
-/// pulls an exact-length id/key/digest field converts through this one
-/// helper so the length-mismatch error path cannot drift between sites.
-pub(crate) fn fixed_bytes<const LENGTH: usize>(
-  bytes: &[u8], context: &'static str,
-) -> Result<[u8; LENGTH]> {
-  <[u8; LENGTH]>::try_from(bytes).map_err(|_| Error::invalid_input(context))
 }

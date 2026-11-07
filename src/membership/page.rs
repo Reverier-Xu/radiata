@@ -216,7 +216,7 @@ fn decode_wire(
   }
   let node =
     NodeId::parse(fields.node).map_err(|_| Error::invalid_input("node descriptor node"))?;
-  let public_key = crate::PublicKey::from_bytes(crate::error::fixed_bytes(
+  let public_key = crate::PublicKey::from_bytes(crate::hex::fixed_bytes(
     fields.public_key.as_ref(),
     "node descriptor key",
   )?);

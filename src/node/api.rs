@@ -468,10 +468,18 @@ impl Tasks {
   pub async fn submit(&self, spec: crate::CustomTaskSpec) -> Result<Task<()>> {
     let client = self.client()?.clone();
     if spec.kind().domain() == crate::protocol::tag::BUILTIN_DOMAIN {
-      return Err(crate::Error::unsupported("task kind"));
+      // Both refusals name the offending kind: the error context
+      // carries the offending value (see `Error`'s full-detail stance).
+      return Err(crate::Error::unsupported(format!(
+        "task kind {}",
+        spec.kind()
+      )));
     }
     let Some(reconciler) = self.extensions.task_reconciler(spec.kind()) else {
-      return Err(crate::Error::unsupported("task kind"));
+      return Err(crate::Error::unsupported(format!(
+        "task kind {}",
+        spec.kind()
+      )));
     };
     self.require_running()?;
     let kind = TaskKind::from(spec.kind().clone());
@@ -499,7 +507,7 @@ impl Tasks {
           // The explicit terminal-failure decision and a returned error
           // both terminalize the task with their error; nothing retries
           // either.
-          Ok(crate::ReconcileDecision::Failed(error)) => Err(error.to_error()),
+          Ok(crate::ReconcileDecision::Failed(error)) => Err(error.into_error()),
           Err(error) => Err(error),
         }
       })

@@ -13,6 +13,7 @@
 //! verb would have lost.
 
 use std::{
+  borrow::Cow,
   collections::{BTreeMap, hash_map::DefaultHasher},
   hash::{Hash, Hasher},
   marker::PhantomData,
@@ -336,23 +337,21 @@ impl TaskPhase {
   }
 }
 
-/// One task's typed failure surface: the effect's terminal error as the
-/// stable kind plus its redacted context.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One task's typed failure surface: the effect's terminal error as
+/// the stable kind plus its full-detail context.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskError {
   kind: ErrorKind,
-  context: &'static str,
+  context: Cow<'static, str>,
 }
 
 impl TaskError {
   /// Projects one error onto the terminal-failure surface: the stable
-  /// kind plus its redacted context. Also the constructor for the
+  /// kind plus its full-detail context. Also the constructor for the
   /// explicit [`ReconcileDecision::Failed`] decision.
   pub fn from_error(error: Error) -> Self {
-    Self {
-      kind: error.kind(),
-      context: error.context(),
-    }
+    let (kind, context) = error.into_parts();
+    Self { kind, context }
   }
 
   /// The stable, secret-safe error category.
@@ -360,14 +359,15 @@ impl TaskError {
     self.kind
   }
 
-  /// The redacted error context (the same `&'static str` surface the
-  /// crate's [`Error`] carries; never a message with interpolated
-  /// caller data).
-  pub fn as_str(&self) -> &'static str {
-    self.context
+  /// The error context: the same dynamic surface the crate's [`Error`]
+  /// carries. It may name the offending value — the crate reports full
+  /// detail, and redaction is an upper layer's policy (cryptographic
+  /// secret hygiene is a separate, untouched rule).
+  pub fn as_str(&self) -> &str {
+    &self.context
   }
 
-  pub(crate) fn to_error(self) -> Error {
+  pub(crate) fn into_error(self) -> Error {
     Error::from_parts(self.kind, self.context)
   }
 }
@@ -450,8 +450,8 @@ impl TaskStatus {
   }
 
   /// The typed terminal error; `None` while non-terminal or succeeded.
-  pub const fn error(&self) -> Option<TaskError> {
-    self.error
+  pub fn error(&self) -> Option<TaskError> {
+    self.error.clone()
   }
 }
 
@@ -482,8 +482,8 @@ impl TaskStatusRecord {
     }
   }
 
-  pub(crate) const fn status(&self) -> TaskStatus {
-    TaskStatus::new(self.phase, self.attempts, self.error)
+  pub(crate) fn status(&self) -> TaskStatus {
+    TaskStatus::new(self.phase, self.attempts, self.error.clone())
   }
 }
 
@@ -527,7 +527,10 @@ impl TaskTable {
   fn lock(
     &self,
   ) -> std::result::Result<std::sync::MutexGuard<'_, BTreeMap<TaskId, TaskEntry>>, Error> {
-    self.entries.lock().map_err(Error::task_table)
+    self
+      .entries
+      .lock()
+      .map_err(|_| Error::poisoned("task table"))
   }
 
   /// Inserts one admitted task's `Pending` entry, carrying the
@@ -938,7 +941,7 @@ fn resolve_terminal<T: TaskResult>(
     TaskPhase::Failed => Err(
       record
         .error
-        .map_or_else(|| Error::internal("task failure"), TaskError::to_error),
+        .map_or_else(|| Error::internal("task failure"), TaskError::into_error),
     ),
     // The arbitration resolves only at a terminal phase, so a
     // non-terminal record here is an internal invariant violation.
@@ -1375,8 +1378,8 @@ impl ReconcileContext {
   }
 
   /// The typed error of the previous attempt, once one failed.
-  pub const fn last_error(&self) -> Option<TaskError> {
-    self.last_error
+  pub fn last_error(&self) -> Option<TaskError> {
+    self.last_error.clone()
   }
 
   pub(crate) const fn new(

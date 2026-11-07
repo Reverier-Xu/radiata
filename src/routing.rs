@@ -1105,7 +1105,7 @@ impl RoutingRegistry {
       let mut policies = self
         .routing_policies
         .write()
-        .map_err(Error::extension_registry)?;
+        .map_err(|_| Error::poisoned("extension registry"))?;
       crate::api::insert_once(
         &mut policies,
         crate::RoutingPolicy::DIRECT.tag().clone(),
@@ -1114,7 +1114,10 @@ impl RoutingRegistry {
       )?;
     }
     {
-      let mut next_hops = self.next_hops.write().map_err(Error::extension_registry)?;
+      let mut next_hops = self
+        .next_hops
+        .write()
+        .map_err(|_| Error::poisoned("extension registry"))?;
       crate::api::insert_once(
         &mut next_hops,
         next_hop_tag,
@@ -1136,7 +1139,10 @@ impl RoutingRegistry {
     &mut self, tag: QualifiedTag, value: Arc<dyn RouteNextHop>,
   ) -> Result<&mut Self> {
     {
-      let mut policies = self.next_hops.write().map_err(Error::extension_registry)?;
+      let mut policies = self
+        .next_hops
+        .write()
+        .map_err(|_| Error::poisoned("extension registry"))?;
       crate::api::insert_once(&mut policies, tag, value, "next-hop registration")?;
     }
     Ok(self)
@@ -1154,7 +1160,7 @@ impl RoutingRegistry {
       let mut policies = self
         .routing_policies
         .write()
-        .map_err(Error::extension_registry)?;
+        .map_err(|_| Error::poisoned("extension registry"))?;
       crate::api::insert_once(&mut policies, tag, value, "routing policy registration")?;
     }
     Ok(self)
@@ -1170,7 +1176,7 @@ impl RoutingRegistry {
       self
         .next_hops
         .read()
-        .map_err(Error::extension_registry)?
+        .map_err(|_| Error::poisoned("extension registry"))?
         .get(tag)
         .cloned(),
     )
@@ -1184,7 +1190,7 @@ impl RoutingRegistry {
       self
         .routing_policies
         .read()
-        .map_err(Error::extension_registry)?
+        .map_err(|_| Error::poisoned("extension registry"))?
         .get(tag)
         .cloned(),
     )

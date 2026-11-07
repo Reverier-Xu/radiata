@@ -75,7 +75,9 @@ impl NodeHandle {
       crate::packet::validate_caller_path(destination, path, policy.max_hops())?;
     }
     if !self.extensions.has_protocol(&protocol)? {
-      return Err(Error::unsupported("packet protocol"));
+      // The context names the offending tag: the error carries the
+      // offending value (see `Error`'s full-detail stance).
+      return Err(Error::unsupported(format!("packet protocol {protocol}")));
     }
     let trace_id = TraceId::generate(self.entropy.as_ref())?;
     Ok(OutboundStream::new(

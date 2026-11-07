@@ -34,7 +34,7 @@ pub(super) async fn stop_listener(
 ) -> Result<()> {
   let removed = listeners
     .lock()
-    .map_err(Error::listener_registry)?
+    .map_err(|_| Error::poisoned("listener registry"))?
     .remove(listener);
   let Some((endpoint, listener_handle, abort)) = removed else {
     return Err(Error::not_found("listener"));

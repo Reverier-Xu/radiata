@@ -282,7 +282,7 @@ pub(crate) async fn announce_leave(
   for peer in peers {
     let entry = sessions
       .lock()
-      .map_err(crate::Error::session_table)?
+      .map_err(|_| Error::poisoned("session table"))?
       .get(&peer)
       .cloned()
       .filter(|entry| entry.alive());

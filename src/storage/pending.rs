@@ -32,7 +32,7 @@ pub(crate) use crate::storage::families::PENDING_NAMESPACE;
 use crate::{
   CommitOutcome, CommitReceipt, Digest, Error, QualifiedTag, Result, StoreExpectation, StoreKey,
   StoreNamespace, StoreOperation, StoreRevision, StoreValue, TransactionId,
-  error::fixed_bytes,
+  hex::fixed_bytes,
   protocol::{CborLimits, decode_canonical_strict, encode_canonical},
   provider::{StorageFactory, StoreSnapshot},
   time::{HostWallClock, WallClock},

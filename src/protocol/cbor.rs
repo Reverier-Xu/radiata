@@ -407,7 +407,7 @@ fn read_array<const LENGTH: usize>(bytes: &[u8], start: usize) -> Result<[u8; LE
   let slice = bytes
     .get(first..last)
     .ok_or_else(|| Error::invalid_input("CBOR header"))?;
-  crate::error::fixed_bytes(slice, "CBOR header")
+  crate::hex::fixed_bytes(slice, "CBOR header")
 }
 
 #[cfg(test)]

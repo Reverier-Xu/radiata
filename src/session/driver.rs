@@ -169,7 +169,7 @@ impl SessionDriver {
       // "no active generation".
       Err(_) => {
         tracing::warn!("merge credential issuer lock poisoned");
-        return Err(Error::join_credential_issuer(()));
+        return Err(Error::poisoned("join credential issuer"));
       }
     };
     Ok(Some(MergeHint::new(generation)))
@@ -274,7 +274,10 @@ impl SessionDriver {
     let (expected_peer, generation, credential) = match peek.mode {
       HandshakeMode::Merge => {
         let active = {
-          let issuer = self.issuer.lock().map_err(Error::join_credential_issuer)?;
+          let issuer = self
+            .issuer
+            .lock()
+            .map_err(|_| Error::poisoned("join credential issuer"))?;
           let now = crate::time::now();
           let active_generation = issuer
             .generation_id()

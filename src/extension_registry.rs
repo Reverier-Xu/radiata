@@ -124,7 +124,7 @@ impl ExtensionRegistry {
       let mut balancers = self
         .load_balancers
         .write()
-        .map_err(Error::extension_registry)?;
+        .map_err(|_| Error::poisoned("extension registry"))?;
       crate::api::insert_once(
         &mut balancers,
         crate::routing::DefaultLoadBalancer::tag()?,
@@ -143,7 +143,10 @@ impl ExtensionRegistry {
   /// the default path owns the official definitions, and a caller
   /// registration under the built-in domain stays refused.
   pub(crate) fn register_core_feature(&mut self, value: crate::FeatureDefinition) -> Result<()> {
-    let mut features = self.features.lock().map_err(Error::extension_registry)?;
+    let mut features = self
+      .features
+      .lock()
+      .map_err(|_| Error::poisoned("extension registry"))?;
     features.entry(value.tag().clone()).or_insert(value);
     Ok(())
   }
@@ -159,7 +162,10 @@ impl ExtensionRegistry {
       "feature definition reserved namespace",
     )?;
     {
-      let mut features = self.features.lock().map_err(Error::extension_registry)?;
+      let mut features = self
+        .features
+        .lock()
+        .map_err(|_| Error::poisoned("extension registry"))?;
       insert_once(
         &mut features,
         value.tag().clone(),
@@ -269,7 +275,7 @@ impl ExtensionRegistry {
       let mut balancers = self
         .load_balancers
         .write()
-        .map_err(Error::extension_registry)?;
+        .map_err(|_| Error::poisoned("extension registry"))?;
       insert_once(&mut balancers, tag, value, "load balancer registration")?;
     }
     Ok(self)
@@ -285,7 +291,7 @@ impl ExtensionRegistry {
       self
         .load_balancers
         .read()
-        .map_err(Error::extension_registry)?
+        .map_err(|_| Error::poisoned("extension registry"))?
         .get(tag)
         .cloned(),
     )
@@ -299,7 +305,7 @@ impl ExtensionRegistry {
       self
         .load_balancers
         .read()
-        .map_err(Error::extension_registry)?
+        .map_err(|_| Error::poisoned("extension registry"))?
         .contains_key(tag),
     )
   }
@@ -370,7 +376,7 @@ impl ExtensionRegistry {
       let mut hooks = self
         .resource_hooks
         .lock()
-        .map_err(Error::extension_registry)?;
+        .map_err(|_| Error::poisoned("extension registry"))?;
       insert_once(&mut hooks, tag, hook, "resource hook registration")?;
     }
     Ok(self)
@@ -390,7 +396,7 @@ impl ExtensionRegistry {
       let mut hooks = self
         .action_hooks
         .lock()
-        .map_err(Error::extension_registry)?;
+        .map_err(|_| Error::poisoned("extension registry"))?;
       insert_once(&mut hooks, tag, hook, "action hook registration")?;
     }
     Ok(self)
@@ -417,7 +423,7 @@ impl ExtensionRegistry {
       let mut reconcilers = self
         .task_reconcilers
         .lock()
-        .map_err(Error::extension_registry)?;
+        .map_err(|_| Error::poisoned("extension registry"))?;
       insert_once(
         &mut reconcilers,
         kind,
@@ -441,7 +447,7 @@ impl ExtensionRegistry {
     let mut reconcilers = self
       .task_reconcilers
       .lock()
-      .map_err(Error::extension_registry)?;
+      .map_err(|_| Error::poisoned("extension registry"))?;
     for (kind, policy) in crate::task::core_task_policies() {
       reconcilers
         .entry(kind.tag().clone())
@@ -528,7 +534,10 @@ impl ExtensionRegistry {
   fn register_protocol_inner(
     &self, value: ProtocolDefinition, consumer: Arc<dyn PacketConsumer>,
   ) -> Result<()> {
-    let mut protocols = self.protocols.write().map_err(Error::extension_registry)?;
+    let mut protocols = self
+      .protocols
+      .write()
+      .map_err(|_| Error::poisoned("extension registry"))?;
     insert_once(
       &mut protocols,
       value.tag.clone(),
@@ -549,7 +558,7 @@ impl ExtensionRegistry {
       self
         .protocols
         .read()
-        .map_err(Error::extension_registry)?
+        .map_err(|_| Error::poisoned("extension registry"))?
         .get(tag)
         .cloned(),
     )
@@ -563,7 +572,7 @@ impl ExtensionRegistry {
       self
         .protocols
         .read()
-        .map_err(Error::extension_registry)?
+        .map_err(|_| Error::poisoned("extension registry"))?
         .contains_key(tag),
     )
   }

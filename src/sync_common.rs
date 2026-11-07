@@ -144,7 +144,9 @@ pub(crate) fn decode_plain_sync_envelope(
 
 /// The alive-peer set of one node, in stable order.
 pub(crate) fn alive_peers(sessions: &SessionTable) -> Result<Vec<NodeId>> {
-  let guard = sessions.lock().map_err(Error::session_table)?;
+  let guard = sessions
+    .lock()
+    .map_err(|_| Error::poisoned("session table"))?;
   Ok(
     guard
       .iter()

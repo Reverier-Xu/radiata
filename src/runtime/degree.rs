@@ -163,7 +163,7 @@ impl TickState {
     let connected: BTreeSet<NodeId> = self
       .sessions
       .lock()
-      .map_err(Error::session_table)?
+      .map_err(|_| Error::poisoned("session table"))?
       .iter()
       .filter(|(_, entry)| entry.alive())
       .map(|(peer, _)| peer.clone())
@@ -395,7 +395,10 @@ impl TickState {
   /// session-table lock is an error: the caller suppresses the probe
   /// rather than densify on a table it cannot read.
   fn probe_edge_peer(&self) -> Result<Option<NodeId>> {
-    let sessions = self.sessions.lock().map_err(Error::session_table)?;
+    let sessions = self
+      .sessions
+      .lock()
+      .map_err(|_| Error::poisoned("session table"))?;
     Ok(sessions.iter().find_map(|(peer, entry)| {
       (entry.alive() && entry.dial_class() == crate::session::stream::DialClass::Probe)
         .then(|| peer.clone())
@@ -431,7 +434,10 @@ impl TickState {
     };
     debug_assert!(due);
     let removed = {
-      let mut sessions = self.sessions.lock().map_err(Error::session_table)?;
+      let mut sessions = self
+        .sessions
+        .lock()
+        .map_err(|_| Error::poisoned("session table"))?;
       match sessions.get(peer) {
         Some(entry)
           if entry.alive() && entry.dial_class() == crate::session::stream::DialClass::Probe =>
@@ -548,7 +554,7 @@ impl Supervisor {
       .dependencies
       .sessions
       .lock()
-      .map_err(Error::session_table)?
+      .map_err(|_| Error::poisoned("session table"))?
       .values()
       .filter(|entry| entry.alive())
       .count();

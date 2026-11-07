@@ -456,7 +456,8 @@ impl TransportRegistry {
   /// Resolves one endpoint's scheme name through the map: the official
   /// transports and every caller-registered transport provider merge
   /// into one resolution namespace, and a name that resolves to nothing
-  /// fails typed here.
+  /// fails typed here, naming the scheme (the error context carries the
+  /// offending value).
   pub(crate) fn resolve_transport(
     &self, name: &crate::transport::TransportName,
   ) -> Result<Arc<dyn Transport>> {
@@ -464,7 +465,7 @@ impl TransportRegistry {
       .transports
       .get(name)
       .cloned()
-      .ok_or_else(|| Error::not_found("transport"))
+      .ok_or_else(|| Error::not_found(format!("transport scheme {name}")))
   }
 
   /// The registered transport for one scheme name. Test-only: production

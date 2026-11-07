@@ -178,7 +178,7 @@ impl PacketAdmission {
     let entry = self
       .sessions
       .lock()
-      .map_err(Error::session_table)?
+      .map_err(|_| Error::poisoned("session table"))?
       .get(&destination)
       .cloned();
     // A direct path is preferred for an exact target; without one, the
@@ -272,7 +272,7 @@ impl PacketAdmission {
       self
         .sessions
         .lock()
-        .map_err(Error::session_table)?
+        .map_err(|_| Error::poisoned("session table"))?
         .get(first)
         .filter(|entry| entry.alive())
         .cloned(),

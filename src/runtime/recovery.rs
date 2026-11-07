@@ -220,7 +220,7 @@ impl TickState {
     let direct: std::collections::BTreeSet<NodeId> = self
       .sessions
       .lock()
-      .map_err(Error::session_table)?
+      .map_err(|_| Error::poisoned("session table"))?
       .iter()
       .filter(|(_, entry)| entry.alive())
       .map(|(peer, _)| peer.clone())
@@ -240,7 +240,10 @@ impl TickState {
     }
     let now = crate::time::now_seconds();
     let dial_due = {
-      let mut controller = self.recovery.lock().map_err(Error::recovery_controller)?;
+      let mut controller = self
+        .recovery
+        .lock()
+        .map_err(|_| Error::poisoned("recovery controller"))?;
       controller.observe(&known, &direct);
       controller.state() == crate::membership::recovery::RecoveryState::Recovering
         && controller.due(now)
@@ -273,7 +276,10 @@ impl TickState {
       }
     }
     let step = {
-      let mut controller = self.recovery.lock().map_err(Error::recovery_controller)?;
+      let mut controller = self
+        .recovery
+        .lock()
+        .map_err(|_| Error::poisoned("recovery controller"))?;
       controller.next_step(
         now,
         &candidates.keys().cloned().collect(),
@@ -398,7 +404,10 @@ impl TickState {
     // retired as the old redundant edge (the dial class belongs to the
     // entry, not the key).
     let victim: Option<(NodeId, crate::session::stream::SessionEntry)> = {
-      let mut sessions = self.sessions.lock().map_err(Error::session_table)?;
+      let mut sessions = self
+        .sessions
+        .lock()
+        .map_err(|_| Error::poisoned("session table"))?;
       let mut marked = Vec::new();
       let mut unmarked = Vec::new();
       for (peer, entry) in sessions.iter() {

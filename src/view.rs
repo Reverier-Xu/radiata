@@ -973,8 +973,8 @@ impl TaskView {
   }
 
   /// The typed terminal failure, when the task failed.
-  pub const fn error(&self) -> Option<crate::TaskError> {
-    self.error
+  pub fn error(&self) -> Option<crate::TaskError> {
+    self.error.clone()
   }
 
   /// The succeeded task's output: the payload bytes. For the credential
@@ -999,7 +999,7 @@ impl TaskView {
       created: record.created,
       started: record.started,
       finished: record.finished,
-      error: record.error,
+      error: record.error.clone(),
       output,
     }
   }
