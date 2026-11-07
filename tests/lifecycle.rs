@@ -185,7 +185,7 @@ async fn lifecycle_concurrent_shutdown_runs_one_drain() {
 #[test]
 fn lifecycle_start_without_tokio_returns_not_ready_without_provider_calls() {
   let providers = Providers::new();
-  let mut start = Box::pin(providers.builder().start());
+  let mut start = std::pin::pin!(providers.builder().start());
   let waker = Waker::noop();
   let mut context = Context::from_waker(waker);
 
