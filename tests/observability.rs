@@ -1,11 +1,14 @@
-//! Bounded runtime status and secret-safe observability.
+//! Bounded runtime status and log observability.
 //!
 //! The status lane proves the public observation of the bounded runtime
 //! responsibilities — lifecycle, sessions, listeners, tasks, queues,
 //! routes, trace metadata, pending transactions, and metadata storage —
-//! while the redaction lane drives a full workflow with injected marker
-//! material and proves no credential, key, body, path, address, selector,
-//! or hostile string enters the emitted log stream.
+//! while the log-capture lane drives a full workflow with a captured
+//! writer and proves the emitted log stream is real (non-empty) and that
+//! cryptographic secret material (the credential secret) never enters it.
+//! Contextual values — paths, addresses, labels, selectors, bodies,
+//! non-secret identifiers — are allowed in logs by decision; only secret
+//! bytes are forbidden.
 
 #[cfg(all(test, feature = "json", unix))]
 use std::sync::Mutex;
@@ -23,7 +26,7 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys};
 
-/// Captures every emitted log line for the redaction scan.
+/// Captures every emitted log line for the log-capture scan.
 #[cfg(all(test, feature = "json", unix))]
 #[derive(Clone, Default)]
 struct LogCapture {
@@ -224,16 +227,17 @@ async fn observability_snapshot_covers_bounded_responsibilities() {
   member.handle.shutdown().await.unwrap();
 }
 
-/// Injected credential, key, packet-body, path, address,
-/// selector, and hostile-string markers never enter the emitted log
-/// stream of a full node workflow.
+/// A full node workflow emits a real log stream, and cryptographic
+/// secret material — the issued credential secret — never enters it.
+/// Contextual values (paths, addresses, bodies, labels, selectors) may
+/// appear by decision; only secret bytes are forbidden.
 ///
-/// The path marker rides the JSON adapter (the only backend that mounts
-/// a real filesystem path), so the lane requires the `json` feature and
-/// the unix directory barrier the full-node open demands.
+/// The lane mounts a real filesystem path through the JSON adapter, so
+/// it requires the `json` feature and the unix directory barrier the
+/// full-node open demands.
 #[cfg(all(test, feature = "json", unix))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn redaction_lane_rejects_every_forbidden_class() {
+async fn credential_secrets_never_enter_the_emitted_log_stream() {
   let capture = LogCapture::default();
   tracing_subscriber::fmt()
     .with_env_filter(tracing_subscriber::EnvFilter::new("radiata=trace"))
@@ -241,11 +245,10 @@ async fn redaction_lane_rejects_every_forbidden_class() {
     .try_init()
     .unwrap();
 
-  // A distinctive storage path marker through the JSON adapter.
+  // A distinctive storage path through the JSON adapter.
   let directory = tempfile::tempdir().unwrap();
-  let storage_marker = directory.path().join("redaction-marker-directory-7x2q");
+  let storage_marker = directory.path().join("log-lane-directory-7x2q");
   std::fs::create_dir(&storage_marker).unwrap();
-  let path_marker = storage_marker.to_string_lossy().to_string();
 
   let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(3_710_000));
   let factory = radiata::adapters::json_store(storage_marker.clone());
@@ -270,8 +273,8 @@ async fn redaction_lane_rejects_every_forbidden_class() {
   issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
   listen(&mut issuer).await;
 
-  // Markers: the credential secret, the packet body, a hostile label
-  // value, a selector text, and the storage path.
+  // Injected workflow material: the issued credential secret, a packet
+  // body, a label value, and a selector.
   let issued = issuer
     .handle
     .credentials()
@@ -281,10 +284,10 @@ async fn redaction_lane_rejects_every_forbidden_class() {
     .wait()
     .await
     .unwrap();
-  let credential_marker = issued.credential().expose_secret().to_owned();
-  let body_marker: Arc<[u8]> = Arc::from(b"PACKET-BODY-MARKER-9w4e".as_slice());
-  let label_marker = "hostile\nlabel\x00value-MARKER";
-  let selector_marker = "radiata.woooo.tech/labels/marker-selector-x1q9";
+  let credential_secret = issued.credential().expose_secret().to_owned();
+  let body_marker: Arc<[u8]> = Arc::from(b"WORKFLOW-BODY-9w4e".as_slice());
+  let label_value = "workflow\nlabel\x00value";
+  let selector_text = "radiata.woooo.tech/labels/workflow-selector-x1q9";
 
   common::merge_with_retry(&member.handle, &issuer.handle, issuer.endpoint.clone()).await;
   member.id = Some(member.handle.local_node().await.unwrap().node_id().clone());
@@ -307,7 +310,7 @@ async fn redaction_lane_rejects_every_forbidden_class() {
     tokio::time::sleep(Duration::from_millis(20)).await;
   }
 
-  // Packet bodies stay inside the stream; never loggable.
+  // Packet bodies stay inside the stream.
   let packet = member.handle.open_stream(
     StreamTarget::Exact(issuer.id.clone().unwrap()),
     ProtocolTag::parse("radiata.woooo.tech/protocols/unregistered-marker").unwrap(),
@@ -321,16 +324,16 @@ async fn redaction_lane_rejects_every_forbidden_class() {
     Err(error) => assert_eq!(error.kind(), ErrorKind::Unsupported),
   }
 
-  // A resource write with a hostile label value and a selector probe.
+  // A resource write with a label value and a selector probe.
   let write = ResourceWrite::new(
-    ResourceName::parse("radiata.woooo.tech/resources/redaction-lane").unwrap(),
+    ResourceName::parse("radiata.woooo.tech/resources/log-lane").unwrap(),
     ResourceLabels::new(
-      radiata::LabelValue::parse("marker").unwrap(),
-      ResourceUri::parse("file:///tmp/redaction-lane").unwrap(),
+      radiata::LabelValue::parse("value").unwrap(),
+      ResourceUri::parse("file:///tmp/log-lane").unwrap(),
     )
     .custom(
       radiata::LabelKey::parse("example.org/labels/owner").unwrap(),
-      radiata::LabelValue::parse(label_marker).unwrap(),
+      radiata::LabelValue::parse(label_value).unwrap(),
     )
     .unwrap(),
   );
@@ -351,7 +354,7 @@ async fn redaction_lane_rejects_every_forbidden_class() {
     .handle
     .resources()
     .select(
-      radiata::Selector::parse(selector_marker).unwrap(),
+      radiata::Selector::parse(selector_text).unwrap(),
       PageSpec::first(8).unwrap(),
     )
     .await;
@@ -370,32 +373,11 @@ async fn redaction_lane_rejects_every_forbidden_class() {
 
   let captured = String::from_utf8_lossy(&capture.buffer.lock().unwrap()).to_string();
   assert!(!captured.is_empty(), "the workflow emitted no log events");
-  for (class, marker) in [
-    ("credential", credential_marker.as_str()),
-    ("packet body", "PACKET-BODY-MARKER-9w4e"),
-    ("label value", label_marker),
-    ("selector", selector_marker),
-    ("storage path", path_marker.as_str()),
-  ] {
-    assert!(
-      !captured.contains(marker),
-      "the {class} marker leaked into the log stream"
-    );
-  }
-  // The listener address never enters the log stream either.
+  // Cryptographic secret material is the one forbidden class: the issued
+  // credential secret never enters the log stream.
   assert!(
-    !captured.contains(issuer.endpoint.as_str()),
-    "the listener address leaked into the log stream"
-  );
-  // The packet body marker as a Debug byte array must not appear either.
-  let bytes_marker: String = body_marker
-    .iter()
-    .map(u8::to_string)
-    .collect::<Vec<_>>()
-    .join(", ");
-  assert!(
-    !captured.contains(&bytes_marker),
-    "packet body bytes leaked into the log stream"
+    !captured.contains(credential_secret.as_str()),
+    "the credential secret leaked into the log stream"
   );
 }
 

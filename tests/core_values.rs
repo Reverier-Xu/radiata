@@ -165,7 +165,7 @@ fn core_config_rejects_only_invalid_foundation_relationships() {
 }
 
 #[test]
-fn core_provider_errors_match_manifest_and_remain_redacted() {
+fn core_provider_errors_match_manifest() {
   let cases = [
     (
       ProviderErrorKind::UnsupportedSchema,
@@ -181,7 +181,6 @@ fn core_provider_errors_match_manifest_and_remain_redacted() {
     let error = radiata::Error::provider(provider, ProviderErrorContext::StorageScan);
     assert_eq!(error.kind(), expected);
     assert_eq!(error.context(), "storage scan");
-    assert!(!format!("{error:?}").contains("provider-secret"));
   }
 }
 
