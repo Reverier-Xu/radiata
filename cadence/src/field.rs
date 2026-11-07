@@ -38,6 +38,9 @@ pub(crate) struct FieldSet {
   domain: FieldDomain,
   /// `true` when the set was declared with `*` (the full domain).
   wildcard: bool,
+  /// `true` when the field was a bare single numeric literal, which the
+  /// canonical form renders without braces.
+  bare: bool,
   /// Bit `v` of word `v / 64` is set iff value `v` is a member.
   mask: Vec<u64>,
 }
@@ -71,7 +74,9 @@ impl FieldSet {
         ));
       }
       let value = Self::parse_number(&text[..digits], domain)?;
-      Ok((Self::single(domain, value), &text[digits..]))
+      let mut set = Self::single(domain, value);
+      set.bare = true;
+      Ok((set, &text[digits..]))
     }
   }
 
@@ -161,7 +166,7 @@ impl FieldSet {
 
   fn empty(domain: FieldDomain) -> Self {
     let words = usize::from(domain.max) / 64 + 1;
-    Self { domain, wildcard: false, mask: vec![0; words] }
+    Self { domain, wildcard: false, bare: false, mask: vec![0; words] }
   }
 
   fn single(domain: FieldDomain, value: u16) -> Self {
@@ -207,6 +212,11 @@ impl FieldSet {
   /// Appends the canonical form: `{*}` for a wildcard declaration, else the
   /// sorted, coalesced list of inclusive runs over the domain.
   pub(crate) fn write_canonical(&self, out: &mut String) {
+    if self.bare {
+      let value = self.next_at(0).unwrap_or(0);
+      push_number(out, value, self.domain.digits);
+      return;
+    }
     out.push('{');
     if self.wildcard {
       out.push('*');
@@ -235,6 +245,12 @@ impl FieldSet {
   }
 }
 
+/// Appends `value` zero-padded to `digits` digits.
+fn push_number(out: &mut String, value: u16, digits: usize) {
+  let rendered = format!("{value:0width$}", width = digits);
+  out.push_str(&rendered);
+}
+
 #[cfg(test)]
 mod tests {
   use super::{FieldDomain, FieldSet};
@@ -251,9 +267,9 @@ mod tests {
 
   #[test]
   fn bare_literals_parse_and_render_zero_padded() {
-    assert_eq!(canonical("09", FieldDomain::HOUR), "{09}");
-    assert_eq!(canonical("59", FieldDomain::SECOND), "{59}");
-    assert_eq!(canonical("2026", FieldDomain::YEAR), "{2026}");
+    assert_eq!(canonical("09", FieldDomain::HOUR), "09");
+    assert_eq!(canonical("59", FieldDomain::SECOND), "59");
+    assert_eq!(canonical("2026", FieldDomain::YEAR), "2026");
   }
 
   #[test]

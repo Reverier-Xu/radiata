@@ -188,14 +188,14 @@ impl Pattern {
       }
       if !self.month.contains(u16::from(cursor.month)) {
         advance_month(&mut cursor, &self.year)?;
-        reset_date(&mut cursor);
+        reset_time(&mut cursor);
         continue;
       }
       if !self.day.contains(u16::from(cursor.day))
         || cursor.day > days_in_month(cursor.year, cursor.month)
       {
         advance_day(&mut cursor, &self.year)?;
-        reset_date(&mut cursor);
+        reset_time(&mut cursor);
         continue;
       }
       if !self.hour.contains(u16::from(cursor.hour)) {
@@ -289,6 +289,14 @@ fn parse_offset_component(text: &str, name: &'static str, max: u8, whole: &str) 
     ));
   }
   Ok(value)
+}
+
+/// Resets the time-of-day after a month or day jump; the advanced field is
+/// left as the carry left it.
+fn reset_time(cursor: &mut FieldValues) {
+  cursor.hour = 0;
+  cursor.minute = 0;
+  cursor.second = 0;
 }
 
 /// Resets month, day, and time-of-day after a year jump.
