@@ -82,8 +82,7 @@ fn page_spec(
             Json(json!({"error": "malformed cursor"})),
           )
         })?;
-      let cursor =
-        PageCursor::new(bytes.into_boxed_slice().into()).map_err(bad_request)?;
+      let cursor = PageCursor::new(bytes.into_boxed_slice().into()).map_err(bad_request)?;
       PageSpec::after(cursor, limit).map_err(bad_request)
     }
     _ => PageSpec::first(limit).map_err(bad_request),
