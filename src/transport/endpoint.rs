@@ -195,6 +195,8 @@ impl TransportScheme {
   /// inventory (`radiata.woooo.tech/transports/<name>`). The official
   /// transports register under their scheme names, not their tags; the
   /// tag remains the declared built-in identity of the transport class.
+  /// The full tag stays one contiguous literal per scheme: the built-in
+  /// tag inventory's owner-source scan pins these spellings textually.
   pub const fn builtin_tag(self) -> &'static str {
     match self {
       Self::Tls => "radiata.woooo.tech/transports/tls",

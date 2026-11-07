@@ -567,7 +567,6 @@ fn authentication_deadline_elapsed() -> Error {
   Error::not_ready("authentication deadline")
 }
 
-/// Reads the trusted member-mode binding for `peer` from durable storage.
 /// Sends one handshake state machine message under its published kind.
 async fn send(connection: &mut Connection, kind: HandshakeKind, body: &[u8]) -> Result<()> {
   connection

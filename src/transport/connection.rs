@@ -99,6 +99,27 @@ pub(crate) struct Message {
   pub(crate) body: Vec<u8>,
 }
 
+impl Message {
+  /// Builds one fully validated wire message, emitting the receive-side
+  /// trace event at the single seam both stream classes produce a
+  /// `Message` through.
+  pub(crate) fn from_parts(schema_id: u16, kind_id: u16, flags: u16, body: Vec<u8>) -> Self {
+    tracing::trace!(
+      schema_id,
+      kind_id,
+      flags,
+      body_len = body.len(),
+      "wire message received"
+    );
+    Self {
+      schema_id,
+      kind_id,
+      flags,
+      body,
+    }
+  }
+}
+
 #[cfg(test)]
 impl Received {
   /// Unwraps the message variant for tests exercising the message-only
@@ -148,17 +169,14 @@ impl Connection {
   ) -> Result<Self> {
     let (tls, peer_addr, channel_binding) = accept_tls_raw(tcp, config).await?;
     let stream = ws::accept(tls, hint).await?;
-    let peer_addr = match admission {
-      TransportAdmission::PeerAddressed => peer_addr,
-      TransportAdmission::Addressless => None,
-    };
+    let (peer_addr, attributable) = admission_parts(admission, peer_addr);
     Ok(Self {
       io: TransportIo::Ws(Box::new(stream)),
       rules,
       channel_binding,
       merge_hint: None,
       peer_addr,
-      attributable: admission == TransportAdmission::PeerAddressed,
+      attributable,
     })
   }
 
@@ -209,21 +227,14 @@ impl Connection {
       let mut write = write.lock().await;
       framing::write_hint(&mut *write, hint).await?;
     }
-    // The declared admission state is authoritative: an addressless
-    // medium never charges a peer bucket, even if it reported an address,
-    // and a peer-addressed medium reports exactly the address the
-    // admission plane must charge.
-    let peer_addr = match admission {
-      TransportAdmission::PeerAddressed => peer_addr,
-      TransportAdmission::Addressless => None,
-    };
+    let (peer_addr, attributable) = admission_parts(admission, peer_addr);
     Ok(Self {
       io: TransportIo::Raw { read, write },
       rules,
       channel_binding,
       merge_hint: None,
       peer_addr,
-      attributable: admission == TransportAdmission::PeerAddressed,
+      attributable,
     })
   }
 
@@ -406,17 +417,16 @@ impl ConnectionWriter {
 
   /// Sends one base-schema wire message of `kind_id` with no flags.
   pub(crate) async fn send(&mut self, kind_id: u16, body: &[u8]) -> Result<()> {
+    tracing::trace!(kind_id, body_len = body.len(), "wire message sent");
     match &mut self.sink {
       WriterSink::Ws(sink) => {
         let frame = encode_frame(self.rules, BASE_SCHEMA_ID, kind_id, 0, body)?;
-        tracing::trace!(kind_id, body_len = body.len(), "wire message sent");
         sink
           .send(WsMessage::binary(frame))
           .await
           .map_err(|_| Error::provider(ProviderErrorKind::Io, ProviderErrorContext::TransportSend))
       }
       WriterSink::Raw(write) => {
-        tracing::trace!(kind_id, body_len = body.len(), "wire message sent");
         let mut write = write.lock().await;
         framing::write_data(&mut *write, self.rules, BASE_SCHEMA_ID, kind_id, 0, body).await
       }
@@ -463,6 +473,23 @@ pub(crate) enum Received {
   Pong,
 }
 
+/// Resolves one accepted connection's admission record: the attributable
+/// peer address and whether the medium attributes by design. The declared
+/// admission state is authoritative: an addressless medium never charges
+/// a peer bucket, even if it reported an address, and a peer-addressed
+/// medium reports exactly the address the admission plane must charge.
+fn admission_parts(
+  admission: TransportAdmission, peer_addr: Option<SocketAddr>,
+) -> (Option<SocketAddr>, bool) {
+  (
+    match admission {
+      TransportAdmission::PeerAddressed => peer_addr,
+      TransportAdmission::Addressless => None,
+    },
+    admission == TransportAdmission::PeerAddressed,
+  )
+}
+
 /// Builds the canonical HTTP upgrade authority of one WebSocket dial:
 /// the endpoint's TLS server name — the exact name the SNI extension
 /// already presented — plus the dialed port. The kernel's peer address
@@ -503,19 +530,12 @@ where
           rules.receive_limit,
           rules.is_declared,
         )?;
-        tracing::trace!(
-          schema_id = prelude.schema_id(),
-          kind_id = prelude.kind_id(),
-          flags = prelude.flags(),
-          body_len = body.len(),
-          "wire message received"
-        );
-        return Ok(Some(Received::Message(Message {
-          schema_id: prelude.schema_id(),
-          kind_id: prelude.kind_id(),
-          flags: prelude.flags(),
-          body: body.to_vec(),
-        })));
+        return Ok(Some(Received::Message(Message::from_parts(
+          prelude.schema_id(),
+          prelude.kind_id(),
+          prelude.flags(),
+          body.to_vec(),
+        ))));
       }
       WsMessage::Text(_) => return Err(Error::invalid_input("websocket text message")),
       WsMessage::Ping(_) => continue,
