@@ -8,9 +8,11 @@
 
 use core::fmt::{self, Write as _};
 
-use crate::calendar::days_in_month;
-use crate::error::{ParseError, ParseErrorKind, Result};
-use crate::field::{FieldDomain, FieldSet};
+use crate::{
+  calendar::days_in_month,
+  error::{ParseError, ParseErrorKind, Result},
+  field::{FieldDomain, FieldSet},
+};
 
 /// One wall-clock second in a chosen reference frame: the six field values
 /// a pattern matches against.
@@ -40,11 +42,17 @@ impl FieldValues {
   /// [`Pattern::next_fire`] rolls such starts forward, and matching is pure
   /// set membership over the supplied values.
   pub fn new(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Option<Self> {
-    if month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 59
-    {
+    if month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 59 {
       return None;
     }
-    Some(Self { year, month, day, hour, minute, second })
+    Some(Self {
+      year,
+      month,
+      day,
+      hour,
+      minute,
+      second,
+    })
   }
 }
 
@@ -70,7 +78,13 @@ impl fmt::Display for Offset {
       Self::Utc => f.write_str("Z"),
       Self::Fixed(seconds) => {
         let magnitude = seconds.unsigned_abs();
-        write!(f, "{}{:02}:{:02}", if seconds < 0 { '-' } else { '+' }, magnitude / 3600, magnitude % 3600 / 60)
+        write!(
+          f,
+          "{}{:02}:{:02}",
+          if seconds < 0 { '-' } else { '+' },
+          magnitude / 3600,
+          magnitude % 3600 / 60
+        )
       }
     }
   }
@@ -127,7 +141,15 @@ impl Pattern {
     let rest = expect(rest, ':', "':'")?;
     let (second, rest) = FieldSet::parse(rest, FieldDomain::SECOND)?;
     let offset = parse_offset(rest)?;
-    Ok(Pattern { year, month, day, hour, minute, second, offset })
+    Ok(Pattern {
+      year,
+      month,
+      day,
+      hour,
+      minute,
+      second,
+      offset,
+    })
   }
 
   /// Returns the declared reference frame.
@@ -142,10 +164,15 @@ impl Pattern {
   /// supply values in the pattern's reference frame; nonexistent civil
   /// dates (February 30th) simply never occur in a real frame, and
   /// [`Pattern::next_fire`] never produces them.
-  pub fn r#match(
-    &self, year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8,
-  ) -> bool {
-    self.matches(FieldValues { year, month, day, hour, minute, second })
+  pub fn r#match(&self, year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> bool {
+    self.matches(FieldValues {
+      year,
+      month,
+      day,
+      hour,
+      minute,
+      second,
+    })
   }
 
   /// The [`FieldValues`]-taking form of [`Pattern::r#match`].
@@ -265,16 +292,24 @@ fn parse_offset(text: &str) -> Result<Offset> {
   })?;
   let sign = if text.starts_with('-') { -1 } else { 1 };
   let (hours, minutes) = body.split_once(':').ok_or_else(|| {
-    ParseError::new(ParseErrorKind::Offset, format!("expected 'hh:mm', found {text:?}"))
+    ParseError::new(
+      ParseErrorKind::Offset,
+      format!("expected 'hh:mm', found {text:?}"),
+    )
   })?;
   let hours = parse_offset_component(hours, "hours", 23, text)?;
   let minutes = parse_offset_component(minutes, "minutes", 59, text)?;
-  Ok(Offset::Fixed(sign * (i32::from(hours) * 3600 + i32::from(minutes) * 60)))
+  Ok(Offset::Fixed(
+    sign * (i32::from(hours) * 3600 + i32::from(minutes) * 60),
+  ))
 }
 
 /// Parses one two-digit offset component with an inclusive upper bound.
 fn parse_offset_component(text: &str, name: &'static str, max: u8, whole: &str) -> Result<u8> {
-  let digits = text.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+  let digits = text
+    .bytes()
+    .take_while(|byte| byte.is_ascii_digit())
+    .count();
   if digits != 2 || digits != text.len() {
     return Err(ParseError::new(
       ParseErrorKind::Offset,
@@ -390,17 +425,31 @@ mod tests {
       ("2026-03-15T09:00:00-05:30", "2026-03-15T09:00:00-05:30"),
       ("2026-{03,09-12}-01T00:00:00", "2026-{03,09-12}-01T00:00:00"),
       ("2026-{09-12,03}-01T00:00:00", "2026-{03,09-12}-01T00:00:00"),
-      ("{2026,2030-2033}-{03,09-12}-01T00:00:00Z", "{2026,2030-2033}-{03,09-12}-01T00:00:00Z"),
+      (
+        "{2026,2030-2033}-{03,09-12}-01T00:00:00Z",
+        "{2026,2030-2033}-{03,09-12}-01T00:00:00Z",
+      ),
       ("2026-{01-03,03-05}-01T00:00:00", "2026-{01-05}-01T00:00:00"),
       ("2026-03-15T{*,07}:{00,30}:59", "2026-03-15T{*}:{00,30}:59"),
-      ("{0059}-{03}-{03}T{03}:{03}:{03}", "{0059}-{03}-{03}T{03}:{03}:{03}"),
+      (
+        "{0059}-{03}-{03}T{03}:{03}:{03}",
+        "{0059}-{03}-{03}T{03}:{03}:{03}",
+      ),
       ("0000-01-01T00:00:00", "0000-01-01T00:00:00"),
       ("9999-12-31T23:59:59", "9999-12-31T23:59:59"),
     ];
     for (input, canonical) in cases {
       let pattern = parse_ok(input);
-      assert_eq!(pattern.to_string(), canonical, "canonical form of {input:?}");
-      assert_eq!(parse_ok(&pattern.to_string()).to_string(), canonical, "reparse of {input:?}");
+      assert_eq!(
+        pattern.to_string(),
+        canonical,
+        "canonical form of {input:?}"
+      );
+      assert_eq!(
+        parse_ok(&pattern.to_string()).to_string(),
+        canonical,
+        "reparse of {input:?}"
+      );
     }
   }
 
@@ -409,33 +458,69 @@ mod tests {
   #[test]
   fn reject_matrix() {
     let skeleton = [
-      "", "*", "2026", "2026-03", "2026-03-15", "2026-03-15T", "2026-03-15T00",
-      "2026-03-15T00:00", "2026-03-15t00:00:00", "2026/03/15T00:00:00", "2026-03-15V00:00:00",
-      "2026-03-15T00-00:00", " 2026-03-15T00:00:00",
+      "",
+      "*",
+      "2026",
+      "2026-03",
+      "2026-03-15",
+      "2026-03-15T",
+      "2026-03-15T00",
+      "2026-03-15T00:00",
+      "2026-03-15t00:00:00",
+      "2026/03/15T00:00:00",
+      "2026-03-15V00:00:00",
+      "2026-03-15T00-00:00",
+      " 2026-03-15T00:00:00",
     ];
     for text in skeleton {
       assert_eq!(rejected(text), ParseErrorKind::Skeleton, "{text:?}");
     }
     // The brace rule: bare *, bare ranges, and bare enumerations fail.
-    let bare = ["*-*-*T*:*:*", "2026-03-15T0-30:00:00", "00:00:00", "2026-03-15T*:00:00"];
+    let bare = [
+      "*-*-*T*:*:*",
+      "2026-03-15T0-30:00:00",
+      "00:00:00",
+      "2026-03-15T*:00:00",
+    ];
     for text in bare {
       let kind = rejected(text);
-      assert!(matches!(kind, ParseErrorKind::Skeleton | ParseErrorKind::DigitCount), "{text:?}");
+      assert!(
+        matches!(kind, ParseErrorKind::Skeleton | ParseErrorKind::DigitCount),
+        "{text:?}"
+      );
     }
     let digit_counts = [
-      "202-03-15T00:00:00", "20260-03-15T00:00:00", "2026-3-15T00:00:00", "2026-013-15T00:00:00",
-      "2026-03-1T00:00:00", "2026-03-15T0:00:00", "2026-03-15T00:0:00", "2026-03-15T00:00:0",
-      "2026-03-15T001:00:00", "{00}-{01}-01T00:00:00", "{32}-{01}-01T00:00:00",
-      "{24}-{01}-01T00:00:00", "{60}-{01}-01T00:00:00", "2026-{03-03-03}-01T00:00:00",
+      "202-03-15T00:00:00",
+      "20260-03-15T00:00:00",
+      "2026-3-15T00:00:00",
+      "2026-013-15T00:00:00",
+      "2026-03-1T00:00:00",
+      "2026-03-15T0:00:00",
+      "2026-03-15T00:0:00",
+      "2026-03-15T00:00:0",
+      "2026-03-15T001:00:00",
+      "{00}-{01}-01T00:00:00",
+      "{32}-{01}-01T00:00:00",
+      "{24}-{01}-01T00:00:00",
+      "{60}-{01}-01T00:00:00",
+      "2026-{03-03-03}-01T00:00:00",
     ];
     for text in digit_counts {
       assert_eq!(rejected(text), ParseErrorKind::DigitCount, "{text:?}");
     }
     let domains = [
-      "2026-00-01T00:00:00", "2026-13-01T00:00:00", "2026-03-00T00:00:00", "2026-03-32T00:00:00",
-      "2026-03-15T24:00:00", "2026-03-15T00:60:00", "2026-03-15T00:00:60",
-      "{2026}-{13}-01T00:00:00", "{2026}-{01}-{32}T00:00:00", "2026-03-15T{24}:00:00",
-      "2026-03-15T00:{60}:00", "2026-03-15T00:00:{60}",
+      "2026-00-01T00:00:00",
+      "2026-13-01T00:00:00",
+      "2026-03-00T00:00:00",
+      "2026-03-32T00:00:00",
+      "2026-03-15T24:00:00",
+      "2026-03-15T00:60:00",
+      "2026-03-15T00:00:60",
+      "{2026}-{13}-01T00:00:00",
+      "{2026}-{01}-{32}T00:00:00",
+      "2026-03-15T{24}:00:00",
+      "2026-03-15T00:{60}:00",
+      "2026-03-15T00:00:{60}",
     ];
     for text in domains {
       assert_eq!(rejected(text), ParseErrorKind::Domain, "{text:?}");
@@ -445,17 +530,30 @@ mod tests {
       assert_eq!(rejected(text), ParseErrorKind::RangeOrder, "{text:?}");
     }
     let duplicates = [
-      "2026-{03,03}-01T00:00:00", "2026-{03,03-03}-01T00:00:00", "2026-{01-05,03}-01T00:00:00",
-      "2026-{01-05,01-05}-01T00:00:00", "{*,*}-{01}-01T00:00:00", "2026-03-15T{00,00}:{00}:00",
+      "2026-{03,03}-01T00:00:00",
+      "2026-{03,03-03}-01T00:00:00",
+      "2026-{01-05,03}-01T00:00:00",
+      "2026-{01-05,01-05}-01T00:00:00",
+      "{*,*}-{01}-01T00:00:00",
+      "2026-03-15T{00,00}:{00}:00",
     ];
     for text in duplicates {
       assert_eq!(rejected(text), ParseErrorKind::DuplicateElement, "{text:?}");
     }
     let offsets = [
-      "2026-03-15T00:00:00x", "2026-03-15T00:00:00Zx", "2026-03-15T00:00:00+", "2026-03-15T00:00:00-",
-      "2026-03-15T00:00:00+24:00", "2026-03-15T00:00:00+00:60", "2026-03-15T00:00:00+1:00",
-      "2026-03-15T00:00:00+0900", "2026-03-15T00:00:00+09:0", "2026-03-15T00:00:00 {*}",
-      "2026-03-15T00:00:00 ", "2026-03-15T00:00:00+5:00", "2026-03-15T00:00:00+005:00",
+      "2026-03-15T00:00:00x",
+      "2026-03-15T00:00:00Zx",
+      "2026-03-15T00:00:00+",
+      "2026-03-15T00:00:00-",
+      "2026-03-15T00:00:00+24:00",
+      "2026-03-15T00:00:00+00:60",
+      "2026-03-15T00:00:00+1:00",
+      "2026-03-15T00:00:00+0900",
+      "2026-03-15T00:00:00+09:0",
+      "2026-03-15T00:00:00 {*}",
+      "2026-03-15T00:00:00 ",
+      "2026-03-15T00:00:00+5:00",
+      "2026-03-15T00:00:00+005:00",
     ];
     for text in offsets {
       assert_eq!(rejected(text), ParseErrorKind::Offset, "{text:?}");
@@ -495,8 +593,10 @@ mod tests {
       "{2025,2026}-{01-12}-{01,15,28-31}T{00,12,23}:{00,29,30,59}:{00,01,59}",
       "{*}-{*}-{30,31}T{23}:59:59",
     ];
-    let oracles: Vec<(Pattern, Oracle)> =
-      patterns.iter().map(|text| (parse_ok(text), Oracle::parse(text))).collect();
+    let oracles: Vec<(Pattern, Oracle)> = patterns
+      .iter()
+      .map(|text| (parse_ok(text), Oracle::parse(text)))
+      .collect();
     for year in 2025..=2026 {
       for month in 1..=12u8 {
         for day in 1..=31u8 {
@@ -540,11 +640,17 @@ mod tests {
     let cases: &[(&str, FieldValues)] = &[
       ("{*}-{*}-{*}T00:00:00Z", values(2026, 3, 15, 12, 30, 45)),
       ("2026-01-{01,15}T00:00:00", values(2026, 1, 2, 0, 0, 0)),
-      ("2026-{01-12}-{01,15}T00:00:00", values(2026, 1, 2, 6, 30, 0)),
+      (
+        "2026-{01-12}-{01,15}T00:00:00",
+        values(2026, 1, 2, 6, 30, 0),
+      ),
       ("2024-{02}-{29}T00:00:00Z", values(2024, 2, 1, 0, 0, 0)),
       ("2026-12-31T23:59:59", values(2026, 12, 31, 0, 0, 0)),
       ("2026-{02,04}-{30,31}T00:00:00", values(2026, 1, 1, 0, 0, 0)),
-      ("2026-03-15T{*,07}:{00,30}:59", values(2026, 3, 15, 7, 30, 58)),
+      (
+        "2026-03-15T{*,07}:{00,30}:59",
+        values(2026, 3, 15, 7, 30, 58),
+      ),
     ];
     for (text, start) in cases {
       let pattern = parse_ok(text);
@@ -565,7 +671,9 @@ mod tests {
     let oracle = Oracle::parse(text);
     let mut cursor = values(2026, 2, 27, 12, 0, 0);
     for _ in 0..24 {
-      let next = pattern.next_fire(cursor).expect("daily-ish pattern always fires");
+      let next = pattern
+        .next_fire(cursor)
+        .expect("daily-ish pattern always fires");
       let stepped = oracle_next_fire(&oracle, cursor, 1_000_000).expect("oracle fires too");
       assert_eq!(next, stepped);
       assert!(pattern.matches(next), "next_fire output matches");
@@ -588,7 +696,10 @@ mod tests {
       leap_day.next_fire(values(2024, 1, 1, 0, 0, 0)),
       Some(values(2024, 2, 29, 0, 0, 0))
     );
-    assert_eq!(leap_day.next_fire(values(2024, 3, 1, 0, 0, 0)), Some(values(2028, 2, 29, 0, 0, 0)));
+    assert_eq!(
+      leap_day.next_fire(values(2024, 3, 1, 0, 0, 0)),
+      Some(values(2028, 2, 29, 0, 0, 0))
+    );
     assert_eq!(
       parse_ok("{2024}-{02}-{29}T00:00:00").next_fire(values(2024, 3, 1, 0, 0, 0)),
       None
@@ -615,7 +726,10 @@ mod tests {
       last.next_fire(values(2026, 12, 31, 23, 59, 58)),
       Some(values(2026, 12, 31, 23, 59, 59))
     );
-    assert_eq!(parse_ok("9999-12-31T00:00:00").next_fire(values(9999, 12, 31, 0, 0, 1)), None);
+    assert_eq!(
+      parse_ok("9999-12-31T00:00:00").next_fire(values(9999, 12, 31, 0, 0, 1)),
+      None
+    );
   }
 
   /// The offset accessor reports the declared frame, and Display renders
@@ -624,9 +738,18 @@ mod tests {
   fn offset_frames() {
     assert_eq!(parse_ok("2026-03-15T00:00:00").offset(), Offset::Local);
     assert_eq!(parse_ok("2026-03-15T00:00:00Z").offset(), Offset::Utc);
-    assert_eq!(parse_ok("2026-03-15T00:00:00+00:00").offset(), Offset::Fixed(0));
-    assert_eq!(parse_ok("2026-03-15T00:00:00+05:45").offset(), Offset::Fixed(20_700));
-    assert_eq!(parse_ok("2026-03-15T00:00:00-08:30").offset(), Offset::Fixed(-30_600));
+    assert_eq!(
+      parse_ok("2026-03-15T00:00:00+00:00").offset(),
+      Offset::Fixed(0)
+    );
+    assert_eq!(
+      parse_ok("2026-03-15T00:00:00+05:45").offset(),
+      Offset::Fixed(20_700)
+    );
+    assert_eq!(
+      parse_ok("2026-03-15T00:00:00-08:30").offset(),
+      Offset::Fixed(-30_600)
+    );
     for (spelling, expected) in [("Z", "Z"), ("+00:00", "+00:00"), ("-08:30", "-08:30")] {
       let text = format!("2026-03-15T00:00:00{spelling}");
       assert_eq!(parse_ok(&text).offset().to_string(), expected);
@@ -648,8 +771,15 @@ mod tests {
       assert_eq!(second.to_string(), canonical, "fixed point of {text:?}");
       assert_eq!(second.offset(), first.offset());
       // Semantics agree on a few probe seconds.
-      for probe in [values(2026, 3, 15, 12, 0, 0), values(2024, 2, 29, 23, 59, 59)] {
-        assert_eq!(first.matches(probe), second.matches(probe), "{text:?} at {probe:?}");
+      for probe in [
+        values(2026, 3, 15, 12, 0, 0),
+        values(2024, 2, 29, 23, 59, 59),
+      ] {
+        assert_eq!(
+          first.matches(probe),
+          second.matches(probe),
+          "{text:?} at {probe:?}"
+        );
       }
     }
   }
@@ -742,16 +872,18 @@ mod tests {
       let time = rest[..time_end].trim_end_matches('Z');
       // Range hyphens live inside braces, so split on '-' but re-merge
       // brace groups across the splits.
-      let date = date.split('-').fold(Vec::new(), |mut fields: Vec<String>, part| {
-        match fields.last_mut() {
-          Some(last) if last.starts_with('{') && !last.ends_with('}') => {
-            last.push('-');
-            last.push_str(part);
+      let date = date
+        .split('-')
+        .fold(Vec::new(), |mut fields: Vec<String>, part| {
+          match fields.last_mut() {
+            Some(last) if last.starts_with('{') && !last.ends_with('}') => {
+              last.push('-');
+              last.push_str(part);
+            }
+            _ => fields.push(part.to_string()),
           }
-          _ => fields.push(part.to_string()),
-        }
-        fields
-      });
+          fields
+        });
       let mut date_fields = date.iter();
       let mut time_fields = time.split(':');
       Oracle {
@@ -789,7 +921,9 @@ mod tests {
     }
 
     fn covered(ranges: &[(u16, u16)], value: u16) -> bool {
-      ranges.iter().any(|&(low, high)| value >= low && value <= high)
+      ranges
+        .iter()
+        .any(|&(low, high)| value >= low && value <= high)
     }
 
     fn matches(&self, values: FieldValues) -> bool {
@@ -807,7 +941,7 @@ mod tests {
     match month {
       1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
       4 | 6 | 9 | 11 => 30,
-      2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+      2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => 29,
       2 => 28,
       _ => 0,
     }

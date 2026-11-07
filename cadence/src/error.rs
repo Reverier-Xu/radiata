@@ -48,7 +48,10 @@ pub struct ParseError {
 
 impl ParseError {
   pub(crate) fn new(kind: ParseErrorKind, detail: impl Into<String>) -> Self {
-    Self { kind, detail: detail.into() }
+    Self {
+      kind,
+      detail: detail.into(),
+    }
   }
 
   /// The failure category.
@@ -64,7 +67,11 @@ impl ParseError {
 
 impl fmt::Display for ParseError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "invalid cadence pattern ({}): {}", self.kind, self.detail)
+    write!(
+      f,
+      "invalid cadence pattern ({}): {}",
+      self.kind, self.detail
+    )
   }
 }
 

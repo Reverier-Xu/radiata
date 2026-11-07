@@ -21,12 +21,42 @@ pub(crate) struct FieldDomain {
 }
 
 impl FieldDomain {
-  pub(crate) const YEAR: Self = Self { name: "year", digits: 4, min: 0, max: 9999 };
-  pub(crate) const MONTH: Self = Self { name: "month", digits: 2, min: 1, max: 12 };
-  pub(crate) const DAY: Self = Self { name: "day", digits: 2, min: 1, max: 31 };
-  pub(crate) const HOUR: Self = Self { name: "hour", digits: 2, min: 0, max: 23 };
-  pub(crate) const MINUTE: Self = Self { name: "minute", digits: 2, min: 0, max: 59 };
-  pub(crate) const SECOND: Self = Self { name: "second", digits: 2, min: 0, max: 59 };
+  pub(crate) const YEAR: Self = Self {
+    name: "year",
+    digits: 4,
+    min: 0,
+    max: 9999,
+  };
+  pub(crate) const MONTH: Self = Self {
+    name: "month",
+    digits: 2,
+    min: 1,
+    max: 12,
+  };
+  pub(crate) const DAY: Self = Self {
+    name: "day",
+    digits: 2,
+    min: 1,
+    max: 31,
+  };
+  pub(crate) const HOUR: Self = Self {
+    name: "hour",
+    digits: 2,
+    min: 0,
+    max: 23,
+  };
+  pub(crate) const MINUTE: Self = Self {
+    name: "minute",
+    digits: 2,
+    min: 0,
+    max: 59,
+  };
+  pub(crate) const SECOND: Self = Self {
+    name: "second",
+    digits: 2,
+    min: 0,
+    max: 59,
+  };
 }
 
 /// A compiled per-field selection set.
@@ -52,12 +82,18 @@ impl FieldSet {
   pub(crate) fn parse(text: &str, domain: FieldDomain) -> Result<(Self, &str)> {
     if let Some(rest) = text.strip_prefix('{') {
       let end = rest.find('}').ok_or_else(|| {
-        ParseError::new(ParseErrorKind::Skeleton, format!("unterminated set in {} field", domain.name))
+        ParseError::new(
+          ParseErrorKind::Skeleton,
+          format!("unterminated set in {} field", domain.name),
+        )
       })?;
       let set = Self::parse_set(&rest[..end], domain)?;
       Ok((set, &rest[end + 1..]))
     } else {
-      let digits = text.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+      let digits = text
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
       if digits == 0 {
         return Err(ParseError::new(
           ParseErrorKind::Skeleton,
@@ -69,7 +105,9 @@ impl FieldSet {
           ParseErrorKind::DigitCount,
           format!(
             "{} field: {:?} must have exactly {} digits",
-            domain.name, &text[..digits], domain.digits
+            domain.name,
+            &text[..digits],
+            domain.digits
           ),
         ));
       }
@@ -128,7 +166,10 @@ impl FieldSet {
   /// Parses one set element: a literal or an inclusive `low-high` range.
   fn parse_element(element: &str, domain: FieldDomain) -> Result<(u16, u16)> {
     let (low, high) = match element.split_once('-') {
-      Some((low, high)) => (Self::parse_number(low, domain)?, Self::parse_number(high, domain)?),
+      Some((low, high)) => (
+        Self::parse_number(low, domain)?,
+        Self::parse_number(high, domain)?,
+      ),
       None => {
         let value = Self::parse_number(element, domain)?;
         (value, value)
@@ -154,11 +195,16 @@ impl FieldSet {
         ),
       ));
     }
-    let value = text.bytes().fold(0u32, |acc, byte| acc * 10 + u32::from(byte - b'0'));
+    let value = text
+      .bytes()
+      .fold(0u32, |acc, byte| acc * 10 + u32::from(byte - b'0'));
     if value < u32::from(domain.min) || value > u32::from(domain.max) {
       return Err(ParseError::new(
         ParseErrorKind::Domain,
-        format!("{} field: {value} outside {}-{}", domain.name, domain.min, domain.max),
+        format!(
+          "{} field: {value} outside {}-{}",
+          domain.name, domain.min, domain.max
+        ),
       ));
     }
     Ok(value as u16)
@@ -166,7 +212,12 @@ impl FieldSet {
 
   fn empty(domain: FieldDomain) -> Self {
     let words = usize::from(domain.max) / 64 + 1;
-    Self { domain, wildcard: false, bare: false, mask: vec![0; words] }
+    Self {
+      domain,
+      wildcard: false,
+      bare: false,
+      mask: vec![0; words],
+    }
   }
 
   fn single(domain: FieldDomain, value: u16) -> Self {
@@ -283,7 +334,10 @@ mod tests {
   fn sets_coalesce_into_sorted_runs() {
     assert_eq!(canonical("{09-12,03}", FieldDomain::MONTH), "{03,09-12}");
     assert_eq!(canonical("{01-03,03-05}", FieldDomain::MONTH), "{01-05}");
-    assert_eq!(canonical("{30,00-05,20}", FieldDomain::SECOND), "{00-05,20,30}");
+    assert_eq!(
+      canonical("{30,00-05,20}", FieldDomain::SECOND),
+      "{00-05,20,30}"
+    );
     assert_eq!(canonical("{03-03}", FieldDomain::DAY), "{03}");
     assert_eq!(canonical("{10,11,12}", FieldDomain::MONTH), "{10-12}");
   }
@@ -303,13 +357,30 @@ mod tests {
       ("{00-31}", FieldDomain::DAY, ParseErrorKind::Domain),
       ("32", FieldDomain::DAY, ParseErrorKind::Domain),
       ("13", FieldDomain::MONTH, ParseErrorKind::Domain),
-      ("10000", FieldDomain::YEAR, ParseErrorKind::DigitCount),      ("{05-02}", FieldDomain::MONTH, ParseErrorKind::RangeOrder),
+      ("10000", FieldDomain::YEAR, ParseErrorKind::DigitCount),
+      ("{05-02}", FieldDomain::MONTH, ParseErrorKind::RangeOrder),
       ("{,}", FieldDomain::MONTH, ParseErrorKind::DigitCount),
       ("{05,}", FieldDomain::MONTH, ParseErrorKind::DigitCount),
-      ("{05,05}", FieldDomain::MONTH, ParseErrorKind::DuplicateElement),
-      ("{05,05-05}", FieldDomain::MONTH, ParseErrorKind::DuplicateElement),
-      ("{01-05,03}", FieldDomain::MONTH, ParseErrorKind::DuplicateElement),
-      ("{*,*}", FieldDomain::MONTH, ParseErrorKind::DuplicateElement),
+      (
+        "{05,05}",
+        FieldDomain::MONTH,
+        ParseErrorKind::DuplicateElement,
+      ),
+      (
+        "{05,05-05}",
+        FieldDomain::MONTH,
+        ParseErrorKind::DuplicateElement,
+      ),
+      (
+        "{01-05,03}",
+        FieldDomain::MONTH,
+        ParseErrorKind::DuplicateElement,
+      ),
+      (
+        "{*,*}",
+        FieldDomain::MONTH,
+        ParseErrorKind::DuplicateElement,
+      ),
       ("{05 05}", FieldDomain::MONTH, ParseErrorKind::DigitCount),
       ("{0x}", FieldDomain::MONTH, ParseErrorKind::DigitCount),
     ];
