@@ -235,13 +235,163 @@ impl CoreTaskKind {
 
   /// The execution-slot channel the verb draws from. Declared onto the
   /// reconciler registration channel by `register_default` (see
-  /// [`core_task_policies`]); never derived at dispatch time.
+  /// [`core_task_policies`]); never derived at dispatch time. The match
+  /// is exhaustive: a new core verb must declare its class here, so a
+  /// forgotten entry is a compile error, never a silent default.
   pub(crate) const fn slot_class(self) -> SlotClass {
     match self {
       Self::Join | Self::Connect => SlotClass::Network,
-      _ => SlotClass::Local,
+      Self::Leave
+      | Self::Disconnect
+      | Self::Revoke
+      | Self::PurgeRevocation
+      | Self::Cleanup
+      | Self::IssueCleanupCheckpoint
+      | Self::ResolveFrozenJournal
+      | Self::Listen
+      | Self::StopListener
+      | Self::PutResource
+      | Self::DeleteResource
+      | Self::PatchNodeMetadata
+      | Self::IssueCredential
+      | Self::RotateCredential
+      | Self::StartRecovery
+      | Self::ApplyReceiptRetention
+      | Self::SyncRound => SlotClass::Local,
     }
   }
+
+  /// The retry classification the verb's schedule rides. Declared onto
+  /// the reconciler registration channel by `register_default` (see
+  /// [`core_task_policies`]); never derived at dispatch time. The match
+  /// is exhaustive: a new core verb must declare its class here, so a
+  /// forgotten entry is a compile error, never a silent degradation to
+  /// one-attempt-no-retry.
+  pub(crate) const fn retry_class(self) -> RetryClass {
+    match self {
+      Self::Join | Self::Connect => RetryClass::Network,
+      Self::Leave
+      | Self::Disconnect
+      | Self::Revoke
+      | Self::PurgeRevocation
+      | Self::Cleanup
+      | Self::IssueCleanupCheckpoint
+      | Self::ResolveFrozenJournal
+      | Self::Listen
+      | Self::StopListener
+      | Self::PutResource
+      | Self::DeleteResource
+      | Self::PatchNodeMetadata
+      | Self::IssueCredential
+      | Self::RotateCredential
+      | Self::StartRecovery
+      | Self::ApplyReceiptRetention
+      | Self::SyncRound => RetryClass::Once,
+    }
+  }
+
+  /// The coalescing rule the verb's admission applies. Declared onto the
+  /// reconciler registration channel by `register_default` (see
+  /// [`core_task_policies`]); never derived at dispatch time. The match
+  /// is exhaustive: a new core verb must declare its rule here, so a
+  /// forgotten entry is a compile error, never a silent degradation to
+  /// no-coalescing (or a coalescing shape the admission never checks).
+  pub(crate) const fn coalescing(self) -> Coalescing {
+    match self {
+      Self::Connect => Coalescing::PeerDial,
+      Self::Disconnect | Self::PurgeRevocation | Self::Cleanup => Coalescing::Peer,
+      Self::Revoke => Coalescing::RevokeKey,
+      Self::Join
+      | Self::Leave
+      | Self::IssueCleanupCheckpoint
+      | Self::ResolveFrozenJournal
+      | Self::Listen
+      | Self::StopListener
+      | Self::PutResource
+      | Self::DeleteResource
+      | Self::PatchNodeMetadata
+      | Self::IssueCredential
+      | Self::RotateCredential
+      | Self::StartRecovery
+      | Self::ApplyReceiptRetention
+      | Self::SyncRound => Coalescing::None,
+    }
+  }
+
+  /// The verb's full declared execution policy: the single record the
+  /// registration channel installs (see [`core_task_policies`]) and the
+  /// admission resolves.
+  pub(crate) const fn policy(self) -> TaskReconcilePolicy {
+    TaskReconcilePolicy {
+      slot_class: self.slot_class(),
+      drains_on_shutdown: self.drains_on_shutdown(),
+      retry_class: self.retry_class(),
+      coalescing: self.coalescing(),
+    }
+  }
+}
+
+/// The retry classification behind a kind's bounded schedule: which
+/// typed error categories may retry. The taxonomy is the crate's own
+/// verbatim — e.g. an unspread binding (`NotFound`) is a retryable
+/// convergence state for a network dial, while
+/// `AuthenticationFailed`/`Revoked` are the documented terminal dial
+/// contract. Declared per kind on the reconciler registration channel
+/// (see [`core_task_policies`]); the manager derives the schedule from
+/// the admission-resolved record, never from the tag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetryClass {
+  /// Join/connect dials: convergence and transport transients retry.
+  Network,
+  /// Caller-registered custom kinds: a returned `Err` never re-arms the
+  /// schedule (the reconciler's explicit `Retry` decision is the only
+  /// re-arm path — see the manager's `EffectOutcome::Retry`), so the
+  /// class itself treats every error as terminal.
+  Extension,
+  /// Everything else: one attempt, no retry.
+  Once,
+}
+
+impl RetryClass {
+  /// Whether a returned error of this kind may re-arm the schedule
+  /// under this class.
+  pub(crate) const fn retryable(self, kind: ErrorKind) -> bool {
+    match self {
+      RetryClass::Network => matches!(
+        kind,
+        ErrorKind::NotFound
+          | ErrorKind::NotReady
+          | ErrorKind::Io
+          | ErrorKind::Overloaded
+          | ErrorKind::RouteUnavailable
+          | ErrorKind::StreamInterrupted
+      ),
+      RetryClass::Extension | RetryClass::Once => false,
+    }
+  }
+}
+
+/// The coalescing rule a kind's registration declares: whether one
+/// subject's in-flight task admits later same-intent submissions, and
+/// which payload shape carries that subject. Declared per kind on the
+/// reconciler registration channel (see [`core_task_policies`]); the
+/// manager derives the admission shape check and the coalescing key
+/// from the resolved record, never from the tag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Coalescing {
+  /// The kind never coalesces: every admission is a fresh task.
+  None,
+  /// Coalesces on the dialed peer; the payload is the whole dial intent
+  /// (the manager's `TaskPayload::PeerDial`), so a coalesced submission
+  /// may only join a dial to the same endpoint.
+  PeerDial,
+  /// Coalesces on the acted-on peer (the manager's
+  /// `TaskPayload::Peer`).
+  Peer,
+  /// Coalesces on the revoke subject; the pinned expected key rides the
+  /// payload (the manager's `TaskPayload::Revoke`) and is part of the
+  /// compared intent.
+  RevokeKey,
 }
 
 /// Which of the task manager's execution-slot channels a kind draws
@@ -271,12 +421,16 @@ pub(crate) enum SlotClass {
 }
 
 /// The execution policy a task kind's registration declares: the slot
-/// class its effect draws from plus whether the shutdown drain awaits
-/// it to terminality. The policy rides the reconciler registration
-/// (the core verbs declare theirs through the same channel in
+/// class its effect draws from, whether the shutdown drain awaits it to
+/// terminality, the retry classification its schedule rides, and the
+/// coalescing rule its admission applies. The policy rides the
+/// reconciler registration (the core verbs declare theirs through the
+/// same channel in
 /// [`ExtensionRegistry::register_default`](crate::ExtensionRegistry::register_default),
 /// see [`core_task_policies`]); it is never derived from the tag being
-/// a core verb.
+/// a core verb. Every per-kind behavior the manager dispatches on —
+/// slot routing, the shutdown drain, the retry schedule, and the
+/// coalescing shape/key — reads this one admission-resolved record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TaskReconcilePolicy {
   /// The execution-slot channel the kind's effect draws from (see
@@ -291,14 +445,23 @@ pub(crate) struct TaskReconcilePolicy {
   /// before teardown completes. Every other kind's effect may exit
   /// mid-flight, leaving the task non-terminal for the process.
   pub(crate) drains_on_shutdown: bool,
+  /// The retry classification the kind's bounded schedule rides (see
+  /// [`RetryClass`]).
+  pub(crate) retry_class: RetryClass,
+  /// The coalescing rule the kind's admission applies (see
+  /// [`Coalescing`]).
+  pub(crate) coalescing: Coalescing,
 }
 
 impl TaskReconcilePolicy {
   /// The extension policy every caller-registered kind declares: its
-  /// own slot channel, cancelled on shutdown.
+  /// own slot channel, cancelled on shutdown, with the reconciler-owned
+  /// retry semantics and no coalescing.
   pub(crate) const EXTENSION: Self = Self {
     slot_class: SlotClass::Extension,
     drains_on_shutdown: false,
+    retry_class: RetryClass::Extension,
+    coalescing: Coalescing::None,
   };
 }
 
@@ -308,13 +471,10 @@ impl TaskReconcilePolicy {
 /// kind never appears here — its registration declares
 /// [`TaskReconcilePolicy::EXTENSION`].
 pub(crate) fn core_task_policies() -> impl Iterator<Item = (TaskKind, TaskReconcilePolicy)> {
-  CORE_TASK_KINDS.iter().copied().map(|core| {
-    let policy = TaskReconcilePolicy {
-      slot_class: core.slot_class(),
-      drains_on_shutdown: core.drains_on_shutdown(),
-    };
-    (core.tag(), policy)
-  })
+  CORE_TASK_KINDS
+    .iter()
+    .copied()
+    .map(|core| (core.tag(), core.policy()))
 }
 
 /// The task phase machine. `Succeeded` and `Failed` are terminal; no
@@ -1437,9 +1597,9 @@ mod tests {
   };
 
   use super::{
-    CORE_TASK_KINDS, CoreTaskKind, ObservationLanes, ResourceHook, SlotClass,
-    TASK_OBSERVATION_INBOX, TaskKind, TaskReconcilePolicy, TaskTable, core_task_policies, lane_of,
-    notify_resource_observers,
+    CORE_TASK_KINDS, Coalescing, CoreTaskKind, ObservationLanes, ResourceHook, RetryClass,
+    SlotClass, TASK_OBSERVATION_INBOX, TaskKind, TaskReconcilePolicy, TaskTable,
+    core_task_policies, lane_of, notify_resource_observers,
   };
   use crate::{ErrorKind, NodeId, Result, TaskId};
 
@@ -1477,6 +1637,23 @@ mod tests {
           core,
           CoreTaskKind::Leave | CoreTaskKind::ResolveFrozenJournal
         )
+      );
+      assert_eq!(
+        policy.retry_class,
+        match core {
+          CoreTaskKind::Join | CoreTaskKind::Connect => RetryClass::Network,
+          _ => RetryClass::Once,
+        }
+      );
+      assert_eq!(
+        policy.coalescing,
+        match core {
+          CoreTaskKind::Connect => Coalescing::PeerDial,
+          CoreTaskKind::Disconnect | CoreTaskKind::PurgeRevocation | CoreTaskKind::Cleanup =>
+            Coalescing::Peer,
+          CoreTaskKind::Revoke => Coalescing::RevokeKey,
+          _ => Coalescing::None,
+        }
       );
     }
   }

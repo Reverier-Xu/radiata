@@ -880,30 +880,31 @@ pub(super) struct Supervisor {
 /// degree-maintenance worker need to run OFF the supervisor's select loop,
 /// because slow storage or a slow policy resolution must
 /// never park control-plane reads and packet admission behind a tick.
-/// Built once per incarnation by [`Supervisor::tick_state`] from the same
-/// Arc-held collaborators the supervisor reads, so the workers observe the
-/// one truth per field — no second controller, cache, or session table.
+/// Built once per incarnation by [`Supervisor::tick_state`] from the one
+/// Arc-held operation-deps handle plus the tick-local counters, so the
+/// workers observe the one truth per collaborator — no second
+/// controller, cache, or session table.
 /// Mutation is confined to atomics and the briefly-held controller mutex,
 /// so every method takes `&self` and both workers share one `Arc<TickState>`.
 pub(super) struct TickState {
-  pub(super) context: Arc<LocalIdentityContext>,
-  pub(super) config: NodeConfig,
-  pub(super) entropy: Arc<dyn crate::api::Entropy>,
+  /// The node-shared operation planes behind one Arc handle: the
+  /// identity context, the calibrated config, the entropy source, the
+  /// session table, the driver, the packet context, the connection-task
+  /// registry, the recovery controller, and the exclusion cache are read
+  /// through it (see the accessors below) — the same instances the
+  /// supervisor and the verb effects share, so the workers observe the
+  /// one truth per collaborator.
+  pub(super) operations: Arc<super::task_effects::OperationDeps>,
   pub(super) extensions: Arc<ExtensionRegistry>,
-  pub(super) sessions: crate::session::stream::SessionTable,
   pub(super) events: Arc<crate::node::EventHub>,
-  /// The tracked connection tasks the recovery tick reaps (bounded task
-  /// accounting shared with the shutdown path).
-  pub(super) connection_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-  pub(super) driver: SessionDriver,
-  pub(super) packet: Arc<SessionPacketContext>,
   /// The graceful-shutdown signal: each worker clones its receiver and
   /// exits cooperatively; the abort in `into_dependencies` is the
   /// backstop for a mid-tick stall.
   pub(super) shutdown: watch::Receiver<()>,
-  /// The recovery controller (the same instance the supervisor's read
-  /// view locks).
-  pub(super) recovery: Arc<std::sync::Mutex<crate::membership::recovery::RecoveryController>>,
+  /// The approximate live durable trace-record population the trace
+  /// retention sweep decrements (the same counter the observability
+  /// view reads).
+  pub(super) trace_records: Arc<std::sync::atomic::AtomicUsize>,
   /// In-flight recovery dials: bounds the isolated node's dial fan-out
   /// (the counter bounds in-flight dials, not lifetime volume).
   pub(super) recovery_pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -933,13 +934,61 @@ pub(super) struct TickState {
   /// the recovery worker mutates it; a racing read at worst shifts one
   /// cut by one tick.
   pub(super) prune_cooldown: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl TickState {
+  /// The opened identity context (through the operation planes).
+  pub(super) fn context(&self) -> &Arc<LocalIdentityContext> {
+    &self.operations.planes().context
+  }
+
+  /// The calibrated node configuration (through the operation planes).
+  pub(super) fn config(&self) -> &NodeConfig {
+    &self.operations.planes().config
+  }
+
+  /// The node's entropy source (through the operation planes).
+  pub(super) fn entropy(&self) -> &Arc<dyn crate::api::Entropy> {
+    &self.operations.planes().entropy
+  }
+
+  /// The live authenticated sessions (through the operation planes).
+  pub(super) fn sessions(&self) -> &SessionTable {
+    &self.operations.planes().sessions
+  }
+
+  /// The session driver (through the operation planes).
+  pub(super) fn driver(&self) -> &SessionDriver {
+    &self.operations.planes().driver
+  }
+
+  /// The node-shared packet context (through the operation planes).
+  pub(super) fn packet(&self) -> &Arc<SessionPacketContext> {
+    &self.operations.planes().packet
+  }
+
+  /// The tracked connection tasks the recovery tick reaps (through the
+  /// operation planes).
+  pub(super) fn connection_tasks(
+    &self,
+  ) -> &Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> {
+    &self.operations.planes().connection_tasks
+  }
+
+  /// The recovery controller (the same instance the supervisor's read
+  /// view locks; through the operation planes).
+  pub(super) fn recovery(
+    &self,
+  ) -> &Arc<std::sync::Mutex<crate::membership::recovery::RecoveryController>> {
+    &self.operations.planes().recovery
+  }
+
   /// The departed-members exclusion cache (the same instance the
-  /// supervisor's member pages memoize through).
-  pub(super) exclusion_cache: super::recovery::ExclusionCache,
-  /// The approximate live durable trace-record population the trace
-  /// retention sweep decrements (the same counter the observability
-  /// view reads).
-  pub(super) trace_records: Arc<std::sync::atomic::AtomicUsize>,
+  /// supervisor's member pages memoize through; through the operation
+  /// planes).
+  pub(super) fn exclusion_cache(&self) -> &super::recovery::ExclusionCache {
+    &self.operations.planes().exclusion_cache
+  }
 }
 
 /// Builds the node-shared packet context (single construction site):
@@ -1054,15 +1103,11 @@ impl Supervisor {
         dependencies,
       )));
     };
-    let (packet, shutdown_tx, exclusion_cache, published_endpoints) = match operations.planes() {
-      Ok(planes) => (
-        Arc::clone(&planes.packet),
-        planes.shutdown.clone(),
-        Arc::clone(&planes.exclusion_cache),
-        Arc::clone(&planes.published_endpoints),
-      ),
-      Err(error) => return Err(Box::new((error, dependencies))),
-    };
+    let planes = operations.planes();
+    let packet = Arc::clone(&planes.packet);
+    let shutdown_tx = planes.shutdown.clone();
+    let exclusion_cache = Arc::clone(&planes.exclusion_cache);
+    let published_endpoints = Arc::clone(&planes.published_endpoints);
     let route_capacity = dependencies.config.trace_metadata_limits().active();
     // The durable trace sink was constructed with the packet context (one
     // construction site) and is read back here: the origin pump's terminal
@@ -1088,15 +1133,7 @@ impl Supervisor {
       dependencies.member_revision.clone(),
       dependencies.reconcile.clone(),
     ));
-    let recovery = {
-      let Ok(planes) = operations.planes() else {
-        return Err(Box::new((
-          Error::internal("runtime operations"),
-          dependencies,
-        )));
-      };
-      std::sync::Arc::clone(&planes.recovery)
-    };
+    let recovery = std::sync::Arc::clone(&operations.planes().recovery);
     Ok(Self {
       dependencies,
       shutdown_tx,
@@ -1111,30 +1148,23 @@ impl Supervisor {
     })
   }
 
-  /// Builds the periodic planes' shared state (see [`TickState`]):
-  /// clones of the Arc-held collaborators this supervisor already
-  /// reads, plus a fresh shutdown subscription and the tick-local
-  /// counters. Called exactly once by `supervise` when it spawns the two
-  /// tick workers.
+  /// Builds the periodic planes' shared state (see [`TickState`]): the
+  /// one Arc handle to the node-shared operation planes, a fresh
+  /// shutdown subscription, and the tick-local counters. Called exactly
+  /// once by `supervise` when it spawns the two tick workers.
   pub(super) fn tick_state(&self) -> Result<TickState> {
-    let planes = self
+    let operations = self
       .dependencies
       .operations
       .as_ref()
       .ok_or_else(|| Error::internal("runtime operations"))?
-      .planes()?;
+      .clone();
     Ok(TickState {
-      context: Arc::clone(&planes.context),
-      config: planes.config.clone(),
-      entropy: Arc::clone(&planes.entropy),
+      operations,
       extensions: Arc::clone(&self.dependencies.extensions),
-      sessions: planes.sessions.clone(),
       events: Arc::clone(&self.dependencies.events),
-      connection_tasks: Arc::clone(&planes.connection_tasks),
-      driver: planes.driver.clone(),
-      packet: Arc::clone(&planes.packet),
       shutdown: self.shutdown_tx.subscribe(),
-      recovery: Arc::clone(&self.recovery),
+      trace_records: Arc::clone(&self.trace_records),
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       endpoint_attempts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -1143,8 +1173,6 @@ impl Supervisor {
       )),
       probe_ledger: std::sync::Mutex::new(super::degree::ProbeLedger::default()),
       prune_cooldown: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-      exclusion_cache: Arc::clone(&self.exclusion_cache),
-      trace_records: Arc::clone(&self.trace_records),
     })
   }
 
@@ -1878,7 +1906,6 @@ mod admission_loop_tests {
       .as_ref()
       .expect("operation handles")
       .planes()
-      .expect("planes")
       .leave_signal
       .clone();
     let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
