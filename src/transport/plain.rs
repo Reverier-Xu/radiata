@@ -54,6 +54,13 @@ impl Transport for PlainTransport {
     let admission = self.admission();
     Box::pin(async move {
       let base = TcpListenerBase::bind(&endpoint, TransportScheme::Tcp).await?;
+      // One unconditional runtime signal that the plaintext channel is
+      // live: the module docs own the standing guidance, but an operator
+      // watching logs never sees a silent `tcp://` bind.
+      tracing::warn!(
+        bound = %base.local_endpoint(),
+        "plaintext tcp:// listener bound: the channel provides no confidentiality or integrity; the session handshake still authenticates both endpoints"
+      );
       let rules = connection_frame_rules()?;
       Ok(Box::new(PlainListener {
         base,

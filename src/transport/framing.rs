@@ -182,19 +182,12 @@ async fn read_data(
     usize::try_from(prelude.body_len()).map_err(|_| Error::invalid_input("wire body length"))?;
   let mut body = vec![0_u8; body_len];
   read_exact(read, &mut body).await?;
-  tracing::trace!(
-    schema_id = prelude.schema_id(),
-    kind_id = prelude.kind_id(),
-    flags = prelude.flags(),
-    body_len,
-    "wire message received"
-  );
-  Ok(RawFrame::Data(Message {
-    schema_id: prelude.schema_id(),
-    kind_id: prelude.kind_id(),
-    flags: prelude.flags(),
+  Ok(RawFrame::Data(Message::from_parts(
+    prelude.schema_id(),
+    prelude.kind_id(),
+    prelude.flags(),
     body,
-  }))
+  )))
 }
 
 /// Reads the single hint frame payload. A truncated or malformed hint
