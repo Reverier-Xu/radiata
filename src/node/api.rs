@@ -568,9 +568,16 @@ impl Triggers {
 
   /// Registers one time trigger: `pattern` is the cadence pattern text,
   /// `target` the qualified tag of a registered caller-owned task
-  /// reconciler. Re-registering the same name with the same declaration
-  /// is a no-op; a different declaration for a live name conflicts
-  /// (remove first).
+  /// reconciler. Re-registering an existing name REPLACES its
+  /// declaration (a documented overwrite — the new pattern and target
+  /// take over; callers never need `remove` to change a declaration).
+  /// The row's watermark is monotone across replacements: a
+  /// time-over-time replacement keeps the LATER of the existing and the
+  /// new watermark, so a re-registration never moves the due window
+  /// earlier than progress the name already covered (a replacement
+  /// across source kinds carries no watermark and overwrites
+  /// outright). `wait()` resolves only after the durable write landed;
+  /// a registration that keeps losing commit races fails typed.
   pub async fn register_time(
     self, name: &str, pattern: &str, target: crate::QualifiedTag,
   ) -> Result<Task<()>> {
@@ -583,7 +590,10 @@ impl Triggers {
   /// Registers one event trigger: `predicate` filters the live resource
   /// change stream (the same emit-side evaluation the watch
   /// subscriptions use), `target` the qualified tag of a registered
-  /// caller-owned task reconciler.
+  /// caller-owned task reconciler. Re-registering an existing name
+  /// REPLACES its declaration (a documented overwrite); `wait()`
+  /// resolves only after the durable write landed, and a registration
+  /// that keeps losing commit races fails typed.
   pub async fn register_event(
     self, name: &str, predicate: crate::SubscriptionPredicate, target: crate::QualifiedTag,
   ) -> Result<Task<()>> {
@@ -593,8 +603,13 @@ impl Triggers {
     crate::runtime::register_trigger(&client, row).await
   }
 
-  /// Removes one trigger declaration by name. Idempotent: removing an
-  /// absent name succeeds.
+  /// Removes one trigger declaration by name. Idempotent: an absent
+  /// name succeeds, and so does a removal whose conditional commit
+  /// loses a race to a concurrent removal (the name is absent
+  /// afterwards, which is the contract). A name that keeps being
+  /// re-registered under the removal re-drives bounded and then fails
+  /// typed — the caller learns a live declaration still carries the
+  /// name instead of a silent false success.
   pub async fn remove(self, name: &str) -> Result<Task<()>> {
     let client = self.admit_client().await?;
     crate::runtime::remove_trigger(&client, name.to_owned()).await

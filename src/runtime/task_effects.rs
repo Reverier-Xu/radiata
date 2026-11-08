@@ -1572,9 +1572,11 @@ fn trace_live_records(deps: &OperationDeps) -> Result<&std::sync::atomic::Atomic
 
 /// Admits one trigger declaration registration: the caller-built row
 /// (the facade has already validated the pattern frame and the target
-/// reconciler) persists durably through the core-verb entry. One
-/// attempt, no coalescing, cancellable — the registration is an
-/// idempotent conditional put the caller re-drives on failure.
+/// reconciler) persists durably through the core-verb entry — a
+/// replace-with-monotone-watermark write whose commit verdict is
+/// fail-closed (see `crate::trigger::put_trigger_row_ctx`). One
+/// attempt, no coalescing, cancellable — the caller re-drives a typed
+/// failure.
 pub(crate) async fn register_trigger(
   tasks: &TaskClient, row: crate::trigger::TriggerRow,
 ) -> Result<Task<()>> {
@@ -1603,8 +1605,12 @@ pub(crate) async fn register_trigger(
   ))
 }
 
-/// Admits one trigger declaration removal by name. Idempotent: removing
-/// an absent name succeeds.
+/// Admits one trigger declaration removal by name. Idempotent: an
+/// absent name succeeds, and so does a removal whose conditional
+/// commit loses a race to a concurrent removal; a name that keeps
+/// being re-registered under the removal re-drives bounded in the
+/// store write and then fails typed (see
+/// `crate::trigger::remove_trigger_ctx`).
 pub(crate) async fn remove_trigger(tasks: &TaskClient, name: String) -> Result<Task<()>> {
   let effect: TaskEffect = Arc::new(move |deps, _attempt| {
     let name = name.clone();

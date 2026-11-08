@@ -35,7 +35,8 @@ use radiata_cadence::{Offset, Pattern, field_values_to_system_time, system_time_
 use tokio::sync::mpsc;
 
 use crate::{
-  Error, Result, StoreKey, StoreNamespace, StoreOperation, StoreValue, SubscriptionPredicate,
+  Error, ProviderErrorContext, ProviderErrorKind, Result, StoreExpectation, StoreKey,
+  StoreNamespace, StoreOperation, StoreValue, SubscriptionPredicate,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   protocol::{CborLimits, QualifiedTag, decode_canonical_strict, encode_canonical},
@@ -406,69 +407,229 @@ fn fire_seconds(values: &radiata_cadence::FieldValues, frame: Offset) -> u64 {
     .unwrap_or(0)
 }
 
-/// Persists one trigger row through the core-verb entry: an idempotent
-/// conditional put (identical bytes are a no-op, a raced divergent write
-/// conflicts and the caller's error surfaces typed).
+/// The bounded re-drive budget for a registration or removal whose
+/// conditional commit lost an optimistic-concurrency race: each retry
+/// re-reads the current row and re-derives the operation against it, so
+/// a bounded burst of racing writers still converges; past the budget
+/// the caller's error surfaces typed (the crate's conflict convention —
+/// a lost race is a definitive did-not-land, never a silent success).
+const ROW_COMMIT_ATTEMPTS: usize = 4;
+
+/// Persists one trigger declaration through the core-verb entry: the
+/// registration write behind `register-trigger`.
+///
+/// Semantics: re-registering an existing name REPLACES its declaration
+/// (a documented overwrite — callers never need `remove` to change a
+/// declaration), with one monotonicity rule merged in at this write:
+/// a time-over-time replacement's watermark is the LATER of the existing
+/// and the new watermark, so a re-registration can never move a due
+/// window earlier and replay runs the old declaration already covered.
+/// A replacement across source kinds (time ↔ event) carries no watermark
+/// and overwrites outright.
+///
+/// The write is an idempotent conditional put (identical bytes are a
+/// no-op) under the store's writer permit, and the commit verdict is
+/// fail-closed like every core writer (see
+/// `crate::provider::commit_verdict`): a lost optimistic-concurrency
+/// race is re-driven against a fresh snapshot within
+/// [`ROW_COMMIT_ATTEMPTS`] and otherwise surfaces as the typed conflict
+/// — the caller's `wait()` never resolves success for a put that did
+/// not land.
 pub(crate) async fn put_trigger_row_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, row: &TriggerRow,
 ) -> Result<()> {
   let namespace = namespace()?;
   let key = trigger_key(row.name());
-  let value = StoreValue::new(Arc::from(row.encode()?));
   let _permit = store.write_permit().await;
-  let snapshot = store.snapshot().await?;
-  if let Some(existing) = snapshot.get(&namespace, &key).await?
-    && existing.as_bytes() == value.as_bytes()
-  {
-    return Ok(());
+  for _ in 0..ROW_COMMIT_ATTEMPTS {
+    let snapshot = store.snapshot().await?;
+    let stored = snapshot.get(&namespace, &key).await?;
+    // The merged declaration: the caller's row, with a time-over-time
+    // replacement's watermark held at the later of the two. A corrupt
+    // stored row is hygiene, not a declaration: the registration
+    // overwrites it outright (the repair path).
+    let decoded = match stored
+      .as_ref()
+      .map(|value| TriggerRow::decode(value.as_bytes()))
+    {
+      Some(Ok(existing)) => Some(existing),
+      Some(Err(_)) => {
+        tracing::warn!(trigger = row.name(), "replacing an undecodable trigger row");
+        None
+      }
+      None => None,
+    };
+    let effective = decoded
+      .as_ref()
+      .map(|existing| merge_watermark(existing.clone(), row.clone()))
+      .unwrap_or_else(|| row.clone());
+    if decoded.as_ref() == Some(&effective) {
+      // The merge was an identity: the stored declaration and watermark
+      // already equal the caller's intent (a same-declaration
+      // re-registration whose watermark did not advance).
+      return Ok(());
+    }
+    let value = StoreValue::new(Arc::from(effective.encode()?));
+    let expected =
+      crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
+    let revision = snapshot.revision().clone();
+    drop(snapshot);
+    let transaction = store.prepare_core_verb_transaction(
+      crate::TransactionId::generate(entropy)?,
+      revision,
+      vec![StoreOperation::Put {
+        namespace: namespace.clone(),
+        key: key.clone(),
+        expected,
+        value,
+      }],
+    )?;
+    // The commit's outcome is deliberately not signaled to the
+    // anti-entropy plane: the trigger family is node-local and no lane
+    // owns its namespace, so there is nothing to rescan. The verdict
+    // itself is fail-closed: a lost race re-drives against the fresh
+    // snapshot (the loop's next round), past the budget it errors.
+    match store.commit(transaction).await? {
+      crate::CommitOutcome::Committed(_) => return Ok(()),
+      crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => continue,
+      crate::CommitOutcome::Unknown { .. } => {
+        return Err(Error::provider(
+          ProviderErrorKind::CommitUnknown,
+          ProviderErrorContext::StorageCommit,
+        ));
+      }
+    }
   }
-  let expected = crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
-  let revision = snapshot.revision().clone();
-  drop(snapshot);
-  let transaction = store.prepare_core_verb_transaction(
-    crate::TransactionId::generate(entropy)?,
-    revision,
-    vec![StoreOperation::Put {
-      namespace,
-      key,
-      expected,
-      value,
-    }],
-  )?;
-  // The commit's outcome is deliberately not signaled to the anti-entropy
-  // plane: the trigger family is node-local and no lane owns its
-  // namespace, so there is nothing to rescan.
-  store.commit(transaction).await?;
-  Ok(())
+  Err(Error::conflict("trigger registration race"))
 }
 
-/// Removes one trigger row by name. `false` when no row carried it.
+/// The watermark monotonicity rule of a declaration replacement: a
+/// time-over-time replacement keeps the later of the two watermarks;
+/// every other shape (a fresh name, an event row, a source-kind change)
+/// takes the new row outright.
+fn merge_watermark(existing: TriggerRow, replacement: TriggerRow) -> TriggerRow {
+  let merged = match (existing.source(), replacement.source()) {
+    (TriggerSource::Time { .. }, TriggerSource::Time { .. }) => replacement
+      .next_fire_seconds
+      .max(existing.next_fire_seconds),
+    _ => replacement.next_fire_seconds,
+  };
+  TriggerRow {
+    next_fire_seconds: merged,
+    ..replacement
+  }
+}
+
+/// Advances one time trigger's watermark past a pass's fire. The
+/// evaluation path's own write: unlike a registration replacement it
+/// never overwrites a declaration — if the row was re-declared (or
+/// removed) since the pass read it, the write is a no-op and the
+/// registration's own watermark governs. The watermark monotonicity is
+/// re-checked against the current row, and a lost race re-drives within
+/// [`ROW_COMMIT_ATTEMPTS`]; past the budget the typed conflict surfaces
+/// (the next pass re-fires — the fire contract stays at-least-once,
+/// never skips).
+pub(crate) async fn advance_trigger_watermark_ctx(
+  store: &MetadataStore, entropy: &dyn Entropy, observed: &TriggerRow, next_fire_seconds: u64,
+) -> Result<()> {
+  let namespace = namespace()?;
+  let key = trigger_key(observed.name());
+  let _permit = store.write_permit().await;
+  for _ in 0..ROW_COMMIT_ATTEMPTS {
+    let snapshot = store.snapshot().await?;
+    let Some(existing) = snapshot.get(&namespace, &key).await? else {
+      return Ok(());
+    };
+    let current = TriggerRow::decode(existing.as_bytes())?;
+    if current.source() != observed.source() || current.target() != observed.target() {
+      // The row was re-declared since the pass read it: the registration
+      // owns the declaration and its merged watermark now.
+      return Ok(());
+    }
+    if current.next_fire_seconds >= next_fire_seconds {
+      return Ok(());
+    }
+    let advanced = TriggerRow {
+      next_fire_seconds,
+      ..current
+    };
+    let value = StoreValue::new(Arc::from(advanced.encode()?));
+    let expected = StoreExpectation::Exact(existing.digest().clone());
+    let revision = snapshot.revision().clone();
+    drop(snapshot);
+    let transaction = store.prepare_core_verb_transaction(
+      crate::TransactionId::generate(entropy)?,
+      revision,
+      vec![StoreOperation::Put {
+        namespace: namespace.clone(),
+        key: key.clone(),
+        expected,
+        value,
+      }],
+    )?;
+    match store.commit(transaction).await? {
+      crate::CommitOutcome::Committed(_) => return Ok(()),
+      crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => continue,
+      crate::CommitOutcome::Unknown { .. } => {
+        return Err(Error::provider(
+          ProviderErrorKind::CommitUnknown,
+          ProviderErrorContext::StorageCommit,
+        ));
+      }
+    }
+  }
+  Err(Error::conflict("trigger watermark advance race"))
+}
+
+/// Removes one trigger declaration by name. Idempotent: an absent name
+/// succeeds, and a delete whose conditional commit loses a race to a
+/// concurrent removal succeeds too (the name is absent afterwards,
+/// which is the contract). A name that keeps being re-registered under
+/// the removal re-drives within [`ROW_COMMIT_ATTEMPTS`] and then fails
+/// typed — the caller learns a live declaration still carries the name
+/// instead of a silent false success.
 pub(crate) async fn remove_trigger_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, name: &str,
-) -> Result<bool> {
+) -> Result<()> {
   TriggerRow::validate_name(name)?;
   let namespace = namespace()?;
   let key = trigger_key(name);
   let _permit = store.write_permit().await;
+  for _ in 0..ROW_COMMIT_ATTEMPTS {
+    let snapshot = store.snapshot().await?;
+    let Some(existing) = snapshot.get(&namespace, &key).await? else {
+      return Ok(());
+    };
+    let revision = snapshot.revision().clone();
+    drop(snapshot);
+    let transaction = store.prepare_core_verb_transaction(
+      crate::TransactionId::generate(entropy)?,
+      revision,
+      vec![StoreOperation::Delete {
+        namespace: namespace.clone(),
+        key: key.clone(),
+        expected: existing.digest().clone(),
+      }],
+    )?;
+    match store.commit(transaction).await? {
+      crate::CommitOutcome::Committed(_) => return Ok(()),
+      crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => continue,
+      crate::CommitOutcome::Unknown { .. } => {
+        return Err(Error::provider(
+          ProviderErrorKind::CommitUnknown,
+          ProviderErrorContext::StorageCommit,
+        ));
+      }
+    }
+  }
+  // Past the re-drive budget: the name's presence decides the verdict —
+  // absent means a racing removal won (the contract holds), present
+  // means a racing registration keeps replacing it.
   let snapshot = store.snapshot().await?;
-  let Some(existing) = snapshot.get(&namespace, &key).await? else {
-    return Ok(false);
-  };
-  let revision = snapshot.revision().clone();
-  drop(snapshot);
-  let transaction = store.prepare_core_verb_transaction(
-    crate::TransactionId::generate(entropy)?,
-    revision,
-    vec![StoreOperation::Delete {
-      namespace,
-      key,
-      expected: existing.digest().clone(),
-    }],
-  )?;
-  Ok(matches!(
-    store.commit(transaction).await?,
-    crate::CommitOutcome::Committed(_)
-  ))
+  if snapshot.get(&namespace, &key).await?.is_none() {
+    return Ok(());
+  }
+  Err(Error::conflict("trigger removal race"))
 }
 
 /// Lists the stored trigger rows in canonical key order, bounded by
@@ -506,7 +667,7 @@ pub(crate) async fn evaluate_pass(
   let rows = list_trigger_rows_ctx(store).await?;
   let now = crate::time::now_seconds();
   let mut event_rows = BTreeMap::new();
-  let mut advanced: Vec<TriggerRow> = Vec::new();
+  let mut advanced: Vec<(TriggerRow, u64)> = Vec::new();
   for row in rows {
     match row.source() {
       TriggerSource::Event { predicate } => {
@@ -538,15 +699,8 @@ pub(crate) async fn evaluate_pass(
         }) {
           let start = now.saturating_add(1);
           let next_fire = next_fire_after(&pattern, start)?;
-          if next_fire != row.next_fire_seconds()
-            && let Ok(advanced_row) = TriggerRow::new(
-              row.name().to_owned(),
-              row.source().clone(),
-              row.target().clone(),
-              next_fire,
-            )
-          {
-            advanced.push(advanced_row);
+          if next_fire != row.next_fire_seconds() {
+            advanced.push((row.clone(), next_fire));
           }
         } else {
           tracing::warn!(
@@ -558,12 +712,13 @@ pub(crate) async fn evaluate_pass(
     }
   }
   state.replace_event_rows(event_rows);
-  // The watermark advances land after the scan is released, each an
-  // idempotent conditional put on the row's own read. A conflict or a
-  // store failure leaves the watermark due: the next pass re-fires
+  // The watermark advances land after the scan is released, each a
+  // drift-checked conditional put on the row's own read (never a
+  // declaration overwrite). A lost race re-drives bounded; a store
+  // failure leaves the watermark due: the next pass re-fires
   // (at-least-once), never skips.
-  for row in advanced {
-    if let Err(error) = put_trigger_row_ctx(store, entropy, &row).await {
+  for (row, next_fire) in advanced {
+    if let Err(error) = advance_trigger_watermark_ctx(store, entropy, &row, next_fire).await {
       tracing::warn!(kind = ?error.kind(), "trigger watermark advance failed");
     }
   }
@@ -577,6 +732,9 @@ mod tests {
     extension_registry::ExtensionRegistry, identity::testing::SequenceEntropy,
     storage::contract::ReferenceFactory,
   };
+
+  /// The every-second UTC test pattern: every wall-clock second matches.
+  const EVERY_TEST_SECOND: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
 
   fn entropy() -> SequenceEntropy {
     SequenceEntropy::default()
@@ -818,8 +976,9 @@ mod tests {
     assert_eq!(list_trigger_rows_ctx(&store).await.expect("rows").len(), 1);
   }
 
-  /// A registered time trigger persists durably, re-registers
-  /// idempotently, lists in key order, and removes by name.
+  /// A registered time trigger persists durably, re-registration
+  /// replaces the declaration without regressing the watermark, the
+  /// rows list in key order, and removal is idempotent by name.
   #[tokio::test]
   async fn trigger_rows_persist_list_and_remove() {
     let store = store().await;
@@ -845,9 +1004,9 @@ mod tests {
       "the watermark starts due-never"
     );
 
-    // Re-registering the same declaration is a no-op: the watermark is
-    // recomputed from the same wall clock second and lands on the same
-    // or a later window, never an earlier one.
+    // Re-registering replaces the declaration (a documented overwrite);
+    // the watermark monotonicity rule keeps the later of the two
+    // watermarks, so a replacement never moves a due window earlier.
     register_time_trigger_ctx(
       &store,
       &entropy,
@@ -862,22 +1021,135 @@ mod tests {
     assert_eq!(rows.len(), 1);
     assert!(rows[0].next_fire_seconds() >= watermark);
 
-    // Removal is by name; a second removal reports absent.
-    assert!(
-      remove_trigger_ctx(&store, &entropy, "alpha")
-        .await
-        .expect("remove")
-    );
-    assert!(
-      !remove_trigger_ctx(&store, &entropy, "alpha")
-        .await
-        .expect("remove again")
-    );
+    // Removal is by name and idempotent: both removals succeed.
+    remove_trigger_ctx(&store, &entropy, "alpha")
+      .await
+      .expect("remove");
+    remove_trigger_ctx(&store, &entropy, "alpha")
+      .await
+      .expect("remove again");
     assert!(
       list_trigger_rows_ctx(&store)
         .await
         .expect("rows")
         .is_empty()
+    );
+  }
+
+  /// The registration replacement semantics: a re-registration under a
+  /// live name replaces the declaration (a different pattern takes
+  /// over), and the watermark monotonicity rule keeps the LATER of the
+  /// two watermarks — a re-registration whose fresh watermark would be
+  /// earlier never moves the due window back.
+  #[tokio::test]
+  async fn a_replacement_replaces_the_declaration_and_keeps_the_later_watermark() {
+    let store = store().await;
+    let entropy = entropy();
+    let mut extensions = registry();
+    let registered = registered_target(&mut extensions);
+
+    // The first declaration fires once a day at midnight UTC: its
+    // watermark is the next midnight, far past any re-registration's
+    // fresh watermark.
+    register_time_trigger_ctx(
+      &store,
+      &entropy,
+      &extensions,
+      "alpha",
+      "{*}-{*}-{*}T00:00:00Z",
+      registered.clone(),
+    )
+    .await
+    .expect("register");
+    let daily_watermark = list_trigger_rows_ctx(&store).await.expect("rows")[0].next_fire_seconds();
+
+    // The replacement declares the every-second pattern; its fresh
+    // watermark is the current second, but the stored watermark must
+    // stay at the daily window.
+    register_time_trigger_ctx(
+      &store,
+      &entropy,
+      &extensions,
+      "alpha",
+      EVERY_TEST_SECOND,
+      registered,
+    )
+    .await
+    .expect("re-register");
+    let rows = list_trigger_rows_ctx(&store).await.expect("rows");
+    assert_eq!(rows.len(), 1);
+    let TriggerSource::Time { pattern } = rows[0].source() else {
+      panic!("the replacement's declaration must take over");
+    };
+    assert_eq!(pattern, EVERY_TEST_SECOND, "the declaration is replaced");
+    assert_eq!(
+      rows[0].next_fire_seconds(),
+      daily_watermark,
+      "the watermark never moves earlier"
+    );
+  }
+
+  /// The evaluation path's watermark advance: it moves the watermark
+  /// forward, is a no-op when the watermark is already at or past the
+  /// target, and never overwrites a declaration that was re-declared
+  /// since the pass read the row.
+  #[tokio::test]
+  async fn the_watermark_advance_never_clobbers_a_redeclaration() {
+    let store = store().await;
+    let entropy = entropy();
+    let mut extensions = registry();
+    let registered = registered_target(&mut extensions);
+
+    register_time_trigger_ctx(
+      &store,
+      &entropy,
+      &extensions,
+      "alpha",
+      "{*}-{*}-{*}T00:00:00Z",
+      registered.clone(),
+    )
+    .await
+    .expect("register");
+    let observed = list_trigger_rows_ctx(&store).await.expect("rows").remove(0);
+
+    // A forward advance lands.
+    let target = observed.next_fire_seconds() + 1_000;
+    advance_trigger_watermark_ctx(&store, &entropy, &observed, target)
+      .await
+      .expect("advance");
+    assert_eq!(
+      list_trigger_rows_ctx(&store).await.expect("rows")[0].next_fire_seconds(),
+      target
+    );
+
+    // A backward or equal advance is a no-op.
+    advance_trigger_watermark_ctx(&store, &entropy, &observed, observed.next_fire_seconds())
+      .await
+      .expect("no-op advance");
+    assert_eq!(
+      list_trigger_rows_ctx(&store).await.expect("rows")[0].next_fire_seconds(),
+      target
+    );
+
+    // A re-declared row (different pattern) is left alone: the
+    // registration's own merged watermark governs.
+    let replacement =
+      prepare_time_trigger("alpha", EVERY_TEST_SECOND, registered).expect("replacement row");
+    put_trigger_row_ctx(&store, &entropy, &replacement)
+      .await
+      .expect("replace");
+    advance_trigger_watermark_ctx(&store, &entropy, &observed, target + 1_000)
+      .await
+      .expect("drift-checked advance");
+    let rows = list_trigger_rows_ctx(&store).await.expect("rows");
+    let TriggerSource::Time { pattern } = rows[0].source() else {
+      panic!("the replacement's declaration must stand");
+    };
+    assert_eq!(pattern, EVERY_TEST_SECOND);
+    assert_eq!(
+      rows[0].next_fire_seconds(),
+      target,
+      "the stale pass must not advance the replaced row"
     );
   }
 
@@ -977,11 +1249,9 @@ mod tests {
     evaluate_pass(&store, &entropy, &state).await.expect("pass");
     assert_eq!(state.event_rows().len(), 1);
 
-    assert!(
-      remove_trigger_ctx(&store, &entropy, "on-change")
-        .await
-        .expect("remove")
-    );
+    remove_trigger_ctx(&store, &entropy, "on-change")
+      .await
+      .expect("remove");
     evaluate_pass(&store, &entropy, &state).await.expect("pass");
     assert!(state.event_rows().is_empty());
   }
