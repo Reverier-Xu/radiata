@@ -1,7 +1,7 @@
 //! The row envelope: the one persisted shape of a metadata row.
 //!
-//! Every migrated family persists one envelope: **name + labels + version
-//! + payload**. The name is the namespace-qualified row key (the family's
+//! Every migrated family persists one envelope: name, labels, version,
+//! and payload. The name is the namespace-qualified row key (the family's
 //! existing key discipline, unchanged); the labels are the row's label
 //! vocabulary (identity families store the empty set — policy-as-row-data
 //! arrives in a later phase); the version is the family's monotonic
@@ -47,14 +47,6 @@ pub(crate) struct RowName {
 impl RowName {
   pub(crate) const fn new(namespace: StoreNamespace, key: StoreKey) -> Self {
     Self { namespace, key }
-  }
-
-  pub(crate) const fn namespace(&self) -> &StoreNamespace {
-    &self.namespace
-  }
-
-  pub(crate) const fn key(&self) -> &StoreKey {
-    &self.key
   }
 }
 
@@ -199,22 +191,6 @@ impl RowEnvelope {
       ROW_ENVELOPE_LIMITS,
     )
   }
-
-  pub(crate) const fn name(&self) -> &RowName {
-    &self.name
-  }
-
-  pub(crate) const fn labels(&self) -> &LabelSet {
-    &self.labels
-  }
-
-  pub(crate) const fn version(&self) -> &RowVersion {
-    &self.version
-  }
-
-  pub(crate) fn payload(&self) -> &[u8] {
-    &self.payload
-  }
 }
 
 impl std::fmt::Debug for RowEnvelope {
@@ -276,11 +252,11 @@ mod tests {
     assert_eq!(envelope.encode().unwrap(), GOLDEN_ROW_ENVELOPE_G1);
     let decoded = RowEnvelope::decode(GOLDEN_ROW_ENVELOPE_G1).unwrap();
     assert_eq!(decoded, envelope);
-    assert_eq!(decoded.name().namespace().as_str(), namespace().as_str());
-    assert_eq!(decoded.name().key().as_bytes(), key().as_bytes());
-    assert_eq!(decoded.labels().entries().count(), 0);
-    assert_eq!(decoded.version(), &RowVersion::Revision(revision()));
-    assert_eq!(decoded.payload(), payload.as_ref());
+    assert_eq!(decoded.name.namespace.as_str(), namespace().as_str());
+    assert_eq!(decoded.name.key.as_bytes(), key().as_bytes());
+    assert_eq!(decoded.labels.entries().count(), 0);
+    assert_eq!(decoded.version, RowVersion::Revision(revision()));
+    assert_eq!(&*decoded.payload, payload.as_ref());
     assert_eq!(
       RowEnvelope::open(GOLDEN_ROW_ENVELOPE_G1).unwrap(),
       [1, 2, 3]

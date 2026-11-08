@@ -71,7 +71,7 @@ pub(crate) fn namespace(tag: &str) -> crate::Result<crate::StoreNamespace> {
 /// through the catalog itself (iterate [`metadata_families`]) instead of
 /// by copying namespace lists.
 pub(crate) use catalog::{
-  FamilyContest, FamilyPolicy, MetadataDomain, MetadataFamily, metadata_families,
+  FamilyCleanup, FamilyContest, FamilyPolicy, MetadataDomain, MetadataFamily, metadata_families,
 };
 
 /// The declared policy of one catalog family, resolved by namespace: the
@@ -185,11 +185,16 @@ mod catalog {
   /// The declared policy of one metadata family: the four aspects the
   /// storage contract and later phases consume. Declared per family at
   /// the catalog rows, so a new family is correct by declaration instead
-  /// of by consumer edits.
+  /// of by consumer edits. The admission and visibility aspects are read
+  /// by their consumer phases (node-local exclusion generalization,
+  /// public read scoping); the cleanup aspect drives the leave wipe scope
+  /// today.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   pub(crate) struct FamilyPolicy {
     contest: FamilyContest,
+    #[allow(dead_code)]
     admission: FamilyAdmission,
+    #[allow(dead_code)]
     visibility: FamilyVisibility,
     cleanup: FamilyCleanup,
   }
@@ -210,14 +215,6 @@ mod catalog {
 
     pub(crate) const fn contest(&self) -> FamilyContest {
       self.contest
-    }
-
-    pub(crate) const fn admission(&self) -> FamilyAdmission {
-      self.admission
-    }
-
-    pub(crate) const fn visibility(&self) -> FamilyVisibility {
-      self.visibility
     }
 
     pub(crate) const fn cleanup(&self) -> FamilyCleanup {
@@ -538,6 +535,35 @@ mod catalog {
         .map(MetadataFamily::namespace_tag)
         .collect();
       assert_eq!(node_local, vec![RESOURCE_CHANGE_FEED_NAMESPACE]);
+    }
+
+    /// The leave wipe scope derives the Identity-domain families it wipes
+    /// from the cleanup declarations: exactly the four families that
+    /// carry the old identity's credentials. The rest of the Identity
+    /// domain stays: the local identity singleton is swapped, never
+    /// wiped, and the leave intent, cleanup tombstones, and checkpoint
+    /// are hygiene records of the store, not credentials of the old
+    /// identity. The declaration set is pinned here so a cleanup-class
+    /// edit cannot silently move a family in or out of the wipe scope.
+    #[test]
+    fn the_identity_leave_wipe_scope_is_the_leave_wipe_cleanup_class() {
+      let wiped: Vec<&str> = metadata_families()
+        .into_iter()
+        .filter(|family| {
+          family.domain() == MetadataDomain::Identity
+            && family.policy().cleanup() == FamilyCleanup::LeaveWipe
+        })
+        .map(|family| family.namespace_tag())
+        .collect();
+      assert_eq!(
+        wiped,
+        vec![
+          IDENTITY_BINDING_NAMESPACE,
+          CREDENTIAL_USE_NAMESPACE,
+          MERGE_GRANT_NAMESPACE,
+          REVOCATION_NAMESPACE,
+        ]
+      );
     }
 
     /// The registry lookup behind the classification guards.

@@ -2090,19 +2090,15 @@ mod tests {
       )
     };
     let stored = || async {
-      let value = store
+      store
         .snapshot()
         .await
         .unwrap()
         .get(&namespace, &key)
         .await
         .unwrap()
-        .map(|value| value.as_bytes().to_vec());
-      match value {
         // The stored row is the envelope; the assertions compare payloads.
-        Some(bytes) => Some(RowEnvelope::open(&bytes).unwrap()),
-        None => None,
-      }
+        .map(|value| RowEnvelope::open(value.as_bytes()).unwrap())
     };
 
     // A fresh record installs exactly once; the exact record is a no-op.

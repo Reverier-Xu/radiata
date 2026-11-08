@@ -431,26 +431,12 @@ pub(crate) async fn discover_leave_intent(
 /// node-descriptor, resource, and trace family. A family added to any of
 /// these domains joins the wipe scope automatically through the registry
 /// derivation. The old identity's trust view is not a domain of its own:
-/// its one durable family is the identity-binding family below.
+/// its durable families are derived from the catalog's cleanup
+/// declarations below.
 const WIPE_DOMAINS: &[crate::storage::families::MetadataDomain] = &[
   crate::storage::families::MetadataDomain::Node,
   crate::storage::families::MetadataDomain::Resource,
   crate::storage::families::MetadataDomain::Route,
-];
-
-/// The Identity-domain families that carry the old identity itself and
-/// are wiped with it. The rest of the Identity domain stays: the local
-/// identity singleton is swapped, never wiped, and the leave intent,
-/// cleanup tombstones, and checkpoint are hygiene records of the store,
-/// not credentials of the old identity. Key-custody families (the
-/// KeyIntent and Custody domains: the seed rows leave through the
-/// provider's own deletion flow) and the storage infrastructure domains
-/// (pending journal, receipts, schema) stay for the same reason.
-const WIPE_IDENTITY_FAMILIES: &[&str] = &[
-  crate::storage::families::IDENTITY_BINDING_NAMESPACE,
-  crate::storage::families::CREDENTIAL_USE_NAMESPACE,
-  crate::storage::families::MERGE_GRANT_NAMESPACE,
-  crate::storage::families::REVOCATION_NAMESPACE,
 ];
 
 /// The domain metadata namespaces of the old identity, wiped by a leave:
@@ -461,7 +447,8 @@ pub(crate) fn wipe_namespaces() -> Vec<&'static str> {
     .into_iter()
     .filter(|family| {
       WIPE_DOMAINS.contains(&family.domain())
-        || WIPE_IDENTITY_FAMILIES.contains(&family.namespace_tag())
+        || (family.domain() == crate::storage::families::MetadataDomain::Identity
+          && family.policy().cleanup() == crate::storage::families::FamilyCleanup::LeaveWipe)
     })
     .map(|family| family.namespace_tag())
     .collect()

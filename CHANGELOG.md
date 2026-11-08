@@ -29,6 +29,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Persisted metadata rows unify onto one row envelope — name, labels,
+  version, payload (a pre-release format amendment): the identity
+  families (local identity, identity bindings, credential use, merge
+  grants, revocations, leave records and intents, cleanup tombstones,
+  cleanup checkpoints, and the key custody intents and outcomes) persist
+  the envelope as the stored row value, with the existing
+  `canonical_record!` wire bytes as the opaque payload element, the
+  preparing CAS revision as the version, and the empty label set; the
+  record codecs and the reconcile wire content (the payload element) are
+  unchanged.
+- The storage family catalog declares per-family policy records: the
+  contest aspect generalizes the terminal-record `decides` precedent and
+  is enforced by the guarded and convergent install helpers; the cleanup
+  vocabulary replaces the hardcoded identity-family wipe list, so the
+  leave wipe scope derives from the declarations; admission and
+  visibility are declared for the phases that consume them.
 - Route planning replaces per-hop next-hop selection: a `RouteNextHop`
   policy now plans the ordered path a packet follows, the path rides the
   route envelope, and every hop follows it. The default policy plans the
