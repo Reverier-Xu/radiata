@@ -1,14 +1,90 @@
+//! The storage contract suite: the reference oracle a metadata backend
+//! author runs their own backend through.
+//!
+//! The suite drives one [`StorageFactory`] through the backend-neutral
+//! provider contract documented on [`Storage`](crate::provider::Storage):
+//! provider-owned immutable snapshots, exact lookup, unsigned-byte
+//! ordered scan streams (plain and positioned), receipt replay,
+//! base-revision and per-key conditional commits, cross-family
+//! atomicity, idempotent replays, and reconciliation verdicts — over
+//! every family of the metadata catalog. The suite asserts each clause,
+//! so a violation fails the caller's own test harness; it is opt-in by
+//! construction: nothing in the crate runs it outside the crate's own
+//! contract lanes, and a backend author invokes
+//! [`run_storage_contract`] from their own tests.
+//!
+//! The failure style is deliberately the test tool's: the suite
+//! `assert!`s and `panic!`s with the violated clause, so a failing run
+//! surfaces in the author's test output with the exact divergence. That
+//! style is why the unwrapped reads below are allowed in this one
+//! module — they are the assertions, not silent invariants.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::Arc;
 
-use super::helpers::*;
 use crate::{
-  CommitOutcome, Digest, ReconcileOutcome, StoreEntry, StoreExpectation, StoreOperation,
-  StoreRequirements, provider::StorageFactory,
+  CommitOutcome, Digest, QualifiedTag, ReconcileOutcome, StoreExpectation, StoreKey,
+  StoreNamespace, StoreOperation, StoreRequirements, StoreRevision, StoreTransaction, StoreValue,
+  TransactionId,
+  provider::{StorageFactory, StoreScan},
+  storage::families::metadata_families,
 };
 
-pub(crate) async fn storage_contract_snapshot_lookup_and_ordering(
-  factory: Arc<dyn StorageFactory>,
-) {
+/// The full contract suite, five lanes in dependency order: snapshot
+/// semantics, conditional-commit semantics, positioned scans, the
+/// all-family roundtrip, and cross-family atomicity. `fresh` builds one
+/// factory per lane, so each lane starts from an empty store exactly as
+/// a backend author's own per-test construction would.
+pub async fn run_storage_contract<F>(fresh: F)
+where
+  F: Fn() -> Arc<dyn StorageFactory>,
+{
+  storage_contract_snapshot_lookup_and_ordering(fresh()).await;
+  storage_contract_conflicts_atomicity_and_idempotence(fresh()).await;
+  storage_contract_positioned_scans(fresh()).await;
+  storage_contract_all_family_roundtrip(fresh()).await;
+  storage_contract_cross_family_atomicity(fresh()).await;
+}
+
+// ---- shared fixtures -------------------------------------------------
+
+fn namespace(name: &str) -> StoreNamespace {
+  StoreNamespace::new(
+    QualifiedTag::parse(&format!("radiata.woooo.tech/metadata/{name}")).unwrap(),
+  )
+}
+
+fn store_key(bytes: &[u8]) -> StoreKey {
+  StoreKey::new(Arc::from(bytes))
+}
+
+fn value(bytes: &[u8]) -> StoreValue {
+  StoreValue::new(Arc::from(bytes))
+}
+
+fn transaction_id(index: u64) -> TransactionId {
+  TransactionId::parse(&format!("txn-{index:021}")).unwrap()
+}
+
+fn transaction(
+  index: u64, base_revision: StoreRevision, operations: Vec<StoreOperation>,
+) -> Result<StoreTransaction, crate::Error> {
+  StoreTransaction::new(transaction_id(index), base_revision, operations)
+}
+
+async fn collect_scan(mut scan: Box<dyn StoreScan + '_>) -> Vec<crate::StoreEntry> {
+  let mut entries = Vec::new();
+  while let Some(entry) = scan.next().await.unwrap() {
+    entries.push(entry);
+  }
+  assert!(scan.next().await.unwrap().is_none());
+  entries
+}
+
+// ---- lane 1: snapshots, lookup, ordering -----------------------------
+
+async fn storage_contract_snapshot_lookup_and_ordering(factory: Arc<dyn StorageFactory>) {
   let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
   let old = storage.snapshot().await.unwrap();
   assert!(!old.revision().as_bytes().is_empty());
@@ -169,9 +245,9 @@ pub(crate) async fn storage_contract_snapshot_lookup_and_ordering(
   );
 }
 
-pub(crate) async fn storage_contract_conflicts_atomicity_and_idempotence(
-  factory: Arc<dyn StorageFactory>,
-) {
+// ---- lane 2: conflicts, atomicity, idempotence -----------------------
+
+async fn storage_contract_conflicts_atomicity_and_idempotence(factory: Arc<dyn StorageFactory>) {
   let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
   let initial = storage.snapshot().await.unwrap();
   let first_namespace = namespace("first");
@@ -486,11 +562,13 @@ pub(crate) async fn storage_contract_conflicts_atomicity_and_idempotence(
   assert!(transaction(17, receipt.committed_revision().clone(), duplicate_receipt).is_err());
 }
 
+// ---- lane 3: positioned scans ----------------------------------------
+
 /// The positioned-scan (seek) contract, shared by every storage backend:
 /// `scan_from` positions strictly past the keyset cursor with the exact
 /// plain-scan order and filters, `None` equals a plain scan, and
 /// out-of-bounds positions are empty scans, never errors.
-pub(crate) async fn storage_contract_positioned_scans(factory: Arc<dyn StorageFactory>) {
+async fn storage_contract_positioned_scans(factory: Arc<dyn StorageFactory>) {
   let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
   let initial = storage.snapshot().await.unwrap();
   let target_namespace = namespace("one");
@@ -529,7 +607,7 @@ pub(crate) async fn storage_contract_positioned_scans(factory: Arc<dyn StorageFa
   ));
 
   let current = storage.snapshot().await.unwrap();
-  let key_list = |entries: &[StoreEntry]| {
+  let key_list = |entries: &[crate::StoreEntry]| {
     entries
       .iter()
       .map(|entry| entry.key().as_bytes().to_vec())
@@ -652,4 +730,280 @@ pub(crate) async fn storage_contract_positioned_scans(factory: Arc<dyn StorageFa
   )
   .await;
   assert!(beyond.is_empty());
+}
+
+// ---- lanes 4 and 5: the metadata catalog ------------------------------
+
+/// One representative key set per family: three keys in unsigned-byte
+/// order.
+const ROUNDTRIP_KEYS: [&[u8]; 3] = [b"", b"mid", b"\xFF\x00"];
+
+fn family_namespaces() -> Vec<StoreNamespace> {
+  metadata_families()
+    .iter()
+    .map(|family| {
+      crate::storage::families::namespace(family.namespace_tag()).unwrap()
+    })
+    .collect()
+}
+
+fn digest_of(bytes: &[u8]) -> Digest {
+  value(bytes).digest().clone()
+}
+
+fn put(namespace: &StoreNamespace, key: &[u8], contents: &[u8]) -> StoreOperation {
+  StoreOperation::Put {
+    namespace: namespace.clone(),
+    key: store_key(key),
+    expected: StoreExpectation::Absent,
+    value: value(contents),
+  }
+}
+
+/// Every family round-trips puts, exact lookup, ordered scans, conditional
+/// updates, and conditional deletes through one shared contract body.
+async fn storage_contract_all_family_roundtrip(factory: Arc<dyn StorageFactory>) {
+  let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
+  let families = family_namespaces();
+
+  let initial = storage.snapshot().await.unwrap();
+  let operations: Vec<StoreOperation> = families
+    .iter()
+    .flat_map(|family| {
+      ROUNDTRIP_KEYS
+        .iter()
+        .enumerate()
+        .map(move |(index, key)| put(family, key, &[index as u8, 0xAA]))
+    })
+    .collect();
+  let first = transaction(1, initial.revision().clone(), operations).unwrap();
+  let first_receipt = match storage.commit(first.clone()).await.unwrap() {
+    CommitOutcome::Committed(receipt) => receipt,
+    outcome => panic!("unexpected outcome: {outcome:?}"),
+  };
+  assert!(
+    matches!(
+      storage
+        .reconcile(first_receipt.transaction(), first_receipt.operation_digest())
+        .await
+        .unwrap(),
+      ReconcileOutcome::Committed(found) if found == first_receipt
+    ),
+    "committed cross-family receipt must reconcile"
+  );
+
+  let current = storage.snapshot().await.unwrap();
+  for family in &families {
+    for (index, key) in ROUNDTRIP_KEYS.iter().enumerate() {
+      let stored = current.get(family, &store_key(key)).await.unwrap();
+      assert_eq!(
+        stored.as_ref().map(|entry| entry.as_bytes().to_vec()),
+        Some(vec![index as u8, 0xAA]),
+        "exact lookup failed for family {}",
+        family.as_str(),
+      );
+    }
+
+    let scanned = collect_scan(current.scan(family, &[]).await.unwrap()).await;
+    let keys: Vec<Vec<u8>> = scanned
+      .iter()
+      .map(|entry| entry.key().as_bytes().to_vec())
+      .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "scan order violated in {}", family.as_str());
+    assert_eq!(keys.len(), ROUNDTRIP_KEYS.len());
+
+    for key in ROUNDTRIP_KEYS {
+      let prefixed = collect_scan(current.scan(family, key).await.unwrap()).await;
+      let expected = ROUNDTRIP_KEYS
+        .iter()
+        .filter(|candidate| candidate.starts_with(key))
+        .count();
+      assert_eq!(prefixed.len(), expected);
+    }
+  }
+
+  // Conditional update and conditional delete per family on the current
+  // revision, then a stale-revision and a failed per-key condition must
+  // both conflict without mutating any family.
+  let updates: Vec<StoreOperation> = families
+    .iter()
+    .flat_map(|family| {
+      [
+        StoreOperation::Put {
+          namespace: family.clone(),
+          key: store_key(b"mid"),
+          expected: StoreExpectation::Exact(digest_of(&[1, 0xAA])),
+          value: value(b"updated"),
+        },
+        StoreOperation::Delete {
+          namespace: family.clone(),
+          key: store_key(b"\xFF\x00"),
+          expected: digest_of(&[2, 0xAA]),
+        },
+      ]
+    })
+    .collect();
+  let second = transaction(2, current.revision().clone(), updates).unwrap();
+  assert!(matches!(
+    storage.commit(second).await.unwrap(),
+    CommitOutcome::Committed(_)
+  ));
+
+  let latest = storage.snapshot().await.unwrap();
+  let stale = transaction(
+    3,
+    initial.revision().clone(),
+    vec![put(&families[0], b"stale", b"x")],
+  )
+  .unwrap();
+  assert!(matches!(
+    storage.commit(stale).await.unwrap(),
+    CommitOutcome::Conflict
+  ));
+  let failed_condition = transaction(
+    4,
+    latest.revision().clone(),
+    vec![StoreOperation::Put {
+      namespace: families[0].clone(),
+      key: store_key(b"mid"),
+      expected: StoreExpectation::Exact(digest_of(&[1, 0xAA])),
+      value: value(b"wrong"),
+    }],
+  )
+  .unwrap();
+  assert!(matches!(
+    storage.commit(failed_condition).await.unwrap(),
+    CommitOutcome::Conflict
+  ));
+
+  let unchanged = storage.snapshot().await.unwrap();
+  for family in &families {
+    assert!(
+      unchanged
+        .get(family, &store_key(b"stale"))
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(
+      unchanged
+        .get(family, &store_key(b"mid"))
+        .await
+        .unwrap()
+        .unwrap()
+        .as_bytes(),
+      b"updated"
+    );
+    assert!(
+      unchanged
+        .get(family, &store_key(b"\xFF\x00"))
+        .await
+        .unwrap()
+        .is_none()
+    );
+  }
+  assert!(matches!(
+    storage
+      .reconcile(&transaction_id(4), &digest_of(&[0, 0xAA]))
+      .await
+      .unwrap(),
+    ReconcileOutcome::Aborted
+  ));
+}
+
+/// One transaction spanning every metadata family commits or aborts
+/// atomically, and its single receipt reconciles per family.
+async fn storage_contract_cross_family_atomicity(factory: Arc<dyn StorageFactory>) {
+  let storage = factory.open(StoreRequirements::metadata()).await.unwrap();
+  let families = family_namespaces();
+
+  let initial = storage.snapshot().await.unwrap();
+  let mut aborted: Vec<StoreOperation> = families
+    .iter()
+    .map(|family| put(family, b"cross", b"must-not-commit"))
+    .collect();
+  aborted.push(StoreOperation::Check {
+    namespace: families[0].clone(),
+    key: store_key(b"absent-guard"),
+    expected: StoreExpectation::Exact(digest_of(b"no-such-value")),
+  });
+  let aborted_transaction = transaction(10, initial.revision().clone(), aborted).unwrap();
+  assert!(matches!(
+    storage.commit(aborted_transaction).await.unwrap(),
+    CommitOutcome::Conflict
+  ));
+
+  let after_abort = storage.snapshot().await.unwrap();
+  for family in &families {
+    assert!(
+      after_abort
+        .get(family, &store_key(b"cross"))
+        .await
+        .unwrap()
+        .is_none()
+    );
+  }
+
+  let committed: Vec<StoreOperation> = families
+    .iter()
+    .map(|family| put(family, b"cross", b"applied"))
+    .collect();
+  let committed_transaction = transaction(11, after_abort.revision().clone(), committed).unwrap();
+  let receipt = match storage.commit(committed_transaction).await.unwrap() {
+    CommitOutcome::Committed(receipt) => receipt,
+    outcome => panic!("unexpected outcome: {outcome:?}"),
+  };
+
+  let converged = storage.snapshot().await.unwrap();
+  for family in &families {
+    assert_eq!(
+      converged
+        .get(family, &store_key(b"cross"))
+        .await
+        .unwrap()
+        .unwrap()
+        .as_bytes(),
+      b"applied"
+    );
+  }
+  assert!(matches!(
+    storage
+      .reconcile(receipt.transaction(), receipt.operation_digest())
+      .await
+      .unwrap(),
+    ReconcileOutcome::Committed(found) if found == receipt
+  ));
+  assert!(matches!(
+    storage
+      .reconcile(receipt.transaction(), &Digest::from_bytes([7; 32]))
+      .await
+      .unwrap(),
+    ReconcileOutcome::DigestConflict
+  ));
+
+  let forget = transaction(
+    12,
+    converged.revision().clone(),
+    vec![
+      StoreOperation::ForgetReceipt {
+        transaction: receipt.transaction().clone(),
+        expected_operation_digest: receipt.operation_digest().clone(),
+      },
+      put(&families[0], b"cross-after-forget", b"kept"),
+    ],
+  )
+  .unwrap();
+  assert!(matches!(
+    storage.commit(forget).await.unwrap(),
+    CommitOutcome::Committed(_)
+  ));
+  assert!(matches!(
+    storage
+      .reconcile(receipt.transaction(), receipt.operation_digest())
+      .await
+      .unwrap(),
+    ReconcileOutcome::Aborted
+  ));
 }

@@ -1389,7 +1389,7 @@ async fn exercise_cancelled_receipt_operation(phase: FaultedReceiptOperation) {
 
 #[tokio::test]
 async fn storage_contract_reference_provider_covers_raw_storage_semantics() {
-  run_storage_contract(|| Arc::new(ReferenceFactory::new(required_capabilities()))).await;
+  super::run_storage_contract(|| Arc::new(ReferenceFactory::new(required_capabilities()))).await;
 }
 
 #[tokio::test]
