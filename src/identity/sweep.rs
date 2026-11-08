@@ -423,3 +423,421 @@ async fn subject_permanently_pinned(
   }
   Ok(false)
 }
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Arc;
+
+  use super::*;
+  use crate::{
+    KeyCreateState, KeyDeleteState, KeyOperationId, PublicKey, StoreExpectation, StoreOperation,
+    StoreValue,
+    identity::{
+      cleanup::{
+        CLEANUP_RECORD_DOMAIN, CleanupRecordV1, is_cleaned_ctx, issue_checkpoint_ctx,
+        persist_cleanup_record_ctx,
+      },
+      leave::wipe_namespaces,
+      lifecycle::{LocalIdentityContext, ensure_self_binding},
+      signature::signature_message,
+      testing::{ScriptedKeys, SequenceEntropy, fresh_reference, node, open_context},
+      trust::store::adopt_binding_ctx,
+    },
+    keys::metadata::MetadataKeyStore,
+    provider::KeyProvider as _,
+    storage::families::{FamilyPin, KEY_SEED_NAMESPACE},
+  };
+
+  fn reference_factory() -> Arc<dyn crate::provider::StorageFactory> {
+    fresh_reference().1
+  }
+
+  /// A cleanup tombstone signed by the local identity with an explicit
+  /// (test-chosen) removal stamp, exactly the unit the checkpoint
+  /// watermark judges.
+  async fn stamped_tombstone(
+    context: &LocalIdentityContext, keys: &Arc<ScriptedKeys>, subject: &NodeId,
+    subject_key: &PublicKey, stamp: i64,
+  ) -> CleanupRecordV1 {
+    let identity = context.identity();
+    let body =
+      CleanupRecordV1::encode_signed_body(subject, subject_key, identity.node(), stamp).unwrap();
+    let signature = keys
+      .as_provider()
+      .sign(
+        identity.handle(),
+        &signature_message(CLEANUP_RECORD_DOMAIN, &body),
+      )
+      .await
+      .unwrap();
+    CleanupRecordV1::new(
+      subject.clone(),
+      subject_key.clone(),
+      identity.node().clone(),
+      stamp,
+      signature,
+    )
+  }
+
+  /// Encodes one row envelope by hand carrying the given cleanup-policy
+  /// label value: the stored shape a foreign or future binary persists.
+  /// The local seal validates the vocabulary, so an unknown or
+  /// class-changing value can only ever arrive in stored bytes — exactly
+  /// the convergence surface these scenarios exercise.
+  fn foreign_policy_row(
+    namespace: &crate::StoreNamespace, key: &StoreKey, revision: &crate::StoreRevision,
+    payload: &[u8], policy: &str,
+  ) -> StoreValue {
+    let mut encoder = minicbor::Encoder::new(Vec::new());
+    encoder.array(7).unwrap();
+    encoder
+      .str("radiata.woooo.tech/schemas/v1/row-envelope")
+      .unwrap();
+    encoder.u16(1).unwrap();
+    encoder.str(namespace.as_str()).unwrap();
+    encoder.bytes(key.as_bytes()).unwrap();
+    encoder.array(1).unwrap();
+    encoder.array(2).unwrap();
+    encoder.str(families::CLEANUP_POLICY_LABEL_KEY).unwrap();
+    encoder.str(policy).unwrap();
+    encoder.bytes(revision.as_bytes()).unwrap();
+    encoder.bytes(payload).unwrap();
+    StoreValue::new(Arc::from(encoder.into_writer().as_slice()))
+  }
+
+  /// Relabels the stored cleanup tombstone row through a core-verb
+  /// transaction (the write path a future encapsulated policy mutation
+  /// uses) with the given policy label value.
+  async fn relabel_tombstone_row(
+    store: &MetadataStore, entropy: &dyn Entropy, record: &CleanupRecordV1, policy: &str,
+  ) {
+    let namespace = records::metadata_namespace(families::CLEANUP_NAMESPACE).unwrap();
+    let key = crate::identity::cleanup::cleanup_key(record.subject());
+    let snapshot = store.snapshot().await.unwrap();
+    let existing = snapshot.get(&namespace, &key).await.unwrap().unwrap();
+    let value = foreign_policy_row(
+      &namespace,
+      &key,
+      snapshot.revision(),
+      record.encode().unwrap().as_slice(),
+      policy,
+    );
+    let transaction = store
+      .prepare_core_verb_transaction(
+        crate::TransactionId::generate(entropy).unwrap(),
+        snapshot.revision().clone(),
+        vec![StoreOperation::Put {
+          namespace,
+          key,
+          expected: StoreExpectation::Exact(existing.digest().clone()),
+          value,
+        }],
+      )
+      .unwrap();
+    assert!(matches!(
+      store.commit(transaction).await.unwrap(),
+      crate::CommitOutcome::Committed(_)
+    ));
+  }
+
+  /// The sweep tables cover exactly the declared families: every family
+  /// the catalog declares checkpoint-collected has an adapter (so a
+  /// newly declared family cannot silently drop out of the pass), every
+  /// permanent-pinning family has a live probe, and no family declared
+  /// otherwise appears in either table.
+  #[test]
+  fn the_sweep_tables_cover_exactly_the_declared_families() {
+    for family in families::metadata_families() {
+      let tag = family.namespace_tag();
+      let adapter = ADAPTERS.iter().any(|(table_tag, _)| *table_tag == tag);
+      assert_eq!(
+        adapter,
+        family.policy().cleanup() == FamilyCleanup::CheckpointCollected,
+        "adapter table mismatch for {tag}"
+      );
+      let probe = PIN_PROBES
+        .iter()
+        .find(|(table_tag, _)| *table_tag == tag)
+        .map(|(_, probe)| probe.is_some());
+      let expected = (family.policy().pin() == FamilyPin::PermanentSubject).then_some(true);
+      assert_eq!(probe, expected, "probe table mismatch for {tag}");
+    }
+  }
+
+  /// Tombstone scenario, the declared cross-family policy: a revoked
+  /// subject whose cleanup tombstone is collected keeps its binding —
+  /// the permanent exclusion is the revocation family's declared pin,
+  /// consumed by the engine's retirement probe — while a plain collected
+  /// subject's binding retires in the same transaction.
+  #[tokio::test]
+  async fn a_revoked_subjects_binding_is_retained_by_declared_policy() {
+    use crate::identity::revocation::{
+      REVOCATION_RECORD_DOMAIN, RevocationRecordV1, persist_revocation_ctx,
+    };
+
+    let factory = reference_factory();
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = open_context(&factory, &keys, &entropy).await.unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+    let store = context.store();
+
+    let revoked = node(9_400);
+    let revoked_key = PublicKey::from_bytes(
+      crate::identity::testing::scripted_signing(9_401)
+        .verifying_key()
+        .to_bytes(),
+    );
+    let collected_subject = node(9_410);
+    let collected_key = PublicKey::from_bytes(
+      crate::identity::testing::scripted_signing(9_411)
+        .verifying_key()
+        .to_bytes(),
+    );
+    for (subject, key) in [
+      (&revoked, &revoked_key),
+      (&collected_subject, &collected_key),
+    ] {
+      adopt_binding_ctx(store, entropy.as_ref(), subject, key)
+        .await
+        .unwrap();
+    }
+    let body =
+      RevocationRecordV1::encode_signed_body(&revoked, &revoked_key, context.identity().node())
+        .unwrap();
+    let signature = keys
+      .as_provider()
+      .sign(
+        context.identity().handle(),
+        &signature_message(REVOCATION_RECORD_DOMAIN, &body),
+      )
+      .await
+      .unwrap();
+    persist_revocation_ctx(
+      store,
+      entropy.as_ref(),
+      &RevocationRecordV1::new(
+        revoked.clone(),
+        revoked_key.clone(),
+        context.identity().node().clone(),
+        signature,
+      ),
+    )
+    .await
+    .unwrap();
+    for (subject, key) in [
+      (&revoked, &revoked_key),
+      (&collected_subject, &collected_key),
+    ] {
+      let tombstone = stamped_tombstone(&context, &keys, subject, key, 1_000).await;
+      persist_cleanup_record_ctx(store, entropy.as_ref(), &tombstone)
+        .await
+        .unwrap();
+    }
+    issue_checkpoint_ctx(&context, entropy.as_ref())
+      .await
+      .unwrap();
+
+    let collected = collect_checkpoint_watermark_ctx(store, entropy.as_ref(), 5_000)
+      .await
+      .unwrap();
+    assert_eq!(collected, 2);
+    // The collected subject's binding is retired with its tombstone; the
+    // revoked subject's binding stays — permanent exclusion outranks
+    // collection, declared on the revocation family's catalog row.
+    let bindings = crate::identity::trust::store::trusted_bindings(store)
+      .await
+      .unwrap();
+    assert!(!bindings.contains_key(&collected_subject));
+    assert_eq!(bindings.get(&revoked), Some(&revoked_key));
+  }
+
+  /// Tombstone scenario, the row-level policy carrier: a tombstone row
+  /// whose policy label names a value this binary does not know is never
+  /// swept (bounded-degrading, fail-closed on the retention side), and a
+  /// row relabeled into another declared class leaves the
+  /// checkpoint-watermark pass alone — while the watermark still
+  /// collects a default-labeled tombstone next to them.
+  #[tokio::test]
+  async fn unknown_or_relabeled_policy_rows_are_never_swept() {
+    let factory = reference_factory();
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    let context = open_context(&factory, &keys, &entropy).await.unwrap();
+    ensure_self_binding(&context, entropy.as_ref())
+      .await
+      .unwrap();
+    let store = context.store();
+
+    let unknown = node(9_500);
+    let unknown_key = PublicKey::from_bytes(
+      crate::identity::testing::scripted_signing(9_501)
+        .verifying_key()
+        .to_bytes(),
+    );
+    let relabeled = node(9_510);
+    let relabeled_key = PublicKey::from_bytes(
+      crate::identity::testing::scripted_signing(9_511)
+        .verifying_key()
+        .to_bytes(),
+    );
+    let collected = node(9_520);
+    let collected_key = PublicKey::from_bytes(
+      crate::identity::testing::scripted_signing(9_521)
+        .verifying_key()
+        .to_bytes(),
+    );
+    for (subject, key) in [
+      (&unknown, &unknown_key),
+      (&relabeled, &relabeled_key),
+      (&collected, &collected_key),
+    ] {
+      adopt_binding_ctx(store, entropy.as_ref(), subject, key)
+        .await
+        .unwrap();
+    }
+    let unknown_tombstone = stamped_tombstone(&context, &keys, &unknown, &unknown_key, 1_000).await;
+    persist_cleanup_record_ctx(store, entropy.as_ref(), &unknown_tombstone)
+      .await
+      .unwrap();
+    let relabeled_tombstone =
+      stamped_tombstone(&context, &keys, &relabeled, &relabeled_key, 1_000).await;
+    persist_cleanup_record_ctx(store, entropy.as_ref(), &relabeled_tombstone)
+      .await
+      .unwrap();
+    let collected_tombstone =
+      stamped_tombstone(&context, &keys, &collected, &collected_key, 1_000).await;
+    persist_cleanup_record_ctx(store, entropy.as_ref(), &collected_tombstone)
+      .await
+      .unwrap();
+    relabel_tombstone_row(store, entropy.as_ref(), &unknown_tombstone, "future-class").await;
+    relabel_tombstone_row(
+      store,
+      entropy.as_ref(),
+      &relabeled_tombstone,
+      "storage-internal",
+    )
+    .await;
+
+    // The default-labeled tombstone is collected; the unknown-vocabulary
+    // and relabeled rows are retained, however stale their stamps.
+    let collected_count = collect_checkpoint_watermark_ctx(store, entropy.as_ref(), 5_000)
+      .await
+      .unwrap();
+    assert_eq!(collected_count, 1);
+    assert!(
+      is_cleaned_ctx(store, &unknown).await.unwrap(),
+      "the unknown-vocabulary row stays"
+    );
+    assert!(
+      is_cleaned_ctx(store, &relabeled).await.unwrap(),
+      "the relabeled row stays"
+    );
+    assert!(
+      !is_cleaned_ctx(store, &collected).await.unwrap(),
+      "the declared row is collected"
+    );
+  }
+
+  /// Tombstone scenario, the provider-only class: the checkpoint sweep
+  /// and the leave wipe never touch the key-seed family — the seed rows
+  /// leave only through the provider's own deletion flow.
+  #[tokio::test]
+  async fn provider_seed_rows_are_swept_only_by_the_provider_flow() {
+    use crate::StoreRequirements;
+
+    let factory = reference_factory();
+    // The provider's seed row, written through its own flow before any
+    // identity context opens the same store (the reference factory
+    // admits one open at a time).
+    let operation = KeyOperationId::parse("keyop-000000000000000000001").unwrap();
+    let handle = {
+      let storage: Arc<dyn crate::provider::Storage> = factory
+        .open(StoreRequirements::metadata())
+        .await
+        .unwrap()
+        .into();
+      let seed_store = MetadataKeyStore::new(storage);
+      match seed_store.create_ed25519(&operation).await.unwrap() {
+        KeyCreateState::Present(created) => created.handle().clone(),
+        other => panic!("expected a created seed, got {other:?}"),
+      }
+    };
+
+    // The identity sweep runs over the same store: the pass collects
+    // the cleanup tombstone and never touches the seed row, and the
+    // leave wipe scope never names the seed family.
+    let keys = ScriptedKeys::full();
+    let entropy = Arc::new(SequenceEntropy::default());
+    {
+      let context = open_context(&factory, &keys, &entropy).await.unwrap();
+      ensure_self_binding(&context, entropy.as_ref())
+        .await
+        .unwrap();
+      let store = context.store();
+      let subject = node(9_600);
+      let subject_key = PublicKey::from_bytes(
+        crate::identity::testing::scripted_signing(9_601)
+          .verifying_key()
+          .to_bytes(),
+      );
+      adopt_binding_ctx(store, entropy.as_ref(), &subject, &subject_key)
+        .await
+        .unwrap();
+      let tombstone = stamped_tombstone(&context, &keys, &subject, &subject_key, 1_000).await;
+      persist_cleanup_record_ctx(store, entropy.as_ref(), &tombstone)
+        .await
+        .unwrap();
+      issue_checkpoint_ctx(&context, entropy.as_ref())
+        .await
+        .unwrap();
+      let collected = collect_checkpoint_watermark_ctx(store, entropy.as_ref(), 5_000)
+        .await
+        .unwrap();
+      assert_eq!(collected, 1);
+
+      let seed_namespace = records::metadata_namespace(KEY_SEED_NAMESPACE).unwrap();
+      let seed_key = crate::StoreKey::new(handle.expose_provider_handle().into());
+      assert!(
+        crate::identity::records::key_present(store, &seed_namespace, &seed_key)
+          .await
+          .unwrap(),
+        "the checkpoint sweep never touches the provider's seed rows"
+      );
+      assert!(
+        !wipe_namespaces().contains(&KEY_SEED_NAMESPACE),
+        "the leave wipe scope never includes the provider's seed family"
+      );
+    }
+
+    // The provider's own deletion flow is the only path that removes it:
+    // the row is still durably present, the delete removes it, and the
+    // durable evidence reads absent afterwards.
+    let storage: Arc<dyn crate::provider::Storage> = factory
+      .open(StoreRequirements::metadata())
+      .await
+      .unwrap()
+      .into();
+    let seed_store = MetadataKeyStore::new(storage);
+    assert_eq!(
+      seed_store
+        .reconcile_delete(&operation, &handle)
+        .await
+        .unwrap(),
+      KeyDeleteState::Present
+    );
+    assert_eq!(
+      seed_store.delete(&operation, &handle).await.unwrap(),
+      KeyDeleteState::Present
+    );
+    assert_eq!(
+      seed_store
+        .reconcile_delete(&operation, &handle)
+        .await
+        .unwrap(),
+      KeyDeleteState::Absent
+    );
+  }
+}
