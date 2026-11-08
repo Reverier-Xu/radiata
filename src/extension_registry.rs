@@ -376,7 +376,7 @@ impl ExtensionRegistry {
       Some(tag) => Ok(tag.clone()),
       None => {
         let tag = crate::routing::DefaultNextHop::tag()?;
-        if self.routing_policy(&tag)?.is_none() {
+        if self.routing().next_hop_policy(&tag)?.is_none() {
           return Err(Error::internal("default next-hop policy"));
         }
         Ok(tag)
