@@ -11,6 +11,7 @@ pub(crate) mod merge_rate;
 pub(crate) mod records;
 pub(crate) mod revocation;
 pub(crate) mod signature;
+pub(crate) mod sweep;
 #[cfg(any(test, fuzzing))]
 #[cfg_attr(fuzzing, allow(dead_code))]
 pub(crate) mod testing;

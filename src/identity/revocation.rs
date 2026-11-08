@@ -164,7 +164,10 @@ fn namespace() -> Result<StoreNamespace> {
   crate::identity::records::metadata_namespace(REVOCATION_NAMESPACE)
 }
 
-fn revocation_key(subject: &NodeId) -> StoreKey {
+/// The store key of one revocation tombstone: the subject's node text.
+/// The sweep engine's permanent-pin probe shares the family's own key
+/// discipline.
+pub(crate) fn revocation_key(subject: &NodeId) -> StoreKey {
   StoreKey::new(Arc::from(subject.as_str().as_bytes().to_vec()))
 }
 

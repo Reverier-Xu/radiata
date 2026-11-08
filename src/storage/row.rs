@@ -318,6 +318,17 @@ impl RowEnvelope {
     Ok(Self::decode(bytes)?.payload.to_vec())
   }
 
+  /// The row's label vocabulary (the sweep engine reads the declared
+  /// cleanup policy from it).
+  pub(crate) fn labels(&self) -> &LabelSet {
+    &self.labels
+  }
+
+  /// The row's payload element (the canonical record bytes).
+  pub(crate) fn payload(&self) -> &[u8] {
+    &self.payload
+  }
+
   /// Decodes one canonical envelope, rejecting non-canonical encodings,
   /// unknown envelope versions, non-metadata namespaces, malformed
   /// labels, empty revisions or payloads, and out-of-grammar version

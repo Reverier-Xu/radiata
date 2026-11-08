@@ -92,8 +92,8 @@ pub(crate) fn validate_cleanup_policy_label(value: &str) -> crate::Result<()> {
 /// through the catalog itself (iterate [`metadata_families`]) instead of
 /// by copying namespace lists.
 pub(crate) use catalog::{
-  FamilyAdmission, FamilyCleanup, FamilyContest, FamilyPolicy, FamilyVisibility, MetadataDomain,
-  MetadataFamily, metadata_families,
+  FamilyAdmission, FamilyCleanup, FamilyContest, FamilyPin, FamilyPolicy, FamilyRetirement,
+  FamilyVisibility, MetadataDomain, MetadataFamily, metadata_families,
 };
 
 /// The declared policy of one catalog family, resolved by namespace: the
@@ -247,23 +247,57 @@ mod catalog {
     }
   }
 
-  /// The declared policy of one metadata family: the four aspects the
-  /// storage contract and the enforcement seams consume. Declared per
-  /// family at the catalog rows, so a new family is correct by
-  /// declaration instead of by consumer edits. The admission aspect
+  /// Whether the family's rows permanently pin their subject node while
+  /// they live: the sweep engine keeps such a subject's identity binding
+  /// even when a collected tombstone pins it too. This is the declared
+  /// cross-family rule (revocation's permanent exclusion) — declared at
+  /// the catalog row instead of hardcoded into the sweep.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(crate) enum FamilyPin {
+    /// A live row of this family permanently pins its subject.
+    PermanentSubject,
+    /// The family's rows pin no subject (the default).
+    Unpinned,
+  }
+
+  /// Whether collecting a checkpoint-collected row of this family
+  /// retires the subject binding the row pins, in the collection's own
+  /// transaction. The per-family declaration parameter of the
+  /// checkpoint-watermark class: the retirement semantics are a
+  /// refinement one boolean wide, so they ride the class instead of
+  /// forking a separate sweep class for it.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(crate) enum FamilyRetirement {
+    /// Collection retires the pinned subject binding.
+    RetirePinnedBinding,
+    /// Collection leaves bindings alone (the default).
+    KeepPinnedBinding,
+  }
+
+  /// The declared policy of one metadata family: the aspects the storage
+  /// contract, the enforcement seams, and the sweep engine consume.
+  /// Declared per family at the catalog rows, so a new family is correct
+  /// by declaration instead of by consumer edits. The admission aspect
   /// gates the store's write seam (the plain prepare entry refuses
   /// core-verb-gated families), the visibility aspect gates the public
-  /// read helpers, and the cleanup aspect drives the leave wipe scope.
+  /// read helpers, the cleanup aspect names the family's sweep class,
+  /// and the pin and retirement aspects declare the sweep engine's
+  /// cross-family and per-family refinement semantics.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   pub(crate) struct FamilyPolicy {
     contest: FamilyContest,
     admission: FamilyAdmission,
     visibility: FamilyVisibility,
     cleanup: FamilyCleanup,
+    pin: FamilyPin,
+    retirement: FamilyRetirement,
   }
 
   impl FamilyPolicy {
-    /// Declares the four aspects of one family.
+    /// Declares the family's aspects; the pin and retirement defaults
+    /// (unpinned, keep-pinned-binding) cover every family whose sweep
+    /// class needs no refinement — the catalog rows that need one
+    /// specialize through [`Self::with_pin`] and [`Self::with_retirement`].
     pub(crate) const fn new(
       contest: FamilyContest, admission: FamilyAdmission, visibility: FamilyVisibility,
       cleanup: FamilyCleanup,
@@ -273,7 +307,21 @@ mod catalog {
         admission,
         visibility,
         cleanup,
+        pin: FamilyPin::Unpinned,
+        retirement: FamilyRetirement::KeepPinnedBinding,
       }
+    }
+
+    /// Specializes the pin declaration (a const builder, so catalog
+    /// rows stay `const` expressions).
+    pub(crate) const fn with_pin(self, pin: FamilyPin) -> Self {
+      Self { pin, ..self }
+    }
+
+    /// Specializes the retirement declaration (a const builder, so
+    /// catalog rows stay `const` expressions).
+    pub(crate) const fn with_retirement(self, retirement: FamilyRetirement) -> Self {
+      Self { retirement, ..self }
     }
 
     pub(crate) const fn contest(&self) -> FamilyContest {
@@ -290,6 +338,14 @@ mod catalog {
 
     pub(crate) const fn cleanup(&self) -> FamilyCleanup {
       self.cleanup
+    }
+
+    pub(crate) const fn pin(&self) -> FamilyPin {
+      self.pin
+    }
+
+    pub(crate) const fn retirement(&self) -> FamilyRetirement {
+      self.retirement
     }
   }
 
@@ -403,7 +459,11 @@ mod catalog {
       MetadataFamily::new(
         MetadataDomain::Identity,
         REVOCATION_NAMESPACE,
-        core_policy(FamilyContest::CanonicalWinner, FamilyCleanup::LeaveWipe),
+        // The permanent-exclusion declaration: a live revocation row
+        // permanently pins its subject, so the sweep engine keeps the
+        // subject's binding even when a collected tombstone pins it too.
+        core_policy(FamilyContest::CanonicalWinner, FamilyCleanup::LeaveWipe)
+          .with_pin(FamilyPin::PermanentSubject),
       ),
       MetadataFamily::new(
         MetadataDomain::Identity,
@@ -411,7 +471,8 @@ mod catalog {
         core_policy(
           FamilyContest::GuardedSingleRecord,
           FamilyCleanup::CheckpointCollected,
-        ),
+        )
+        .with_retirement(FamilyRetirement::RetirePinnedBinding),
       ),
       MetadataFamily::new(
         MetadataDomain::Identity,
@@ -419,7 +480,8 @@ mod catalog {
         core_policy(
           FamilyContest::CanonicalWinner,
           FamilyCleanup::CheckpointCollected,
-        ),
+        )
+        .with_retirement(FamilyRetirement::RetirePinnedBinding),
       ),
       MetadataFamily::new(
         MetadataDomain::Identity,

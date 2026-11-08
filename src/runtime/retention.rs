@@ -78,27 +78,32 @@ impl TickState {
     }
   }
 
-  /// One bounded identity-tombstone GC pass: the collected leave and
-  /// cleanup tombstones at or before the local cleanup-checkpoint
-  /// watermark leave, together with the bindings they pin. The checkpoint
-  /// is the pass's gate — a node that never issued or received one has no
+  /// One bounded identity-tombstone GC pass, run by the generic sweep
+  /// engine: every row the catalog declares checkpoint-collected (the
+  /// leave and cleanup tombstones) at or before the local
+  /// cleanup-checkpoint watermark leaves, together with the bindings it
+  /// pins where the families declare the retirement. The checkpoint is
+  /// the pass's gate — a node that never issued or received one has no
   /// eligible watermark, so the sweep stays off the tick entirely instead
-  /// of running two empty scans. The pass itself is bounded by its record
+  /// of running empty scans. The pass itself is bounded by its record
   /// batch; a failure (store outage, frozen slot) surfaces as a warning
   /// and the next tick retries.
   pub(super) async fn collected_tombstone_sweep(&self) {
     let store = self.context().store();
-    match crate::identity::cleanup::latest_checkpoint_millis_ctx(store).await {
-      Ok(Some(_)) => {}
+    let watermark = match crate::identity::cleanup::latest_checkpoint_millis_ctx(store).await {
+      Ok(Some(watermark)) => watermark,
       Ok(None) => return,
       Err(error) => {
         tracing::warn!(kind = ?error.kind(), "tombstone gc checkpoint read failed");
         return;
       }
-    }
-    if let Err(error) =
-      crate::identity::cleanup::collect_collected_tombstones_ctx(store, self.entropy().as_ref())
-        .await
+    };
+    if let Err(error) = crate::identity::sweep::collect_checkpoint_watermark_ctx(
+      store,
+      self.entropy().as_ref(),
+      watermark,
+    )
+    .await
     {
       tracing::warn!(kind = ?error.kind(), "tombstone gc sweep failed");
     }
