@@ -1017,11 +1017,12 @@ impl MetadataStore {
     }
   }
 }
+pub(crate) mod families;
+pub(crate) mod row;
 #[cfg(any(test, fuzzing))]
 #[cfg_attr(fuzzing, allow(dead_code))]
 pub(crate) mod test_util;
-
-pub(crate) mod families;
+pub(crate) use row::{RowEnvelope, RowName, RowVersion};
 pub(crate) mod incumbent;
 #[cfg(feature = "json")]
 pub(crate) mod json;

@@ -84,6 +84,9 @@ pub fn persisted_decode(input: &[u8]) {
   let _ = ResourceRecordV1::decode(input);
   let _ = decode_trace_record(input);
   let _ = PendingTransactionV1::decode(input);
+  // The row envelope wraps every migrated metadata family's persisted
+  // row; its decoder is on the same frozen fail-closed contract.
+  let _ = crate::storage::RowEnvelope::decode(input);
   // The migration schema-record grammar is byte-framed: kind byte, tag
   // length, tag text; every other shape fails closed.
   let _ = decode_schema_record(&crate::StoreValue::new(std::sync::Arc::from(input)));
