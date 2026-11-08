@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use radiata::{
-  Digest, StoreKey, StoreNamespace, StoreOperation, StoreExpectation, QualifiedTag, TransactionId,
+  Digest, QualifiedTag, StoreExpectation, StoreKey, StoreNamespace, StoreOperation, TransactionId,
   adapters::memory_store, contract::run_storage_contract,
 };
 
@@ -34,16 +34,18 @@ fn the_public_commit_semantics_helpers_evaluate_expectations() {
   let entry = |_namespace: &StoreNamespace, _key: &StoreKey| Ok(None);
   let receipt = |_transaction: &TransactionId| Ok(None);
 
-  assert!(radiata::condition_matches(
-    entry,
-    receipt,
-    &StoreOperation::Check {
-      namespace: namespace.clone(),
-      key: key.clone(),
-      expected: StoreExpectation::Absent,
-    },
-  )
-  .unwrap());
+  assert!(
+    radiata::condition_matches(
+      entry,
+      receipt,
+      &StoreOperation::Check {
+        namespace: namespace.clone(),
+        key: key.clone(),
+        expected: StoreExpectation::Absent,
+      },
+    )
+    .unwrap()
+  );
 
   let present = |_namespace: &StoreNamespace, _key: &StoreKey| Ok(Some(digest.clone()));
   assert!(

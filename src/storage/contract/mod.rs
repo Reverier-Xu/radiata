@@ -25,10 +25,11 @@ pub(crate) mod reference;
 pub(crate) mod unknown;
 
 pub(crate) use helpers::required_capabilities;
-pub(crate) use crate::storage::memory::ReferenceFactory;
 // The contract runner is exercised by Unix-gated adapter lanes and the
 // engine closure; on platforms where those lanes compile out, the
 // re-export stays intentionally available for cross-platform callers.
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use reference::run_reference_storage_contract as run_storage_contract;
+
+pub(crate) use crate::storage::memory::ReferenceFactory;

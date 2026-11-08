@@ -38,8 +38,7 @@ use crate::{
 /// a backend author's own per-test construction would.
 pub async fn run_storage_contract<F>(fresh: F)
 where
-  F: Fn() -> Arc<dyn StorageFactory>,
-{
+  F: Fn() -> Arc<dyn StorageFactory>, {
   storage_contract_snapshot_lookup_and_ordering(fresh()).await;
   storage_contract_conflicts_atomicity_and_idempotence(fresh()).await;
   storage_contract_positioned_scans(fresh()).await;
@@ -50,9 +49,7 @@ where
 // ---- shared fixtures -------------------------------------------------
 
 fn namespace(name: &str) -> StoreNamespace {
-  StoreNamespace::new(
-    QualifiedTag::parse(&format!("radiata.woooo.tech/metadata/{name}")).unwrap(),
-  )
+  StoreNamespace::new(QualifiedTag::parse(&format!("radiata.woooo.tech/metadata/{name}")).unwrap())
 }
 
 fn store_key(bytes: &[u8]) -> StoreKey {
@@ -741,9 +738,7 @@ const ROUNDTRIP_KEYS: [&[u8]; 3] = [b"", b"mid", b"\xFF\x00"];
 fn family_namespaces() -> Vec<StoreNamespace> {
   metadata_families()
     .iter()
-    .map(|family| {
-      crate::storage::families::namespace(family.namespace_tag()).unwrap()
-    })
+    .map(|family| crate::storage::families::namespace(family.namespace_tag()).unwrap())
     .collect()
 }
 

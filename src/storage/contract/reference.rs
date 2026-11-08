@@ -9,12 +9,11 @@ use std::{
   sync::{Arc, Mutex},
 };
 
+pub(crate) use crate::storage::memory::ReferenceFactory;
 use crate::{
   BoxFuture, CommitOutcome, Digest, ReconcileOutcome, Result, StoreRequirements, TransactionId,
   provider::{Storage, StorageFactory},
 };
-
-pub(crate) use crate::storage::memory::ReferenceFactory;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UnknownFaultMode {
@@ -130,7 +129,6 @@ impl Storage for UnknownFaultStorage {
 #[cfg(test)]
 pub(crate) async fn run_reference_storage_contract<F>(fresh: F)
 where
-  F: Fn() -> Arc<dyn StorageFactory>,
-{
+  F: Fn() -> Arc<dyn StorageFactory>, {
   crate::storage::contract_suite::run_storage_contract(fresh).await;
 }

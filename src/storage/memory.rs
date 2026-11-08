@@ -13,7 +13,10 @@
 
 use std::{
   collections::BTreeMap,
-  sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}},
+  sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+  },
 };
 
 use crate::{
@@ -87,10 +90,10 @@ fn generation_revision(generation: u64) -> Result<StoreRevision> {
 /// The shared-state lock mapper: a poisoned reference-state mutex is an
 /// implementation fault (the critical sections never panic), surfaced
 /// as one instead of panicking.
-fn lock_state(
-  state: &Mutex<ReferenceState>,
-) -> Result<std::sync::MutexGuard<'_, ReferenceState>> {
-  state.lock().map_err(|_| Error::poisoned("reference store state"))
+fn lock_state(state: &Mutex<ReferenceState>) -> Result<std::sync::MutexGuard<'_, ReferenceState>> {
+  state
+    .lock()
+    .map_err(|_| Error::poisoned("reference store state"))
 }
 
 impl StorageFactory for ReferenceFactory {
@@ -161,9 +164,8 @@ impl Storage for ReferenceStorage {
   fn reconcile<'a>(
     &'a self, transaction: &'a TransactionId, digest: &'a Digest,
   ) -> BoxFuture<'a, Result<ReconcileOutcome>> {
-    let outcome = lock_state(&self.state).map(|state| {
-      reference_reconcile_verdict(&state.receipts, transaction, digest)
-    });
+    let outcome = lock_state(&self.state)
+      .map(|state| reference_reconcile_verdict(&state.receipts, transaction, digest));
     Box::pin(async move { outcome })
   }
 

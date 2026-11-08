@@ -1023,11 +1023,11 @@ pub(crate) mod row;
 #[cfg_attr(fuzzing, allow(dead_code))]
 pub(crate) mod test_util;
 pub(crate) use row::{RegisterTuple, RowEnvelope, RowVersion};
-pub(crate) mod memory;
 pub(crate) mod contract_suite;
 pub(crate) mod incumbent;
 #[cfg(feature = "json")]
 pub(crate) mod json;
+pub(crate) mod memory;
 pub(crate) mod migration;
 
 #[cfg(all(test, unix, feature = "json", feature = "redb"))]
