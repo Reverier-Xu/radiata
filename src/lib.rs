@@ -158,7 +158,6 @@ pub mod adapters {
   use std::{path::PathBuf, sync::Arc};
 
   use crate::extension::KeyProvider;
-  #[cfg(any(feature = "json", feature = "redb"))]
   use crate::extension::StorageFactory;
 
   /// Creates a test-only immutable JSON generation store factory rooted at
