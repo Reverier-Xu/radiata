@@ -6,7 +6,9 @@ use crate::{
   ShutdownReason, StreamMetadata, StreamPolicy, StreamTarget, TaggedEvent, Task, TraceId,
   api::{BoxFuture, Entropy},
   extension_registry::ExtensionRegistry,
-  node::{Credentials, Listeners, Members, Resources, Routes, Sessions, Tasks, Topology, Trust},
+  node::{
+    Credentials, Listeners, Members, Resources, Routes, Sessions, Tasks, Topology, Triggers, Trust,
+  },
   packet::DeliveryAck,
   runtime::{Control, RuntimeClient},
   view::{
@@ -162,6 +164,12 @@ impl NodeHandle {
   /// caller-registered extension kinds.
   pub fn tasks(&self) -> Tasks {
     Tasks::new(&self.runtime, &self.extensions, self)
+  }
+
+  /// The node's trigger declarations: durable node-local rows driven by
+  /// cadence patterns or subscription predicates (see [`Triggers`]).
+  pub fn triggers(&self) -> Triggers {
+    Triggers::new(&self.runtime, &self.extensions)
   }
 
   // -- lifecycle ------------------------------------------------------

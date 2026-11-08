@@ -6,7 +6,7 @@ mod predicate;
 mod revision;
 
 pub use api::{
-  Credentials, Listeners, Members, Resources, Routes, Sessions, Tasks, Topology, Trust,
+  Credentials, Listeners, Members, Resources, Routes, Sessions, Tasks, Topology, Triggers, Trust,
 };
 pub use builder::NodeBuilder;
 pub(crate) use event::EventHub;

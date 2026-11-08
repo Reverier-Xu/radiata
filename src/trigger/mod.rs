@@ -325,32 +325,53 @@ fn trigger_key(name: &str) -> StoreKey {
   StoreKey::new(Arc::from(name.as_bytes().to_vec()))
 }
 
-/// Validates the registration inputs the store layer cannot see: a time
-/// source's pattern must parse in a resolvable frame, and the target
-/// must be a registered caller-owned task reconciler (the same rule the
-/// public `tasks().submit` admission enforces).
-fn validate_source_and_target(
-  extensions: &ExtensionRegistry, source: &TriggerSource, target: &QualifiedTag,
-) -> Result<Option<Pattern>> {
-  let pattern = match source {
-    TriggerSource::Time { pattern } => {
-      let pattern = Pattern::parse(pattern).map_err(|_| Error::invalid_input("trigger pattern"))?;
-      if pattern.offset() == Offset::Local {
-        // The core resolves no local timezone: the pattern's frame must
-        // name its offset (`Z` or fixed), so the trigger's fire times
-        // never depend on a timezone database the core does not carry.
-        return Err(Error::invalid_input("trigger pattern frame"));
-      }
-      Some(pattern)
-    }
-    TriggerSource::Event { .. } => None,
-  };
+/// Validates the trigger target the store layer cannot see: a
+/// registered caller-owned task reconciler (the same rule the public
+/// `tasks().submit` admission enforces — the builtin domain is
+/// reserved).
+pub(crate) fn validate_trigger_target(
+  extensions: &ExtensionRegistry, target: &QualifiedTag,
+) -> Result<()> {
   if target.domain() == crate::protocol::tag::BUILTIN_DOMAIN
     || extensions.task_reconciler(target).is_none()
   {
     return Err(Error::unsupported(format!("trigger target {target}")));
   }
-  Ok(pattern)
+  Ok(())
+}
+
+/// Builds one time-trigger row: the pattern must parse in a resolvable
+/// frame (the core resolves no local timezone — the pattern's frame
+/// must name its offset, so the fire times never depend on a timezone
+/// database the core does not carry), and the initial watermark is the
+/// first fire at or after the current second.
+pub(crate) fn prepare_time_trigger(
+  name: &str, pattern: &str, target: QualifiedTag,
+) -> Result<TriggerRow> {
+  let pattern = Pattern::parse(pattern).map_err(|_| Error::invalid_input("trigger pattern"))?;
+  if pattern.offset() == Offset::Local {
+    // The core resolves no local timezone: the pattern's frame must
+    // name its offset (`Z` or fixed), so the trigger's fire times never
+    // depend on a timezone database the core does not carry.
+    return Err(Error::invalid_input("trigger pattern frame"));
+  }
+  let next_fire = next_fire_after(&pattern, crate::time::now_seconds())?;
+  TriggerRow::new(
+    name.to_owned(),
+    TriggerSource::Time {
+      pattern: pattern.to_string(),
+    },
+    target,
+    next_fire,
+  )
+}
+
+/// Builds one event-trigger row: the predicate is already typed value
+/// state.
+pub(crate) fn prepare_event_trigger(
+  name: &str, predicate: SubscriptionPredicate, target: QualifiedTag,
+) -> Result<TriggerRow> {
+  TriggerRow::new(name.to_owned(), TriggerSource::Event { predicate }, target, 0)
 }
 
 /// The next due fire of `pattern` at or after `start_seconds` (inclusive,
@@ -383,7 +404,7 @@ fn fire_seconds(values: &radiata_cadence::FieldValues, frame: Offset) -> u64 {
 /// Persists one trigger row through the core-verb entry: an idempotent
 /// conditional put (identical bytes are a no-op, a raced divergent write
 /// conflicts and the caller's error surfaces typed).
-async fn put_trigger_row_ctx(
+pub(crate) async fn put_trigger_row_ctx(
   store: &MetadataStore, entropy: &dyn Entropy, row: &TriggerRow,
 ) -> Result<()> {
   let namespace = namespace()?;
@@ -414,57 +435,6 @@ async fn put_trigger_row_ctx(
   // namespace, so there is nothing to rescan.
   store.commit(transaction).await?;
   Ok(())
-}
-
-/// Registers one trigger row: validates the source and target, then
-/// persists the declaration durably. Re-registering the same name with
-/// the same declaration is a no-op; a different declaration for a live
-/// name conflicts (remove first).
-pub(crate) async fn register_time_trigger_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy, extensions: &ExtensionRegistry, name: &str,
-  pattern: &str, target: QualifiedTag,
-) -> Result<()> {
-  let pattern = validate_source_and_target(
-    extensions,
-    &TriggerSource::Time {
-      pattern: pattern.to_owned(),
-    },
-    &target,
-  )?
-  .expect("a time source validates to a pattern");
-  let now = crate::time::now_seconds();
-  let next_fire = next_fire_after(&pattern, now)?;
-  let row = TriggerRow::new(
-    name.to_owned(),
-    TriggerSource::Time {
-      pattern: pattern.to_string(),
-    },
-    target,
-    next_fire,
-  )?;
-  put_trigger_row_ctx(store, entropy, &row).await
-}
-
-/// Registers one event trigger row: validates the target, then persists
-/// the declaration. The predicate is already typed value state.
-pub(crate) async fn register_event_trigger_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy, extensions: &ExtensionRegistry, name: &str,
-  predicate: SubscriptionPredicate, target: QualifiedTag,
-) -> Result<()> {
-  validate_source_and_target(
-    extensions,
-    &TriggerSource::Event {
-      predicate: predicate.clone(),
-    },
-    &target,
-  )?;
-  let row = TriggerRow::new(
-    name.to_owned(),
-    TriggerSource::Event { predicate },
-    target,
-    0,
-  )?;
-  put_trigger_row_ctx(store, entropy, &row).await
 }
 
 /// Removes one trigger row by name. `false` when no row carried it.
@@ -528,37 +498,20 @@ pub(crate) async fn list_trigger_rows_ctx(store: &MetadataStore) -> Result<Vec<T
 pub(crate) async fn evaluate_pass(
   store: &MetadataStore, entropy: &dyn Entropy, state: &TriggerState,
 ) -> Result<()> {
-  let namespace = namespace()?;
-  let snapshot = store.snapshot().await?;
-  let mut scan = snapshot.scan(&namespace, &[]).await?;
+  let rows = list_trigger_rows_ctx(store).await?;
   let now = crate::time::now_seconds();
   let mut event_rows = BTreeMap::new();
   let mut advanced: Vec<TriggerRow> = Vec::new();
-  let mut dropped_cache = 0_usize;
-  while let Some(entry) = scan.next().await? {
-    if event_rows.len() + advanced.len() >= TRIGGER_ROW_CAP {
-      break;
-    }
-    let row = match TriggerRow::decode(entry.value().as_bytes()) {
-      Ok(row) => row,
-      Err(error) => {
-        tracing::warn!(kind = ?error.kind(), "trigger row skipped: undecodable declaration");
-        continue;
-      }
-    };
+  for row in rows {
     match row.source() {
       TriggerSource::Event { predicate } => {
-        if event_rows.len() < TRIGGER_ROW_CAP {
-          event_rows.insert(
-            row.name().to_owned(),
-            EventTrigger {
-              predicate: predicate.clone(),
-              target: row.target().clone(),
-            },
-          );
-        } else {
-          dropped_cache += 1;
-        }
+        event_rows.insert(
+          row.name().to_owned(),
+          EventTrigger {
+            predicate: predicate.clone(),
+            target: row.target().clone(),
+          },
+        );
       }
       TriggerSource::Time { pattern } => {
         if row.next_fire_seconds() > now {
@@ -599,16 +552,8 @@ pub(crate) async fn evaluate_pass(
       }
     }
   }
-  drop(scan);
-  drop(snapshot);
   state.replace_event_rows(event_rows);
-  if dropped_cache > 0 {
-    tracing::warn!(
-      dropped = dropped_cache,
-      "event trigger cache capped; rows past the cap stay unevaluated this pass"
-    );
-  }
-  // The watermark advances land after the snapshot is released, each an
+  // The watermark advances land after the scan is released, each an
   // idempotent conditional put on the row's own read. A conflict or a
   // store failure leaves the watermark due: the next pass re-fires
   // (at-least-once), never skips.
@@ -636,6 +581,26 @@ mod tests {
     let mut extensions = ExtensionRegistry::new();
     extensions.register_default().expect("default pass");
     extensions
+  }
+
+  /// Registers one trigger row over the store directly (the test-level
+  /// composition of the production path's prepare + validate + persist).
+  async fn register_time_trigger_ctx(
+    store: &MetadataStore, entropy: &dyn Entropy, extensions: &ExtensionRegistry, name: &str,
+    pattern: &str, target: QualifiedTag,
+  ) -> Result<()> {
+    validate_trigger_target(extensions, &target)?;
+    let row = prepare_time_trigger(name, pattern, target)?;
+    put_trigger_row_ctx(store, entropy, &row).await
+  }
+
+  async fn register_event_trigger_ctx(
+    store: &MetadataStore, entropy: &dyn Entropy, extensions: &ExtensionRegistry, name: &str,
+    predicate: SubscriptionPredicate, target: QualifiedTag,
+  ) -> Result<()> {
+    validate_trigger_target(extensions, &target)?;
+    let row = prepare_event_trigger(name, predicate, target)?;
+    put_trigger_row_ctx(store, entropy, &row).await
   }
 
   fn target() -> QualifiedTag {

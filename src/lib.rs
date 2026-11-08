@@ -75,7 +75,7 @@ pub use label::{LabelKey, LabelSet, LabelValue};
 pub use node::{
   Credentials, EventOptions, EventReceive, EventSubscription, Listeners, MemberRevision, Members,
   NodeBuilder, NodeHandle, Resources, Routes, Sessions, SubscriptionPredicate, Tasks, Topology,
-  Trust,
+  Triggers, Trust,
 };
 pub use operation::{
   Event, IdentityReplaced, MemberChanged, NodeRevoked, RecoveryChanged, ResourceChanged,

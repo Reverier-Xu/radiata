@@ -29,6 +29,7 @@ use super::{
 };
 use crate::{
   Endpoint, Error, MergeView, NodeConfig, NodeId, PublicKey, Result, RevokeOutcome, Task, TaskKind,
+  TaskOutput,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   identity::{credential::MergeCredential, lifecycle::LocalIdentityContext},
@@ -37,11 +38,11 @@ use crate::{
     SessionDriver,
     stream::{SessionPacketContext, SessionTable, retire_session},
   },
-  task::output::{
+  task::{CoreTaskKind, output::{
     encode_checkpoint, encode_connect, encode_join, encode_leave, encode_listen, encode_member,
     encode_receipt_retention, encode_recovery, encode_resource_mutation, encode_revoke,
     encode_unit,
-  },
+  }},
 };
 
 /// The node's tracked connection tasks: the kept session tasks of the
@@ -137,6 +138,10 @@ pub(crate) struct OperationDeps {
   /// drain. The manager keeps the runner handles, so this half never
   /// pins the lanes' lifetime.
   observation_lanes: std::sync::OnceLock<crate::task::ObservationScheduler>,
+  /// The trigger engine's shared state (see [`Self::triggers`]). The
+  /// default state has a closed fire queue — a fixture-built dependency
+  /// set without the runtime's engine drops enqueued fires with a warn.
+  triggers: crate::trigger::TriggerState,
 }
 
 impl OperationDeps {
@@ -152,6 +157,7 @@ impl OperationDeps {
       events: Arc::clone(&dependencies.events),
       extensions: Arc::clone(&dependencies.extensions),
       observation_lanes: std::sync::OnceLock::new(),
+      triggers: dependencies.triggers.clone().unwrap_or_default(),
       planes: EffectPlanes {
         context: dependencies
           .context
@@ -202,6 +208,13 @@ impl OperationDeps {
   /// no per-effect runtime re-proof.
   pub(super) fn planes(&self) -> &EffectPlanes {
     &self.planes
+  }
+
+  /// The trigger engine's shared state: the event-trigger cache the
+  /// evaluation pass refreshes and the bounded fire queue the dispatch
+  /// engine drains (see `crate::trigger::TriggerState`).
+  pub(super) fn triggers(&self) -> &crate::trigger::TriggerState {
+    &self.triggers
   }
 
   /// Installs the bounded observation lanes' scheduling half. Called
@@ -1467,6 +1480,141 @@ pub(crate) async fn sync_round(tasks: &TaskClient) -> Result<Task<()>> {
   ))
 }
 
+/// Admits one core-owned controller pass (the retention sweeps, the
+/// checkpoint-gated tombstone collection, the trigger evaluation pass).
+/// The effect closes over the kind and dispatches to the same engine
+/// body the tick's inline path runs, so the swept/retained sets are
+/// identical whichever path the incarnation takes. The pass draws from
+/// the controller slot class (its own budget) and declares one attempt,
+/// no coalescing, and a cancellable shutdown — the cadence owner skips
+/// overlapping passes and the next tick retries a failed one.
+pub(crate) async fn admit_core_controller(tasks: &TaskClient, kind: TaskKind) -> Result<Task<()>> {
+  let effect_kind = kind.clone();
+  let effect: TaskEffect = Arc::new(move |deps, _attempt| {
+    let kind = effect_kind.clone();
+    Box::pin(async move { reconcile_core_controller(deps, kind).await })
+  });
+  let id = tasks
+    .submit(TaskSpec::new(kind.clone(), TaskPayload::None), effect)
+    .await?;
+  Ok(Task::from_parts(id, kind, tasks.observer.clone()))
+}
+
+/// One controller pass's effect: dispatch to the shared engine body for
+/// the kind. A failed engine call is the task's typed terminal failure
+/// (observable through the task surface), never a silent drop; a no-op
+/// gate (e.g. no eligible cleanup-checkpoint watermark) is a success.
+async fn reconcile_core_controller(
+  deps: Arc<OperationDeps>, kind: TaskKind,
+) -> Result<EffectOutcome> {
+  let outcome = match CoreTaskKind::from_tag(&kind) {
+    Some(CoreTaskKind::TraceRetention) => {
+      let limits = deps.planes().config.trace_metadata_limits();
+      super::retention::sweep_trace_records(
+        deps.planes().context.store(),
+        deps.planes().entropy.as_ref(),
+        trace_live_records(deps.as_ref())?,
+        limits.terminal(),
+        limits.retention(),
+      )
+      .await
+    }
+    Some(CoreTaskKind::ResourceRemovalRetention) => {
+      super::retention::sweep_resource_removals(
+        deps.planes().context.store(),
+        deps.planes().config.resource_removal_retention(),
+        deps.planes().config.resource_removal_cap(),
+      )
+      .await
+    }
+    Some(CoreTaskKind::ReceiptRetention) => {
+      super::retention::sweep_receipts(deps.planes().context.store()).await
+    }
+    Some(CoreTaskKind::TombstoneCollection) => {
+      super::retention::sweep_collected_tombstones(
+        deps.planes().context.store(),
+        deps.planes().entropy.as_ref(),
+      )
+      .await
+    }
+    Some(CoreTaskKind::TriggerEvaluation) => {
+      crate::trigger::evaluate_pass(
+        deps.planes().context.store(),
+        deps.planes().entropy.as_ref(),
+        deps.triggers(),
+      )
+      .await
+    }
+    _ => return Err(Error::internal("controller kind")),
+  };
+  match outcome {
+    Ok(()) => Ok(EffectOutcome::new(TaskOutput::new(Arc::from([])))),
+    Err(error) => {
+      tracing::warn!(task = %kind, kind = ?error.kind(), "controller pass failed");
+      Err(error)
+    }
+  }
+}
+
+/// The trace sink's live-record counter: the one the retention sweep
+/// decrements (the same counter the observability view reads). The sink
+/// is born with the packet context on every production incarnation.
+fn trace_live_records(deps: &OperationDeps) -> Result<&std::sync::atomic::AtomicUsize> {
+  deps
+    .planes()
+    .packet
+    .trace_sink()
+    .map(|sink| sink.live_records().as_ref())
+    .ok_or_else(|| Error::internal("trace sink"))
+}
+
+/// Admits one trigger declaration registration: the caller-built row
+/// (the facade has already validated the pattern frame and the target
+/// reconciler) persists durably through the core-verb entry. One
+/// attempt, no coalescing, cancellable — the registration is an
+/// idempotent conditional put the caller re-drives on failure.
+pub(crate) async fn register_trigger(
+  tasks: &TaskClient, row: crate::trigger::TriggerRow,
+) -> Result<Task<()>> {
+  let effect: TaskEffect = Arc::new(move |deps, _attempt| {
+    let row = row.clone();
+    Box::pin(async move {
+      crate::trigger::put_trigger_row_ctx(
+        deps.planes().context.store(),
+        deps.planes().entropy.as_ref(),
+        &row,
+      )
+      .await?;
+      Ok(EffectOutcome::new(TaskOutput::new(Arc::from([]))))
+    })
+  });
+  let id = tasks
+    .submit(TaskSpec::new(TaskKind::REGISTER_TRIGGER, TaskPayload::None), effect)
+    .await?;
+  Ok(Task::from_parts(id, TaskKind::REGISTER_TRIGGER, tasks.observer.clone()))
+}
+
+/// Admits one trigger declaration removal by name. Idempotent: removing
+/// an absent name succeeds.
+pub(crate) async fn remove_trigger(tasks: &TaskClient, name: String) -> Result<Task<()>> {
+  let effect: TaskEffect = Arc::new(move |deps, _attempt| {
+    let name = name.clone();
+    Box::pin(async move {
+      crate::trigger::remove_trigger_ctx(
+        deps.planes().context.store(),
+        deps.planes().entropy.as_ref(),
+        &name,
+      )
+      .await?;
+      Ok(EffectOutcome::new(TaskOutput::new(Arc::from([]))))
+    })
+  });
+  let id = tasks
+    .submit(TaskSpec::new(TaskKind::REMOVE_TRIGGER, TaskPayload::None), effect)
+    .await?;
+  Ok(Task::from_parts(id, TaskKind::REMOVE_TRIGGER, tasks.observer.clone()))
+}
+
 /// The listen effect: the moved supervisor body — bind the advertised
 /// endpoint, spawn the bounded-backoff accept loop into the node's
 /// tracked connection tasks, register the listener, and publish the
@@ -2047,6 +2195,8 @@ mod lazy_publication_shutdown_tests {
         connection_tasks: Arc::clone(&connection_tasks),
         listeners: Default::default(),
         task_manager: None,
+        tasks: None,
+        triggers: None,
         operations: None,
         runtime_seed: None,
       },

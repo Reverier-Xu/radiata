@@ -530,3 +530,83 @@ impl Tasks {
     self.runtime.task_client()
   }
 }
+
+/// The node's trigger declarations: durable, node-local rows whose
+/// source is a cadence pattern (time triggers) or a
+/// [`crate::SubscriptionPredicate`] (event triggers), and whose target
+/// is a registered caller-owned task reconciler kind — the same rule
+/// the `tasks().submit` admission enforces.
+///
+/// Registration is an admitted task (see the returned [`Task`]): the
+/// durable row write lands through the task machinery's own store
+/// entry, so `wait()` resolves after the declaration is durable. The
+/// evaluation pass runs on the node's own controller cadence: a time
+/// trigger's first fire is the first pattern window at or after
+/// registration, and an event trigger is matched against the live
+/// change stream once the next pass has loaded it (bounded by the
+/// controller tick period).
+///
+/// Patterns are expressed in the frame the pattern declares (`Z` or a
+/// fixed offset); a device-local pattern is refused — the core
+/// resolves no local timezone.
+pub struct Triggers {
+  runtime: RuntimeClient,
+  /// The node-local extension registry: the target reconciler lookup
+  /// behind registration.
+  extensions: std::sync::Arc<ExtensionRegistry>,
+}
+
+impl Triggers {
+  pub(crate) fn new(
+    runtime: &RuntimeClient, extensions: &std::sync::Arc<ExtensionRegistry>,
+  ) -> Self {
+    Self {
+      runtime: runtime.clone(),
+      extensions: extensions.clone(),
+    }
+  }
+
+  /// Registers one time trigger: `pattern` is the cadence pattern text,
+  /// `target` the qualified tag of a registered caller-owned task
+  /// reconciler. Re-registering the same name with the same declaration
+  /// is a no-op; a different declaration for a live name conflicts
+  /// (remove first).
+  pub async fn register_time(
+    self, name: &str, pattern: &str, target: crate::QualifiedTag,
+  ) -> Result<Task<()>> {
+    let row = crate::trigger::prepare_time_trigger(name, pattern, target.clone())?;
+    crate::trigger::validate_trigger_target(&self.extensions, &target)?;
+    let client = self.admit_client().await?;
+    crate::runtime::register_trigger(&client, row).await
+  }
+
+  /// Registers one event trigger: `predicate` filters the live resource
+  /// change stream (the same emit-side evaluation the watch
+  /// subscriptions use), `target` the qualified tag of a registered
+  /// caller-owned task reconciler.
+  pub async fn register_event(
+    self, name: &str, predicate: crate::SubscriptionPredicate,
+    target: crate::QualifiedTag,
+  ) -> Result<Task<()>> {
+    let row = crate::trigger::prepare_event_trigger(name, predicate, target.clone())?;
+    crate::trigger::validate_trigger_target(&self.extensions, &target)?;
+    let client = self.admit_client().await?;
+    crate::runtime::register_trigger(&client, row).await
+  }
+
+  /// Removes one trigger declaration by name. Idempotent: removing an
+  /// absent name succeeds.
+  pub async fn remove(self, name: &str) -> Result<Task<()>> {
+    let client = self.admit_client().await?;
+    crate::runtime::remove_trigger(&client, name.to_owned()).await
+  }
+
+  /// The running-gated admission client (the same gate every mutating
+  /// verb applies).
+  async fn admit_client(&self) -> Result<TaskClient> {
+    if self.runtime.status() != crate::NodeStatus::Running {
+      return Err(crate::Error::shutting_down("node triggers"));
+    }
+    Ok(self.runtime.task_client()?.clone())
+  }
+}

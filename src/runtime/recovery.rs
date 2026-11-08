@@ -54,6 +54,7 @@ pub(super) async fn run_recovery_worker(state: Arc<TickState>) {
         state.resource_removal_sweep().await;
         state.receipt_retention_sweep().await;
         state.collected_tombstone_sweep().await;
+        state.trigger_evaluation_sweep().await;
       }
     }
   }
@@ -1144,6 +1145,8 @@ mod tests {
         connection_tasks: Arc::clone(&connection_tasks),
         listeners: Default::default(),
         task_manager: None,
+        tasks: None,
+        triggers: None,
         operations: None,
         runtime_seed: None,
       },

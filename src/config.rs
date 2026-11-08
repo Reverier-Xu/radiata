@@ -97,6 +97,10 @@ pub struct NodeConfig {
   // caller-registered extension kinds, which routinely await other
   // admitted tasks through their public handle.
   task_reconcile_extension_slots: usize,
+  // The task manager's controller-class execution-slot budget: the
+  // core's own controllers (the retention sweeps, the checkpoint-gated
+  // tombstone collection, the trigger evaluation pass).
+  task_reconcile_controller_slots: usize,
 }
 
 impl NodeConfig {
@@ -251,6 +255,20 @@ impl NodeConfig {
   pub fn with_task_reconcile_extension_slots(mut self, extension: usize) -> Result<Self> {
     extension.zero_checked("extension task reconcile slots")?;
     self.task_reconcile_extension_slots = extension;
+    Ok(self)
+  }
+
+  /// Sets the task manager's controller-class execution-slot budget:
+  /// the core's own controllers (the retention sweeps, the
+  /// checkpoint-gated tombstone collection, the trigger evaluation
+  /// pass) draw from their own channel, so a backed-up controller never
+  /// consumes the caller-owned local, dial, or extension budgets.
+  /// Purely local admission, never peer-visible; the value must be
+  /// nonzero. Completed controller passes stay observable through the
+  /// task surface's bounded terminal history.
+  pub fn with_task_reconcile_controller_slots(mut self, controller: usize) -> Result<Self> {
+    controller.zero_checked("controller task reconcile slots")?;
+    self.task_reconcile_controller_slots = controller;
     Ok(self)
   }
 
@@ -445,6 +463,12 @@ impl NodeConfig {
     self.task_reconcile_extension_slots
   }
 
+  /// The controller-class execution-slot budget consumed by the task
+  /// manager's admission channel (nonzero by construction).
+  pub(crate) const fn task_reconcile_controller_slots(&self) -> usize {
+    self.task_reconcile_controller_slots
+  }
+
   pub fn require_feature(mut self, value: FeatureTag) -> Result<Self> {
     if !self.required_features.insert(value) {
       return Err(Error::conflict("required feature"));
@@ -510,6 +534,11 @@ impl Default for NodeConfig {
       task_reconcile_local_slots: 2,
       task_reconcile_network_slots: 2,
       task_reconcile_extension_slots: 2,
+      // Four controller permits: the shipped retention set is four
+      // sweeps plus the trigger evaluation pass, so a full controller
+      // pass runs without stacking behind a slow sweep, while the
+      // budget still bounds a pathological controller population.
+      task_reconcile_controller_slots: 4,
     }
   }
 }

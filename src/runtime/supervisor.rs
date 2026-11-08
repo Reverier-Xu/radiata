@@ -10,7 +10,7 @@ use super::{
   anti_entropy::spawn_sync_driver,
   packets::{PacketAdmission, PumpHandoff},
   shutdown::finish_shutdown,
-  task_manager::{TaskManagerHandle, spawn_task_manager},
+  task_manager::{TaskClient, TaskManagerHandle, spawn_task_manager},
 };
 use crate::{
   Endpoint, Error, NodeConfig, NodeId, Result, ShutdownOutcome, ShutdownReason,
@@ -206,6 +206,17 @@ pub(crate) struct RuntimeDependencies {
   /// admission, broadcasts its cancel watch, and drains it before the
   /// node's own task set is shut down.
   pub(crate) task_manager: Option<TaskManagerHandle>,
+  /// The task manager's client half, installed by `spawn_runtime` right
+  /// after the manager spawns: the tick workers' controller submissions
+  /// (the retention sweeps, the checkpoint-gated tombstone collection,
+  /// the trigger evaluation pass) read it. A fixture-built supervisor
+  /// without a manager carries `None` and its sweeps run inline.
+  pub(crate) tasks: Option<TaskClient>,
+  /// The trigger engine's shared state, installed by `spawn_runtime`:
+  /// the event-trigger cache the evaluation pass refreshes and the
+  /// bounded fire queue the dispatch engine drains. Fixture-built
+  /// dependencies carry `None` (the default state, closed queue).
+  pub(crate) triggers: Option<crate::trigger::TriggerState>,
   /// The node-shared operation handles: the session driver, packet
   /// context, shutdown signal, and the effect-side collaborators every
   /// migrated mutating verb reads. Built here (one construction site)
@@ -338,6 +349,12 @@ pub(crate) async fn spawn_runtime(
     leave_signal.clone(),
   )?;
   dependencies.operations = Some(Arc::clone(&operations));
+  // The trigger engine's shared state: the fire queue's receiving end is
+  // handed to the engine task below, the state rides the operation planes
+  // (the evaluation pass reaches it through them).
+  let (trigger_fires, trigger_fires_rx) =
+    tokio::sync::mpsc::channel(crate::trigger::TRIGGER_FIRE_QUEUE);
+  dependencies.triggers = Some(crate::trigger::TriggerState::new(trigger_fires));
   // The task manager is spawned here, beside the supervisor and before the
   // node is marked running: the client side rides the node handle (so an
   // admitted task always has a live manager) and the teardown handle rides
@@ -345,17 +362,33 @@ pub(crate) async fn spawn_runtime(
   let (task_client, task_manager) = spawn_task_manager(super::task_manager::TaskManagerDeps {
     entropy: dependencies.entropy.clone(),
     clock: Arc::new(crate::time::HostWallClock),
-    operations,
+    operations: Arc::clone(&operations),
     leave_signal,
   })?;
   dependencies.task_manager = Some(task_manager);
+  dependencies.tasks = Some(task_client.clone());
   let client = RuntimeClient::new(
     control_tx,
     state_rx,
     routes,
     packet_tx.clone(),
-    Some(task_client),
+    Some(task_client.clone()),
   );
+  // The trigger dispatch engine: one long-lived task over the fire queue
+  // and the live change stream, exiting on the incarnation's shutdown
+  // signal. Its reconciler contexts ride an ordinary public node handle.
+  runtime.spawn(super::trigger_engine::run_trigger_engine(
+    operations,
+    task_client,
+    crate::NodeHandle::new(
+      client.clone(),
+      dependencies.entropy.clone(),
+      dependencies.extensions.clone(),
+      dependencies.events.clone(),
+      dependencies.member_revision.subscribe(),
+    ),
+    trigger_fires_rx,
+  ));
 
   runtime.spawn(supervise(
     dependencies,
@@ -940,6 +973,11 @@ pub(super) struct TickState {
   /// the recovery worker mutates it; a racing read at worst shifts one
   /// cut by one tick.
   pub(super) prune_cooldown: Arc<std::sync::atomic::AtomicU32>,
+  /// The task manager's client half, when the incarnation carries a
+  /// manager (production always does): the controller submissions run
+  /// the sweeps on the task machinery. `None` — the fixture-built
+  /// supervisor without a manager — runs the same engine bodies inline.
+  pub(super) tasks: Option<TaskClient>,
 }
 
 impl TickState {
@@ -994,6 +1032,12 @@ impl TickState {
   /// planes).
   pub(super) fn exclusion_cache(&self) -> &super::recovery::ExclusionCache {
     &self.operations.planes().exclusion_cache
+  }
+
+  /// The task manager's client half, when the incarnation carries a
+  /// manager (see [`TickState::tasks`]).
+  pub(super) fn tasks(&self) -> Option<&TaskClient> {
+    self.tasks.as_ref()
   }
 }
 
@@ -1173,6 +1217,7 @@ impl Supervisor {
       events: Arc::clone(&self.dependencies.events),
       shutdown: self.shutdown_tx.subscribe(),
       trace_records: Arc::clone(&self.trace_records),
+      tasks: self.dependencies.tasks.clone(),
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       endpoint_attempts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -1317,6 +1362,8 @@ mod receipt_retention_sweep_tests {
       connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
       listeners: Default::default(),
       task_manager: None,
+      tasks: None,
+      triggers: None,
       operations: None,
       runtime_seed: None,
     };
@@ -2258,6 +2305,8 @@ pub(crate) mod test_support {
       connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
       listeners: Default::default(),
       task_manager: None,
+      tasks: None,
+      triggers: None,
       operations: None,
       runtime_seed: None,
     };

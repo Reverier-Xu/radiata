@@ -98,6 +98,27 @@ impl TaskKind {
   pub const SYNC_ROUND: Self = Self(QualifiedTag::from_static(
     "radiata.woooo.tech/tasks/sync-round",
   ));
+  pub const TRACE_RETENTION: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/trace-retention",
+  ));
+  pub const RESOURCE_REMOVAL_RETENTION: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/resource-removal-retention",
+  ));
+  pub const RECEIPT_RETENTION: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/receipt-retention",
+  ));
+  pub const TOMBSTONE_COLLECTION: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/tombstone-collection",
+  ));
+  pub const TRIGGER_EVALUATION: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/trigger-evaluation",
+  ));
+  pub const REGISTER_TRIGGER: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/register-trigger",
+  ));
+  pub const REMOVE_TRIGGER: Self = Self(QualifiedTag::from_static(
+    "radiata.woooo.tech/tasks/remove-trigger",
+  ));
 
   /// Parses one kind tag: any canonical qualified tag. A tag outside the
   /// core set is a caller-defined kind and must live under a caller-owned
@@ -164,12 +185,23 @@ pub(crate) enum CoreTaskKind {
   StartRecovery,
   ApplyReceiptRetention,
   SyncRound,
+  /// Core-owned controllers: the retention sweeps, the checkpoint-gated
+  /// tombstone collection, and the trigger evaluation pass. Their effects
+  /// are the runtime's own closures over the existing engines (see
+  /// `runtime::retention` and `runtime::task_effects`).
+  TraceRetention,
+  ResourceRemovalRetention,
+  ReceiptRetention,
+  TombstoneCollection,
+  TriggerEvaluation,
+  RegisterTrigger,
+  RemoveTrigger,
 }
 
 /// Every core verb, in canonical tag order: the single source of the
 /// closed set. [`CoreTaskKind::from_tag`] scans it, so a verb cannot be
 /// added to [`TaskKind`]'s constants and forgotten here.
-const CORE_TASK_KINDS: [CoreTaskKind; 19] = [
+const CORE_TASK_KINDS: [CoreTaskKind; 26] = [
   CoreTaskKind::Join,
   CoreTaskKind::Leave,
   CoreTaskKind::Connect,
@@ -189,6 +221,13 @@ const CORE_TASK_KINDS: [CoreTaskKind; 19] = [
   CoreTaskKind::StartRecovery,
   CoreTaskKind::ApplyReceiptRetention,
   CoreTaskKind::SyncRound,
+  CoreTaskKind::TraceRetention,
+  CoreTaskKind::ResourceRemovalRetention,
+  CoreTaskKind::ReceiptRetention,
+  CoreTaskKind::TombstoneCollection,
+  CoreTaskKind::TriggerEvaluation,
+  CoreTaskKind::RegisterTrigger,
+  CoreTaskKind::RemoveTrigger,
 ];
 
 impl CoreTaskKind {
@@ -222,6 +261,13 @@ impl CoreTaskKind {
       Self::StartRecovery => TaskKind::START_RECOVERY,
       Self::ApplyReceiptRetention => TaskKind::APPLY_RECEIPT_RETENTION,
       Self::SyncRound => TaskKind::SYNC_ROUND,
+      Self::TraceRetention => TaskKind::TRACE_RETENTION,
+      Self::ResourceRemovalRetention => TaskKind::RESOURCE_REMOVAL_RETENTION,
+      Self::ReceiptRetention => TaskKind::RECEIPT_RETENTION,
+      Self::TombstoneCollection => TaskKind::TOMBSTONE_COLLECTION,
+      Self::TriggerEvaluation => TaskKind::TRIGGER_EVALUATION,
+      Self::RegisterTrigger => TaskKind::REGISTER_TRIGGER,
+      Self::RemoveTrigger => TaskKind::REMOVE_TRIGGER,
     }
   }
 
@@ -242,6 +288,12 @@ impl CoreTaskKind {
   pub(crate) const fn slot_class(self) -> SlotClass {
     match self {
       Self::Join | Self::Connect => SlotClass::Network,
+      Self::TraceRetention
+      | Self::ResourceRemovalRetention
+      | Self::ReceiptRetention
+      | Self::TombstoneCollection
+      | Self::TriggerEvaluation => SlotClass::Controller,
+      Self::RegisterTrigger | Self::RemoveTrigger => SlotClass::Local,
       Self::Leave
       | Self::Disconnect
       | Self::Revoke
@@ -271,6 +323,12 @@ impl CoreTaskKind {
   pub(crate) const fn retry_class(self) -> RetryClass {
     match self {
       Self::Join | Self::Connect => RetryClass::Network,
+      Self::TraceRetention
+      | Self::ResourceRemovalRetention
+      | Self::ReceiptRetention
+      | Self::TombstoneCollection
+      | Self::TriggerEvaluation => RetryClass::Once,
+      Self::RegisterTrigger | Self::RemoveTrigger => RetryClass::Once,
       Self::Leave
       | Self::Disconnect
       | Self::Revoke
@@ -303,6 +361,13 @@ impl CoreTaskKind {
       Self::Disconnect | Self::PurgeRevocation | Self::Cleanup => Coalescing::Peer,
       Self::Revoke => Coalescing::RevokeKey,
       Self::Join
+      | Self::TraceRetention
+      | Self::ResourceRemovalRetention
+      | Self::ReceiptRetention
+      | Self::TombstoneCollection
+      | Self::TriggerEvaluation
+      | Self::RegisterTrigger
+      | Self::RemoveTrigger
       | Self::Leave
       | Self::IssueCleanupCheckpoint
       | Self::ResolveFrozenJournal
@@ -419,6 +484,13 @@ pub(crate) enum SlotClass {
   /// nested-submit refusal), because awaiting a task of one's own
   /// bounded channel can self-deadlock on that budget.
   Extension,
+  /// The core's own controllers (the retention sweeps, the
+  /// checkpoint-gated tombstone collection, the trigger evaluation
+  /// pass): their own channel so a slow or backed-up controller never
+  /// consumes the caller-owned local or dial budgets. The bounded
+  /// terminal history retains their completed runs, so every controller
+  /// pass stays an observable task record.
+  Controller,
 }
 
 /// The execution policy a task kind's registration declares: the slot
@@ -806,6 +878,18 @@ impl TaskTable {
     Ok(entries.get_mut(id).map(mutate))
   }
 
+  /// Whether any non-terminal (admitted, unsettled) task of `kind` is
+  /// live: the controller submissions' overlap check, so a cadence owner
+  /// whose previous pass still holds a slot skips the new pass instead
+  /// of stacking it behind the old one. Terminal entries never count.
+  pub(crate) fn has_non_terminal(&self, kind: &TaskKind) -> bool {
+    self.lock().is_ok_and(|entries| {
+      entries
+        .values()
+        .any(|entry| &entry.kind == kind && !entry.status.borrow().phase.is_terminal())
+    })
+  }
+
   /// Evicts oldest-terminal entries beyond `keep` (the bounded
   /// terminal history), dropping each evicted entry's consumed-once
   /// secret with it. Id order is admission order, so the first terminal
@@ -979,7 +1063,14 @@ impl TaskResult for () {
         | CoreTaskKind::Cleanup
         | CoreTaskKind::ResolveFrozenJournal
         | CoreTaskKind::StopListener
-        | CoreTaskKind::SyncRound,
+        | CoreTaskKind::SyncRound
+        | CoreTaskKind::TraceRetention
+        | CoreTaskKind::ResourceRemovalRetention
+        | CoreTaskKind::ReceiptRetention
+        | CoreTaskKind::TombstoneCollection
+        | CoreTaskKind::TriggerEvaluation
+        | CoreTaskKind::RegisterTrigger
+        | CoreTaskKind::RemoveTrigger,
       ) => output::decode_unit(output.bytes()),
       // A caller-defined kind's payload is the reconciler's own bytes:
       // the crate decodes nothing out of it.
@@ -1631,6 +1722,12 @@ mod tests {
         policy.slot_class,
         match core {
           CoreTaskKind::Join | CoreTaskKind::Connect => SlotClass::Network,
+          CoreTaskKind::TraceRetention
+          | CoreTaskKind::ResourceRemovalRetention
+          | CoreTaskKind::ReceiptRetention
+          | CoreTaskKind::TombstoneCollection
+          | CoreTaskKind::TriggerEvaluation => SlotClass::Controller,
+          CoreTaskKind::RegisterTrigger | CoreTaskKind::RemoveTrigger => SlotClass::Local,
           _ => SlotClass::Local,
         }
       );

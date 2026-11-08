@@ -31,6 +31,13 @@ impl MemberRevisionSignal {
   pub(crate) fn bump(&self) {
     self.revision.send_modify(|revision| *revision += 1);
   }
+
+  /// One independent observer half over the same counter: the runtime's
+  /// internal handle holders (the trigger engine's reconciler contexts)
+  /// observe the same revision signal the node builder's handle does.
+  pub(crate) fn subscribe(&self) -> crate::MemberRevision {
+    crate::MemberRevision::new(self.revision.subscribe())
+  }
 }
 
 /// The observer half handed out through

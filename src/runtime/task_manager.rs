@@ -60,14 +60,16 @@ struct ReconcileChannels {
   local: Arc<Semaphore>,
   network: Arc<Semaphore>,
   extension: Arc<Semaphore>,
+  controller: Arc<Semaphore>,
 }
 
 impl ReconcileChannels {
-  fn new(local: usize, network: usize, extension: usize) -> Self {
+  fn new(local: usize, network: usize, extension: usize, controller: usize) -> Self {
     Self {
       local: Arc::new(Semaphore::new(local)),
       network: Arc::new(Semaphore::new(network)),
       extension: Arc::new(Semaphore::new(extension)),
+      controller: Arc::new(Semaphore::new(controller)),
     }
   }
 
@@ -77,6 +79,7 @@ impl ReconcileChannels {
       SlotClass::Local => &self.local,
       SlotClass::Network => &self.network,
       SlotClass::Extension => &self.extension,
+      SlotClass::Controller => &self.controller,
     }
   }
 }
@@ -630,6 +633,7 @@ pub(crate) fn spawn_task_manager(deps: TaskManagerDeps) -> Result<(TaskClient, T
     planes.config.task_reconcile_local_slots(),
     planes.config.task_reconcile_network_slots(),
     planes.config.task_reconcile_extension_slots(),
+    planes.config.task_reconcile_controller_slots(),
   );
   let shared = Arc::new(ManagerShared {
     table,
@@ -2280,7 +2284,7 @@ mod tests {
 
   #[test]
   fn reconcile_channels_carry_the_configured_extension_budget() {
-    let channels = super::ReconcileChannels::new(1, 2, 3);
+    let channels = super::ReconcileChannels::new(1, 2, 3, 4);
     assert_eq!(
       channels
         .for_class(super::SlotClass::Local)
@@ -2299,6 +2303,13 @@ mod tests {
         .available_permits(),
       3,
       "the extension channel carries its configured budget"
+    );
+    assert_eq!(
+      channels
+        .for_class(super::SlotClass::Controller)
+        .available_permits(),
+      4,
+      "the controller channel carries its configured budget"
     );
   }
 

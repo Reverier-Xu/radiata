@@ -99,6 +99,8 @@ impl NodeBuilder {
           connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
           listeners: Default::default(),
           task_manager: None,
+          tasks: None,
+          triggers: None,
           operations: None,
           runtime_seed: None,
         },
