@@ -576,7 +576,9 @@ mod tests {
     if let Some(version) = from {
       options = options.from(version);
     }
-    ResourceWatch::subscribe(Arc::clone(store), options).await.unwrap()
+    ResourceWatch::subscribe(Arc::clone(store), options)
+      .await
+      .unwrap()
   }
 
   /// Subscribes one watch carrying a predicate pushed down into the
@@ -588,7 +590,9 @@ mod tests {
     if let Some(version) = from {
       options = options.from(version);
     }
-    ResourceWatch::subscribe(Arc::clone(store), options).await.unwrap()
+    ResourceWatch::subscribe(Arc::clone(store), options)
+      .await
+      .unwrap()
   }
 
   /// Installs `records` in order and returns the versions they got.
@@ -1067,7 +1071,9 @@ mod tests {
     let mut watch = subscribe_filtered(
       &store,
       Some(0),
-      crate::SubscriptionPredicate::new().domain("example.net").unwrap(),
+      crate::SubscriptionPredicate::new()
+        .domain("example.net")
+        .unwrap(),
     )
     .await;
     let delivered = next(&mut watch).await.unwrap();
@@ -1098,7 +1104,9 @@ mod tests {
       record(&other_name(2), 3_000, false),
     ];
     assert_eq!(install_all(&store, &records).await, vec![1, 2, 3]);
-    let predicate = crate::SubscriptionPredicate::new().domain("example.net").unwrap();
+    let predicate = crate::SubscriptionPredicate::new()
+      .domain("example.net")
+      .unwrap();
 
     // Full replay: 1 and 3, with 2 consumed but skipped.
     let mut replay = subscribe_filtered(&store, Some(0), predicate.clone()).await;
@@ -1130,10 +1138,12 @@ mod tests {
       name(2),
       LabelValue::parse("document").unwrap(),
       crate::ResourceUri::parse("file:///feed").unwrap(),
-      LabelSet::new().insert(
-        LabelKey::parse("example.org/labels/zone").unwrap(),
-        LabelValue::parse("z2").unwrap(),
-      ).unwrap(),
+      LabelSet::new()
+        .insert(
+          LabelKey::parse("example.org/labels/zone").unwrap(),
+          LabelValue::parse("z2").unwrap(),
+        )
+        .unwrap(),
       2_000,
       NodeId::parse("node-000000000000000000001").unwrap(),
       0,

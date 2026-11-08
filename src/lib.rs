@@ -95,7 +95,9 @@ pub use provider::{
 };
 pub use resource::{
   ResourceLabels, ResourceName, ResourceUri, ResourceVersion,
-  feed::{ResourceChange, ResourceChangeKind, ResourceFeedError, ResourceWatch, ResourceWatchOptions},
+  feed::{
+    ResourceChange, ResourceChangeKind, ResourceFeedError, ResourceWatch, ResourceWatchOptions,
+  },
 };
 pub use routing::{
   CandidateNodeReader, DefaultLoadBalancer, DefaultNextHop, LoadBalancingPolicy, NextHopView,

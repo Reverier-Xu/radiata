@@ -117,10 +117,7 @@ impl SubscriptionPredicate {
 
   /// The domain half of the conjunction: `None` matches every domain.
   fn admits_domain(&self, domain: &str) -> bool {
-    self
-      .domains
-      .as_ref()
-      .is_none_or(|set| set.contains(domain))
+    self.domains.as_ref().is_none_or(|set| set.contains(domain))
   }
 
   /// Whether one typed hub event passes. Only [`crate::ResourceChanged`]
@@ -265,7 +262,13 @@ mod tests {
   /// never stores a domain a resource name could not carry.
   #[test]
   fn malformed_domains_fail_closed() {
-    for domain in ["", "example.org.", "-bad.example", "under_score.org", "a..b"] {
+    for domain in [
+      "",
+      "example.org.",
+      "-bad.example",
+      "under_score.org",
+      "a..b",
+    ] {
       assert!(
         SubscriptionPredicate::new().domain(domain).is_err(),
         "domain {domain:?} must be refused"
@@ -285,6 +288,10 @@ mod tests {
   #[test]
   fn malformed_selectors_fail_closed() {
     assert!(SubscriptionPredicate::new().selector("").is_err());
-    assert!(SubscriptionPredicate::new().selector("not-a-tag=key").is_err());
+    assert!(
+      SubscriptionPredicate::new()
+        .selector("not-a-tag=key")
+        .is_err()
+    );
   }
 }

@@ -1043,7 +1043,9 @@ async fn watch_resources_pushes_the_predicate_into_the_replay() {
   )
   .await;
   let predicate = SubscriptionPredicate::new().domain("example.net").unwrap();
-  let options = ResourceWatchOptions::new().from(0).predicate(predicate.clone());
+  let options = ResourceWatchOptions::new()
+    .from(0)
+    .predicate(predicate.clone());
   let mut feed = node.handle.watch_resources_with(options).await.unwrap();
 
   // Three commits, one matching: the replay delivers exactly it.

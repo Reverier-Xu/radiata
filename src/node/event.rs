@@ -276,16 +276,15 @@ impl EventHub {
       return;
     };
     for entry in entries.iter() {
-      if let Some(subscriber) = entry.downcast_ref::<std::sync::Arc<TypedSender<E>>>() {
-        if subscriber
+      if let Some(subscriber) = entry.downcast_ref::<std::sync::Arc<TypedSender<E>>>()
+        && subscriber
           .predicate
           .as_ref()
           .is_none_or(|predicate| predicate.admits_event(&event))
-        {
-          // A send error means this channel has no active receivers; the
-          // transient event is gone and the next retain prunes the sender.
-          let _ = subscriber.sender.send(event.clone());
-        }
+      {
+        // A send error means this channel has no active receivers; the
+        // transient event is gone and the next retain prunes the sender.
+        let _ = subscriber.sender.send(event.clone());
       }
     }
     Self::prune::<E>(entries);
@@ -312,10 +311,10 @@ impl EventHub {
       return;
     };
     for entry in entries.iter() {
-      if let Some(sender) = entry.downcast_ref::<std::sync::Arc<broadcast::Sender<TaggedEvent>>>() {
+      if let Some(subscriber) = entry.downcast_ref::<std::sync::Arc<TypedSender<TaggedEvent>>>() {
         // A send error means this channel has no active receivers; the
         // transient event is gone and the next retain prunes the sender.
-        let _ = sender.send(event.clone());
+        let _ = subscriber.sender.send(event.clone());
       }
     }
     Self::prune::<TaggedEvent>(entries);
@@ -331,7 +330,12 @@ impl EventHub {
     let mut subscribers = Self::lock(&self.tagged);
     let entries = subscribers.entry(tag).or_default();
     Self::prune::<TaggedEvent>(entries);
-    entries.push(Box::new(std::sync::Arc::new(sender)));
+    // The tagged channel carries no filterable label space: the handle
+    // refuses a predicate here, so the slot is always `None`.
+    entries.push(Box::new(std::sync::Arc::new(TypedSender {
+      sender,
+      predicate: None,
+    })));
     EventSubscription {
       state: SubscriptionState::Idle(receiver),
     }
@@ -673,11 +677,7 @@ mod tests {
 
     let hub = EventHub::new();
     let mut filtered = hub.subscribe::<crate::ResourceChanged>(
-      EventOptions::new().predicate(
-        SubscriptionPredicate::new()
-          .domain("example.net")
-          .unwrap(),
-      ),
+      EventOptions::new().predicate(SubscriptionPredicate::new().domain("example.net").unwrap()),
     );
     let mut unfiltered = hub.subscribe::<crate::ResourceChanged>(EventOptions::new());
 
@@ -687,10 +687,7 @@ mod tests {
       unfiltered.recv().await.unwrap(),
       EventReceive::Item(_)
     ));
-    assert!(matches!(
-      filtered.try_recv().unwrap(),
-      EventReceive::Empty
-    ));
+    assert!(matches!(filtered.try_recv().unwrap(), EventReceive::Empty));
 
     // A matching event reaches both, and carries the committed labels.
     hub.emit(change("example.net/resources/hit", "team-b"));
