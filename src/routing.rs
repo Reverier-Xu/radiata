@@ -974,12 +974,12 @@ pub trait RouteNextHop: fmt::Debug + Send + Sync + 'static {
 /// bounded caller-level retries into delivery.
 ///
 /// This is the default policy: the node builder registers it under
-/// [`DefaultNextHop::TAG`] unless the caller already did, and a node
+/// [`DefaultNextHop::TAG`], and a node
 /// without a caller-selected route policy resolves to that tag, so
 /// multi-hop relay works out of the box. [`crate::NodeConfig::
 /// with_route_policy`] selects a different registered policy instead;
-/// registering a caller policy under [`DefaultNextHop::TAG`] replaces the
-/// default outright.
+/// the builtin domain is insertion-once reserved, so a caller policy
+/// can never claim or replace [`DefaultNextHop::TAG`].
 ///
 /// A standalone [`DefaultNextHop::default`] instance carries no learned
 /// topology — it is the fallback algorithm on its own, which is exactly
