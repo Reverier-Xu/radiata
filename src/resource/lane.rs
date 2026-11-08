@@ -46,7 +46,11 @@ impl Lane for ResourcesLane {
   fn scan<'a>(&self, snapshot: &'a dyn StoreSnapshot) -> BoxFuture<'a, Result<LaneRows>> {
     Box::pin(async move {
       scan_namespaces(snapshot, &Self::NAMESPACES, |_key, value| {
-        crate::resource::ResourceRecordV1::decode(value).is_ok()
+        // The resource register stores the raw record bytes (not yet
+        // envelope-migrated): the lane carries them unchanged.
+        crate::resource::ResourceRecordV1::decode(value)
+          .is_ok()
+          .then(|| value.to_vec())
       })
       .await
     })

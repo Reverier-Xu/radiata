@@ -702,6 +702,28 @@ pub(crate) fn inject_entry(
     .insert(location, StoreValue::new(Arc::from(bytes)));
 }
 
+/// Injects one identity-family row as the sealed row envelope over
+/// `payload`, so harness-injected rows are exactly what the production
+/// persist path stores and the envelope-opening readers decode.
+#[allow(dead_code)]
+pub(crate) fn inject_enveloped_entry(
+  reference: &Arc<ReferenceFactory>, namespace: &StoreNamespace, key: &StoreKey, payload: Vec<u8>,
+) {
+  let value = crate::storage::RowEnvelope::seal(
+    namespace,
+    key,
+    &crate::StoreRevision::new(Arc::from(&b"test-revision"[..])).unwrap(),
+    Arc::from(payload),
+  )
+  .unwrap();
+  reference
+    .state
+    .lock()
+    .unwrap()
+    .entries
+    .insert((namespace.clone(), key.clone()), value);
+}
+
 pub(crate) fn remove_entry(
   reference: &Arc<ReferenceFactory>, namespace: &StoreNamespace, key: &StoreKey,
 ) {

@@ -41,7 +41,11 @@ impl Lane for DescriptorsLane {
   fn scan<'a>(&self, snapshot: &'a dyn StoreSnapshot) -> BoxFuture<'a, Result<LaneRows>> {
     Box::pin(async move {
       scan_namespaces(snapshot, &Self::NAMESPACES, |_key, value| {
-        crate::membership::page::decode_descriptor(value).is_ok()
+        // The descriptor family stores the raw record bytes (not yet
+        // envelope-migrated): the lane carries them unchanged.
+        crate::membership::page::decode_descriptor(value)
+          .is_ok()
+          .then(|| value.to_vec())
       })
       .await
     })

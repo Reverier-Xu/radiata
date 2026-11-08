@@ -231,7 +231,7 @@ impl std::fmt::Debug for RowEnvelope {
 
 #[cfg(test)]
 mod tests {
-  use super::{ROW_ENVELOPE_LIMITS, ROW_ENVELOPE_SCHEMA, RowEnvelope, RowName, RowVersion};
+  use super::{ROW_ENVELOPE_LIMITS, ROW_ENVELOPE_SCHEMA, RowEnvelope, RowVersion};
   use crate::{
     StoreKey, StoreNamespace, StoreRevision, protocol::decode_canonical_strict, storage::families,
   };

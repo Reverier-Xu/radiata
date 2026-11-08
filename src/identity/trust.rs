@@ -91,8 +91,9 @@ pub(crate) mod store {
   #[cfg(test)]
   use crate::provider::StorageFactory;
   use crate::{
-    NodeId, PublicKey, Result, StoreExpectation, StoreOperation, StoreValue, TransactionId,
-    api::Entropy, storage::MetadataStore,
+    NodeId, PublicKey, Result, StoreExpectation, StoreOperation, TransactionId,
+    api::Entropy,
+    storage::{MetadataStore, RowEnvelope},
   };
 
   /// Whether the node carries terminal departure evidence — an
@@ -138,8 +139,11 @@ pub(crate) mod store {
       .get(&namespace, &key)
       .await?
       .ok_or_else(|| crate::Error::not_found("session binding"))?;
-    let binding = crate::identity::records::IdentityBindingV1::decode(value.as_bytes())
-      .map_err(|_| crate::Error::authentication_failed("session binding"))?;
+    let binding = crate::identity::records::IdentityBindingV1::decode(
+      &RowEnvelope::open(value.as_bytes())
+        .map_err(|_| crate::Error::authentication_failed("session binding"))?,
+    )
+    .map_err(|_| crate::Error::authentication_failed("session binding"))?;
     let public_key = binding.public_key().clone();
     if crate::identity::revocation::is_revoked_ctx(store, peer, &public_key).await? {
       return Err(crate::Error::revoked("session binding"));
@@ -166,8 +170,11 @@ pub(crate) mod store {
       cursor,
       limit,
       |_key, bytes| {
-        let binding = crate::identity::records::IdentityBindingV1::decode(bytes)
-          .map_err(|_| crate::Error::invalid_input("trust binding decode"))?;
+        let binding = crate::identity::records::IdentityBindingV1::decode(
+          &RowEnvelope::open(bytes)
+            .map_err(|_| crate::Error::invalid_input("trust binding decode"))?,
+        )
+        .map_err(|_| crate::Error::invalid_input("trust binding decode"))?;
         Ok(Some(TrustBinding::new(
           binding.node().clone(),
           binding.public_key().clone(),
@@ -191,8 +198,11 @@ pub(crate) mod store {
     let mut scan = snapshot.scan(&namespace, &[]).await?;
     let mut bindings = BTreeMap::new();
     while let Some(entry) = scan.next().await? {
-      let binding = crate::identity::records::IdentityBindingV1::decode(entry.value().as_bytes())
-        .map_err(|_| crate::Error::invalid_input("trust binding decode"))?;
+      let binding = crate::identity::records::IdentityBindingV1::decode(
+        &RowEnvelope::open(entry.value().as_bytes())
+          .map_err(|_| crate::Error::invalid_input("trust binding decode"))?,
+      )
+      .map_err(|_| crate::Error::invalid_input("trust binding decode"))?;
       bindings.insert(binding.node().clone(), binding.public_key().clone());
     }
     Ok(bindings)
@@ -207,8 +217,11 @@ pub(crate) mod store {
     let mut scan = snapshot.scan(&namespace, &[]).await?;
     let mut seen = 0_usize;
     while let Some(entry) = scan.next().await? {
-      crate::identity::records::IdentityBindingV1::decode(entry.value().as_bytes())
-        .map_err(|_| crate::Error::invalid_input("trust binding decode"))?;
+      crate::identity::records::IdentityBindingV1::decode(
+        &RowEnvelope::open(entry.value().as_bytes())
+          .map_err(|_| crate::Error::invalid_input("trust binding decode"))?,
+      )
+      .map_err(|_| crate::Error::invalid_input("trust binding decode"))?;
       seen += 1;
       if seen > count {
         return Ok(true);
@@ -233,8 +246,11 @@ pub(crate) mod store {
     let (namespace, store_key) = crate::identity::records::identity_binding_key(node)?;
     let snapshot = store.snapshot().await?;
     if let Some(existing) = snapshot.get(&namespace, &store_key).await? {
-      let existing = crate::identity::records::IdentityBindingV1::decode(existing.as_bytes())
-        .map_err(|_| crate::Error::invalid_input("identity binding decode"))?;
+      let existing = crate::identity::records::IdentityBindingV1::decode(
+        &RowEnvelope::open(existing.as_bytes())
+          .map_err(|_| crate::Error::invalid_input("identity binding decode"))?,
+      )
+      .map_err(|_| crate::Error::invalid_input("identity binding decode"))?;
       if existing.public_key() != key {
         return Err(crate::Error::not_trusted("trust binding key substitution"));
       }
@@ -252,9 +268,14 @@ pub(crate) mod store {
       snapshot.revision().clone(),
       vec![StoreOperation::Put {
         namespace: namespace.clone(),
-        key: store_key,
+        key: store_key.clone(),
         expected: StoreExpectation::Absent,
-        value: StoreValue::new(Arc::from(binding.encode()?)),
+        value: RowEnvelope::seal(
+          &namespace,
+          &store_key,
+          snapshot.revision(),
+          Arc::from(binding.encode()?),
+        )?,
       }],
     )?;
     // A discarded commit outcome would report the binding as adopted

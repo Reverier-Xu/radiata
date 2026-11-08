@@ -44,7 +44,10 @@ use super::{
 pub(crate) use crate::storage::families::CLEANUP_NAMESPACE;
 use crate::{
   Error, NodeId, PublicKey, Result, Signature, StoreKey, StoreNamespace, StoreOperation,
-  StoreValue, TransactionId, api::Entropy, provider::KeyProvider, storage::MetadataStore,
+  TransactionId,
+  api::Entropy,
+  provider::KeyProvider,
+  storage::{MetadataStore, RowEnvelope},
 };
 
 /// The durable schema of the issuer-signed cleanup tombstone.
@@ -357,7 +360,7 @@ pub(crate) async fn issue_checkpoint_ctx(
   let key = checkpoint_key();
   let snapshot = context.store().snapshot().await?;
   if let Some(existing) = snapshot.get(&namespace, &key).await? {
-    let stored = CleanupCheckpointV1::decode(existing.as_bytes())?;
+    let stored = CleanupCheckpointV1::decode(&RowEnvelope::open(existing.as_bytes())?)?;
     if stored.watermark_millis >= requested {
       return Ok(stored.watermark_millis);
     }
@@ -370,7 +373,12 @@ pub(crate) async fn issue_checkpoint_ctx(
       namespace: namespace.clone(),
       key: key.clone(),
       expected,
-      value: StoreValue::new(Arc::from(checkpoint.encode()?)),
+      value: RowEnvelope::seal(
+        &namespace,
+        &key,
+        snapshot.revision(),
+        Arc::from(checkpoint.encode()?),
+      )?,
     }],
   )?;
   drop(snapshot);
@@ -411,7 +419,7 @@ pub(crate) async fn latest_checkpoint_millis(
     return Ok(None);
   };
   Ok(Some(
-    CleanupCheckpointV1::decode(value.as_bytes())?.watermark_millis,
+    CleanupCheckpointV1::decode(&RowEnvelope::open(value.as_bytes())?)?.watermark_millis,
   ))
 }
 
@@ -430,12 +438,18 @@ pub(crate) async fn persist_checkpoint_ctx(
   let key = checkpoint_key();
   let snapshot = store.snapshot().await?;
   if let Some(existing) = snapshot.get(&namespace, &key).await? {
-    let stored = CleanupCheckpointV1::decode(existing.as_bytes())?;
+    let stored = CleanupCheckpointV1::decode(&RowEnvelope::open(existing.as_bytes())?)?;
     if stored.watermark_millis >= checkpoint.watermark_millis {
       return Ok(());
     }
   }
   let expected = crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
+  let value = RowEnvelope::seal(
+    &namespace,
+    &key,
+    snapshot.revision(),
+    Arc::from(checkpoint.encode()?),
+  )?;
   let transaction = store.prepare_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
@@ -443,7 +457,7 @@ pub(crate) async fn persist_checkpoint_ctx(
       namespace,
       key,
       expected,
-      value: StoreValue::new(Arc::from(checkpoint.encode()?)),
+      value,
     }],
   )?;
   drop(snapshot);
@@ -545,19 +559,31 @@ mod tests {
   async fn install_checkpoint(
     context: &lifecycle::LocalIdentityContext, entropy: &dyn crate::api::Entropy, watermark: i64,
   ) {
-    use crate::{StoreExpectation, StoreOperation, StoreValue};
+    use crate::{StoreExpectation, StoreOperation, storage::RowEnvelope};
     let checkpoint = CleanupCheckpointV1::new(watermark, context.identity().node().clone());
     let snapshot = context.store().snapshot().await.unwrap();
+    let (namespace, key) = (
+      metadata_namespace(CHECKPOINT_NAMESPACE).unwrap(),
+      checkpoint_key(),
+    );
     let transaction = context
       .store()
       .prepare_transaction(
         crate::TransactionId::generate(entropy).unwrap(),
         snapshot.revision().clone(),
         vec![StoreOperation::Put {
-          namespace: metadata_namespace(CHECKPOINT_NAMESPACE).unwrap(),
-          key: checkpoint_key(),
+          namespace: namespace.clone(),
+          key: key.clone(),
           expected: StoreExpectation::Absent,
-          value: StoreValue::new(Arc::from(checkpoint.encode().unwrap())),
+          // The seeded checkpoint is read through the envelope decoder;
+          // the injected row is the sealed envelope over the record.
+          value: RowEnvelope::seal(
+            &namespace,
+            &key,
+            snapshot.revision(),
+            Arc::from(checkpoint.encode().unwrap()),
+          )
+          .unwrap(),
         }],
       )
       .unwrap();

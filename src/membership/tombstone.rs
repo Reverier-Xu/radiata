@@ -611,7 +611,11 @@ impl crate::reconcile::lane::Lane for TombstonesLane {
           let namespace = crate::storage::families::namespace(kind.namespace_tag())?;
           let key = crate::identity::cleanup::checkpoint_key();
           if let Some(value) = snapshot.get(&namespace, &key).await? {
-            rows.push((kind.row_key(key.as_bytes()), value.as_bytes().to_vec()));
+            // The checkpoint singleton rides as its payload element.
+            let content = kind.content(key.as_bytes(), value.as_bytes());
+            if let Some(content) = content {
+              rows.push((kind.row_key(key.as_bytes()), content));
+            }
           }
           continue;
         }
@@ -621,15 +625,15 @@ impl crate::reconcile::lane::Lane for TombstonesLane {
         while let Some(entry) = scan.next().await? {
           let key = entry.key().as_bytes().to_vec();
           let value = entry.value().as_bytes().to_vec();
-          if !kind.decodable(&key, &value) {
+          let Some(content) = kind.content(&key, &value) else {
             tracing::debug!(
               namespace = %kind.namespace_tag(),
               key = %String::from_utf8_lossy(&key),
               "reconcile lane scan skipped an undecodable row"
             );
             continue;
-          }
-          raw.push((key, value));
+          };
+          raw.push((key, content));
         }
         for (key, content) in raw {
           let row_key = kind.row_key(&key);
@@ -965,8 +969,10 @@ mod tests {
   async fn store_revocation_bytes(
     store: &crate::storage::MetadataStore, subject: &NodeId,
   ) -> Vec<u8> {
-    let snapshot = store.snapshot().await.unwrap();
-    snapshot
+    let stored = store
+      .snapshot()
+      .await
+      .unwrap()
       .get(
         &crate::storage::families::namespace(crate::storage::families::REVOCATION_NAMESPACE)
           .unwrap(),
@@ -976,7 +982,9 @@ mod tests {
       .unwrap()
       .expect("the stored revocation record")
       .as_bytes()
-      .to_vec()
+      .to_vec();
+    // The stored row is the envelope; the assertion compares payloads.
+    crate::storage::RowEnvelope::open(&stored).unwrap()
   }
 
   /// Regression: one divergent terminal record must never

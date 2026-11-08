@@ -1073,9 +1073,10 @@ mod tests {
     let (binding_namespace, binding_key) =
       crate::identity::records::identity_binding_key(&node).unwrap();
     let binding = crate::identity::records::IdentityBindingV1::new(node, member_key(seed));
-    crate::identity::testing::inject_entry(
+    crate::identity::testing::inject_enveloped_entry(
       reference,
-      (binding_namespace, binding_key),
+      &binding_namespace,
+      &binding_key,
       binding.encode().unwrap(),
     );
   }

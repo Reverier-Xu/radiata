@@ -220,12 +220,15 @@ impl LaneId {
 }
 
 /// Scans every namespace the lane owns into rows, keeping the raw store
-/// key and skipping rows the lane cannot decode. Corrupt rows are skipped
+/// key and projecting each row's reconcile content through `project` —
+/// the lane's own row projection from the stored row bytes (the row
+/// envelope for the envelope-migrated families) to the content the lane
+/// carries on the wire. `None` skips the row: corrupt rows are skipped
 /// with a diagnostic — one bad row must not kill egress for every other
 /// row (the page lanes' corrupt-row policy).
 pub(crate) async fn scan_namespaces(
   snapshot: &(dyn StoreSnapshot + '_), namespaces: &'static [&'static str],
-  decodable: impl Fn(&[u8], &[u8]) -> bool,
+  project: impl Fn(&[u8], &[u8]) -> Option<Vec<u8>>,
 ) -> Result<LaneRows> {
   let mut rows = LaneRows::new();
   for tag in namespaces {
@@ -234,15 +237,15 @@ pub(crate) async fn scan_namespaces(
     while let Some(entry) = scan.next().await? {
       let key = entry.key().as_bytes().to_vec();
       let value = entry.value().as_bytes().to_vec();
-      if !decodable(&key, &value) {
+      let Some(content) = project(&key, &value) else {
         tracing::debug!(
           namespace = %tag,
           key = %String::from_utf8_lossy(&key),
           "reconcile lane scan skipped an undecodable row"
         );
         continue;
-      }
-      rows.push((key, value));
+      };
+      rows.push((key, content));
     }
   }
   Ok(rows)

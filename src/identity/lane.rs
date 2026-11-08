@@ -41,7 +41,11 @@ impl Lane for TrustLane {
   fn scan<'a>(&self, snapshot: &'a dyn StoreSnapshot) -> BoxFuture<'a, Result<LaneRows>> {
     Box::pin(async move {
       scan_namespaces(snapshot, &Self::NAMESPACES, |_key, value| {
-        crate::identity::records::IdentityBindingV1::decode(value).is_ok()
+        // The binding family stores the row envelope; the lane carries the
+        // envelope's payload element, the canonical binding record bytes.
+        crate::storage::RowEnvelope::open(value)
+          .ok()
+          .filter(|payload| crate::identity::records::IdentityBindingV1::decode(payload).is_ok())
       })
       .await
     })

@@ -15,7 +15,7 @@ use crate::{
   protocol::CborLimits,
   provider::KeyProvider,
   storage::{
-    MetadataStore,
+    MetadataStore, RowEnvelope,
     receipt::{ReceiptIdentity, ReceiptReferenceToken, recover_self_referenced_transaction},
   },
 };
@@ -232,7 +232,7 @@ pub(crate) async fn persist_terminal_record(
   let snapshot = store.snapshot().await?;
   let expected = match snapshot.get(&namespace, &key).await? {
     Some(existing) => {
-      if existing.as_bytes() == encoded.as_ref() {
+      if RowEnvelope::open(existing.as_bytes())?.as_slice() == encoded.as_ref() {
         return Ok(());
       }
       return Err(Error::conflict(label));
@@ -303,10 +303,11 @@ pub(crate) async fn persist_convergent_terminal_record(
   let snapshot = store.snapshot().await?;
   let expected = match snapshot.get(&namespace, &key).await? {
     Some(existing) => {
-      if existing.as_bytes() == encoded.as_ref() {
+      let stored_payload = RowEnvelope::open(existing.as_bytes())?;
+      if stored_payload.as_slice() == encoded.as_ref() {
         return Ok(TerminalInstall::Unchanged);
       }
-      match decides(existing.as_bytes(), encoded.as_ref())? {
+      match decides(&stored_payload, encoded.as_ref())? {
         TerminalWinner::Stored => return Ok(TerminalInstall::Unchanged),
         TerminalWinner::Fresh => StoreExpectation::Exact(existing.digest().clone()),
       }
@@ -348,12 +349,14 @@ async fn install_terminal_record(
 ) -> Result<()> {
   let transaction = store.prepare_transaction(
     TransactionId::generate(entropy)?,
-    revision,
+    revision.clone(),
     vec![StoreOperation::Put {
       namespace: namespace.clone(),
-      key,
+      key: key.clone(),
       expected,
-      value: StoreValue::new(encoded),
+      // The persisted body is the row envelope: the record bytes ride as
+      // the payload element, versioned by the preparing CAS revision.
+      value: RowEnvelope::seal(namespace, &key, &revision, encoded)?,
     }],
   )?;
   // A discarded commit outcome would silently drop the tombstone: a
@@ -425,7 +428,9 @@ where
       if skip(entry.key()) {
         continue;
       }
-      let record = decode(entry.value().as_bytes())?;
+      // The stored row is the envelope; the record codec decodes its
+      // payload element.
+      let record = decode(&RowEnvelope::open(entry.value().as_bytes())?)?;
       if !admit(&record) {
         continue;
       }
@@ -607,7 +612,7 @@ async fn pinned_binding_retirement(
   let Some(binding) = snapshot.get(&namespace, &key).await? else {
     return Ok(None);
   };
-  let decoded = match IdentityBindingV1::decode(binding.as_bytes()) {
+  let decoded = match IdentityBindingV1::decode(&RowEnvelope::open(binding.as_bytes())?) {
     Ok(decoded) => decoded,
     Err(_) => {
       tracing::debug!(
@@ -2085,14 +2090,19 @@ mod tests {
       )
     };
     let stored = || async {
-      store
+      let value = store
         .snapshot()
         .await
         .unwrap()
         .get(&namespace, &key)
         .await
         .unwrap()
-        .map(|value| value.as_bytes().to_vec())
+        .map(|value| value.as_bytes().to_vec());
+      match value {
+        // The stored row is the envelope; the assertions compare payloads.
+        Some(bytes) => Some(RowEnvelope::open(&bytes).unwrap()),
+        None => None,
+      }
     };
 
     // A fresh record installs exactly once; the exact record is a no-op.

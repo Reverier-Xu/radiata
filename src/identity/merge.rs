@@ -28,11 +28,21 @@ use super::{
   signature::{MERGE_GRANT_DOMAIN, signature_message},
 };
 use crate::{
-  Error, NodeId, PublicKey, Result, StoreExpectation, StoreOperation, StoreValue, TransactionId,
+  Error, NodeId, PublicKey, Result, StoreExpectation, StoreOperation, TransactionId,
   api::Entropy,
   provider::KeyProvider,
-  storage::receipt::{ReceiptReferenceChange, ReceiptReferenceToken},
+  storage::{
+    RowEnvelope,
+    receipt::{ReceiptReferenceChange, ReceiptReferenceToken},
+  },
 };
+
+/// Opens one stored row's payload, classifying envelope failures as
+/// discovery corruption exactly like the record decoders they precede:
+/// a corrupt row is storage corruption whatever element fails to decode.
+fn open_row(bytes: &[u8]) -> Result<Vec<u8>> {
+  RowEnvelope::open(bytes).map_err(|_| discovery_corrupt())
+}
 
 /// A proof-free merge record proposal supplied by the handshake.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,8 +156,8 @@ pub(crate) async fn commit_merge(
     .get(&issuer_namespace, &issuer_key)
     .await?
     .ok_or_else(|| Error::not_trusted("merge issuer"))?;
-  let issuer_binding =
-    IdentityBindingV1::decode(issuer_binding_value.as_bytes()).map_err(|_| discovery_corrupt())?;
+  let issuer_binding = IdentityBindingV1::decode(&open_row(issuer_binding_value.as_bytes())?)
+    .map_err(|_| discovery_corrupt())?;
   if issuer_binding.node() != identity.node()
     || issuer_binding.public_key() != identity.public_key()
   {
@@ -182,7 +192,8 @@ pub(crate) async fn commit_merge(
   }
   let binding_present = match &existing_binding {
     Some(value) => {
-      let record = IdentityBindingV1::decode(value.as_bytes()).map_err(|_| discovery_corrupt())?;
+      let record =
+        IdentityBindingV1::decode(&open_row(value.as_bytes())?).map_err(|_| discovery_corrupt())?;
       if record.node() != &proposal.subject || record.public_key() != &proposal.subject_key {
         return Err(Error::conflict("merge binding"));
       }
@@ -241,7 +252,12 @@ pub(crate) async fn commit_merge(
       namespace: binding_namespace.clone(),
       key: binding_key.clone(),
       expected: StoreExpectation::Absent,
-      value: StoreValue::new(Arc::from(binding.encode()?)),
+      value: RowEnvelope::seal(
+        &binding_namespace,
+        &binding_key,
+        snapshot.revision(),
+        Arc::from(binding.encode()?),
+      )?,
     });
     tokens.push(ReceiptReferenceToken::for_record(
       &binding_namespace,
@@ -252,13 +268,23 @@ pub(crate) async fn commit_merge(
     namespace: use_namespace.clone(),
     key: use_key.clone(),
     expected: StoreExpectation::Absent,
-    value: StoreValue::new(Arc::from(credential_use.encode()?)),
+    value: RowEnvelope::seal(
+      &use_namespace,
+      &use_key,
+      snapshot.revision(),
+      Arc::from(credential_use.encode()?),
+    )?,
   });
   caller_operations.push(StoreOperation::Put {
     namespace: grant_namespace.clone(),
     key: grant_key.clone(),
     expected: StoreExpectation::Absent,
-    value: StoreValue::new(Arc::from(grant.encode()?)),
+    value: RowEnvelope::seal(
+      &grant_namespace,
+      &grant_key,
+      snapshot.revision(),
+      Arc::from(grant.encode()?),
+    )?,
   });
   tokens.push(ReceiptReferenceToken::for_record(&use_namespace, &use_key));
   tokens.push(ReceiptReferenceToken::for_record(
@@ -355,7 +381,8 @@ pub(crate) async fn adopt_merge(
 
   let binding_present = match snapshot.get(&binding_namespace, &binding_key).await? {
     Some(value) => {
-      let record = IdentityBindingV1::decode(value.as_bytes()).map_err(|_| discovery_corrupt())?;
+      let record =
+        IdentityBindingV1::decode(&open_row(value.as_bytes())?).map_err(|_| discovery_corrupt())?;
       if record.node() != grant.issuer() || record.public_key() != issuer_key {
         return Err(Error::conflict("adoption binding"));
       }
@@ -365,7 +392,8 @@ pub(crate) async fn adopt_merge(
   };
   let grant_present = match snapshot.get(&grant_namespace, &grant_key).await? {
     Some(value) => {
-      let record = MergeGrantV1::decode(value.as_bytes()).map_err(|_| discovery_corrupt())?;
+      let record =
+        MergeGrantV1::decode(&open_row(value.as_bytes())?).map_err(|_| discovery_corrupt())?;
       if &record != grant {
         return Err(Error::conflict("adoption grant"));
       }
@@ -388,7 +416,12 @@ pub(crate) async fn adopt_merge(
       namespace: binding_namespace.clone(),
       key: binding_key.clone(),
       expected: StoreExpectation::Absent,
-      value: StoreValue::new(Arc::from(binding.encode()?)),
+      value: RowEnvelope::seal(
+        &binding_namespace,
+        &binding_key,
+        snapshot.revision(),
+        Arc::from(binding.encode()?),
+      )?,
     });
     tokens.push(ReceiptReferenceToken::for_record(
       &binding_namespace,
@@ -400,7 +433,12 @@ pub(crate) async fn adopt_merge(
       namespace: grant_namespace.clone(),
       key: grant_key.clone(),
       expected: StoreExpectation::Absent,
-      value: StoreValue::new(Arc::from(grant.encode()?)),
+      value: RowEnvelope::seal(
+        &grant_namespace,
+        &grant_key,
+        snapshot.revision(),
+        Arc::from(grant.encode()?),
+      )?,
     });
     tokens.push(ReceiptReferenceToken::for_record(
       &grant_namespace,
@@ -470,7 +508,8 @@ async fn merge_adoption_state(
 
   let binding = binding
     .map(|value| {
-      let record = IdentityBindingV1::decode(value.as_bytes()).map_err(|_| discovery_corrupt())?;
+      let record =
+        IdentityBindingV1::decode(&open_row(value.as_bytes())?).map_err(|_| discovery_corrupt())?;
       if record.node() != grant.issuer() || record.public_key() != issuer_key {
         return Err(Error::conflict("adoption record"));
       }
@@ -479,7 +518,8 @@ async fn merge_adoption_state(
     .transpose()?;
   let stored_grant = stored_grant
     .map(|value| {
-      let record = MergeGrantV1::decode(value.as_bytes()).map_err(|_| discovery_corrupt())?;
+      let record =
+        MergeGrantV1::decode(&open_row(value.as_bytes())?).map_err(|_| discovery_corrupt())?;
       if &record != grant {
         return Err(Error::conflict("adoption grant"));
       }
@@ -522,7 +562,8 @@ async fn re_admission(
     .get(&use_namespace, &use_key)
     .await?
     .ok_or_else(|| Error::conflict("merge record"))?;
-  let record = CredentialUseV1::decode(use_value.as_bytes()).map_err(|_| discovery_corrupt())?;
+  let record =
+    CredentialUseV1::decode(&open_row(use_value.as_bytes())?).map_err(|_| discovery_corrupt())?;
   if record.issuer() != identity.node()
     || record.generation() != &proposal.generation
     || record.subject() != &proposal.subject
@@ -535,7 +576,8 @@ async fn re_admission(
     .get(&grant_namespace, &grant_key)
     .await?
     .ok_or_else(discovery_corrupt)?;
-  let grant = MergeGrantV1::decode(grant_value.as_bytes()).map_err(|_| discovery_corrupt())?;
+  let grant =
+    MergeGrantV1::decode(&open_row(grant_value.as_bytes())?).map_err(|_| discovery_corrupt())?;
   if grant.merge() != record.merge()
     || grant.subject() != &proposal.subject
     || grant.subject_key() != &proposal.subject_key
@@ -552,8 +594,8 @@ async fn re_admission(
     .get(&binding_namespace, &binding_key)
     .await?
     .ok_or_else(discovery_corrupt)?;
-  let binding =
-    IdentityBindingV1::decode(binding_value.as_bytes()).map_err(|_| discovery_corrupt())?;
+  let binding = IdentityBindingV1::decode(&open_row(binding_value.as_bytes())?)
+    .map_err(|_| discovery_corrupt())?;
   if binding.node() != &proposal.subject || binding.public_key() != &proposal.subject_key {
     return Err(Error::conflict("merge binding"));
   }
@@ -583,7 +625,8 @@ pub(crate) async fn merge_state(
 
   let credential_use = credential_use
     .map(|value| {
-      let record = CredentialUseV1::decode(value.as_bytes()).map_err(|_| discovery_corrupt())?;
+      let record =
+        CredentialUseV1::decode(&open_row(value.as_bytes())?).map_err(|_| discovery_corrupt())?;
       if record.issuer() != identity.node()
         || record.generation() != &proposal.generation
         || record.merge() != &proposal.merge
@@ -597,7 +640,8 @@ pub(crate) async fn merge_state(
     .transpose()?;
   let grant = grant
     .map(|value| {
-      let record = MergeGrantV1::decode(value.as_bytes()).map_err(|_| discovery_corrupt())?;
+      let record =
+        MergeGrantV1::decode(&open_row(value.as_bytes())?).map_err(|_| discovery_corrupt())?;
       if record.merge() != &proposal.merge
         || record.subject() != &proposal.subject
         || record.subject_key() != &proposal.subject_key
@@ -614,7 +658,8 @@ pub(crate) async fn merge_state(
     .transpose()?;
   let binding = binding
     .map(|value| {
-      let record = IdentityBindingV1::decode(value.as_bytes()).map_err(|_| discovery_corrupt())?;
+      let record =
+        IdentityBindingV1::decode(&open_row(value.as_bytes())?).map_err(|_| discovery_corrupt())?;
       if record.node() != &proposal.subject || record.public_key() != &proposal.subject_key {
         return Err(Error::conflict("merge record"));
       }
@@ -734,17 +779,23 @@ mod tests {
     )
     .unwrap();
     let usage = CredentialUseV1::decode(
-      entry(&fixture.reference, &use_namespace, &use_key)
-        .unwrap()
-        .as_bytes(),
+      &crate::storage::RowEnvelope::open(
+        entry(&fixture.reference, &use_namespace, &use_key)
+          .unwrap()
+          .as_bytes(),
+      )
+      .unwrap(),
     )
     .unwrap();
     assert_eq!(usage.subject(), proposal_subject(&proposal));
     let (grant_namespace, grant_key) = merge_grant_key(proposal_merge(&proposal)).unwrap();
     let stored = MergeGrantV1::decode(
-      entry(&fixture.reference, &grant_namespace, &grant_key)
-        .unwrap()
-        .as_bytes(),
+      &crate::storage::RowEnvelope::open(
+        entry(&fixture.reference, &grant_namespace, &grant_key)
+          .unwrap()
+          .as_bytes(),
+      )
+      .unwrap(),
     )
     .unwrap();
     assert_eq!(stored, grant);

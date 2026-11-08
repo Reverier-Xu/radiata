@@ -2352,7 +2352,12 @@ pub(crate) mod test_support {
     .unwrap();
     let (namespace, key) = crate::identity::records::identity_binding_key(&node).unwrap();
     let binding = crate::identity::records::IdentityBindingV1::new(node, member_key(seed));
-    crate::identity::testing::inject_entry(reference, (namespace, key), binding.encode().unwrap());
+    crate::identity::testing::inject_enveloped_entry(
+      reference,
+      &namespace,
+      &key,
+      binding.encode().unwrap(),
+    );
   }
 
   /// Inserts one live session entry for `peer` into the table: a

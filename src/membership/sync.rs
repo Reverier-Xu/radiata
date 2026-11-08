@@ -941,7 +941,7 @@ mod tests {
         identity::{
           lifecycle,
           records::{IdentityBindingV1, identity_binding_key},
-          testing::{ScriptedKeys, SequenceEntropy, inject_entry},
+          testing::{ScriptedKeys, SequenceEntropy},
         },
         storage::contract::{ReferenceFactory, required_capabilities},
       };
@@ -965,7 +965,12 @@ mod tests {
         let bound = node_at(index);
         let (namespace, key) = identity_binding_key(&bound).unwrap();
         let binding = IdentityBindingV1::new(bound, shared_key.clone());
-        inject_entry(&reference, (namespace, key), binding.encode().unwrap());
+        crate::identity::testing::inject_enveloped_entry(
+          &reference,
+          &namespace,
+          &key,
+          binding.encode().unwrap(),
+        );
       }
       // One known leave record, properly signed by the local identity
       // (the far node applies it, and the apply path verifies the
@@ -976,12 +981,10 @@ mod tests {
       let leaver = context.identity().node().clone();
       let leave_namespace =
         crate::storage::families::namespace(crate::storage::families::LEAVE_NAMESPACE).unwrap();
-      inject_entry(
+      crate::identity::testing::inject_enveloped_entry(
         &reference,
-        (
-          leave_namespace,
-          StoreKey::new(std::sync::Arc::from(leaver.as_str().as_bytes().to_vec())),
-        ),
+        &leave_namespace,
+        &StoreKey::new(std::sync::Arc::from(leaver.as_str().as_bytes().to_vec())),
         record.encode().unwrap(),
       );
 

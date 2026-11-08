@@ -1938,9 +1938,10 @@ mod tests {
       crate::storage::families::namespace(crate::storage::families::REVOCATION_NAMESPACE).unwrap(),
       crate::StoreKey::new(std::sync::Arc::from(revoked.as_str().as_bytes().to_vec())),
     );
-    crate::identity::testing::inject_entry(
+    crate::identity::testing::inject_enveloped_entry(
       &reference,
-      (namespace, store_key),
+      &namespace,
+      &store_key,
       revocation.encode().unwrap(),
     );
     // The batch: the revoked subject's binding row, then a good row.
@@ -3168,9 +3169,10 @@ mod tests {
       crate::storage::families::namespace(crate::storage::families::REVOCATION_NAMESPACE).unwrap(),
       crate::StoreKey::new(Arc::from(revoked.as_str().as_bytes().to_vec())),
     );
-    crate::identity::testing::inject_entry(
+    crate::identity::testing::inject_enveloped_entry(
       &reference,
-      (namespace, store_key),
+      &namespace,
+      &store_key,
       revocation.encode().unwrap(),
     );
     plane.tick(&runtime).await.unwrap();

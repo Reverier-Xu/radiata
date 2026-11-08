@@ -150,18 +150,24 @@ impl TombstoneKind {
     key
   }
 
-  /// Whether one scanned store row belongs to this kind (and decodes):
-  /// the leave family's intent singleton is not a record and is skipped.
-  pub(crate) fn decodable(self, key: &[u8], value: &[u8]) -> bool {
-    match self {
+  /// Projects one scanned store row to the content this kind's lane
+  /// carries, or `None` when the row does not belong to this kind (or
+  /// does not decode): the leave family's intent singleton is not a
+  /// record and is skipped. The identity families store the row envelope;
+  /// the lane carries the envelope's payload element, the canonical
+  /// record bytes the wire digests and the apply path decodes.
+  pub(crate) fn content(self, key: &[u8], value: &[u8]) -> Option<Vec<u8>> {
+    let payload = crate::storage::RowEnvelope::open(value).ok()?;
+    let decodes = match self {
       Self::Leave => {
         !crate::identity::leave::is_intent_key(key)
-          && crate::identity::leave::LeaveRecordV1::decode(value).is_ok()
+          && crate::identity::leave::LeaveRecordV1::decode(&payload).is_ok()
       }
-      Self::Cleanup => crate::identity::cleanup::CleanupRecordV1::decode(value).is_ok(),
-      Self::Revocation => crate::identity::revocation::RevocationRecordV1::decode(value).is_ok(),
-      Self::Checkpoint => crate::identity::cleanup::CleanupCheckpointV1::decode(value).is_ok(),
-    }
+      Self::Cleanup => crate::identity::cleanup::CleanupRecordV1::decode(&payload).is_ok(),
+      Self::Revocation => crate::identity::revocation::RevocationRecordV1::decode(&payload).is_ok(),
+      Self::Checkpoint => crate::identity::cleanup::CleanupCheckpointV1::decode(&payload).is_ok(),
+    };
+    decodes.then_some(payload)
   }
 }
 
@@ -190,9 +196,12 @@ pub(crate) struct RangeFingerprint {
 }
 
 /// One reconciled row: its lane key bytes and its content bytes. The
-/// wire never carries a digest — the receiver recomputes it with the
-/// frozen digest function, so a sender cannot misattribute a payload to
-/// a digest it does not hash to.
+/// content is the row's canonical payload element — the bytes the owning
+/// family's record codec decodes, and for the envelope-migrated families
+/// the [`crate::storage::RowEnvelope`] payload element exactly. The wire
+/// never carries a digest — the receiver recomputes it with the frozen
+/// digest function, so a sender cannot misattribute a payload to a digest
+/// it does not hash to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Row {
   /// The row's lane key, in the lane's own canonical encoding.

@@ -30,7 +30,9 @@ use super::{
 pub(crate) use crate::storage::families::REVOCATION_NAMESPACE;
 use crate::{
   Error, NodeId, PublicKey, Result, StoreExpectation, StoreKey, StoreNamespace, StoreOperation,
-  StoreValue, TransactionId, api::Entropy, storage::MetadataStore,
+  TransactionId,
+  api::Entropy,
+  storage::{MetadataStore, RowEnvelope},
 };
 
 /// The durable schema of the issuer-signed revocation record.
@@ -270,8 +272,11 @@ pub(crate) async fn revoke_binding_ctx(
     .await?
     .ok_or_else(|| Error::not_found("revocation subject"))?;
   let binding_digest = binding_value.digest().clone();
-  let binding = crate::identity::records::IdentityBindingV1::decode(binding_value.as_bytes())
-    .map_err(|_| Error::invalid_input("identity binding"))?;
+  let binding = crate::identity::records::IdentityBindingV1::decode(
+    &RowEnvelope::open(binding_value.as_bytes())
+      .map_err(|_| Error::invalid_input("identity binding"))?,
+  )
+  .map_err(|_| Error::invalid_input("identity binding"))?;
   if binding.public_key() != record.subject_key() {
     return Err(Error::conflict("revocation key"));
   }
@@ -280,7 +285,8 @@ pub(crate) async fn revoke_binding_ctx(
   // a revocation: an absent slot is the only new authorization boundary.
   let (expected, transition) = match snapshot.get(&namespace, &store_key).await? {
     Some(existing) => {
-      let existing_record = RevocationRecordV1::decode(existing.as_bytes())?;
+      let stored_payload = RowEnvelope::open(existing.as_bytes())?;
+      let existing_record = RevocationRecordV1::decode(&stored_payload)?;
       if existing_record == *record {
         return Ok(RevokeStoreOutcome::AlreadyRevoked);
       }
@@ -290,7 +296,7 @@ pub(crate) async fn revoke_binding_ctx(
       // (a losing stored record is already-revoked; a winning fresh
       // record replaces it under its exact digest). A stored record for
       // a different binding still fails closed inside the decision.
-      match revocation_merge(existing.as_bytes(), &encoded)? {
+      match revocation_merge(&stored_payload, &encoded)? {
         TerminalWinner::Stored => return Ok(RevokeStoreOutcome::AlreadyRevoked),
         TerminalWinner::Fresh => (
           StoreExpectation::Exact(existing.digest().clone()),
@@ -313,10 +319,15 @@ pub(crate) async fn revoke_binding_ctx(
         expected: StoreExpectation::Exact(binding_digest),
       },
       StoreOperation::Put {
-        namespace,
-        key: store_key,
+        namespace: namespace.clone(),
+        key: store_key.clone(),
         expected,
-        value: StoreValue::new(Arc::from(encoded)),
+        value: RowEnvelope::seal(
+          &namespace,
+          &store_key,
+          snapshot.revision(),
+          Arc::from(encoded),
+        )?,
       },
     ],
   )?;
@@ -397,7 +408,7 @@ pub(crate) async fn revoked_key_ctx(
     return Ok(None);
   };
   Ok(Some(
-    RevocationRecordV1::decode(value.as_bytes())?
+    RevocationRecordV1::decode(&RowEnvelope::open(value.as_bytes())?)?
       .subject_key()
       .clone(),
   ))
@@ -523,14 +534,20 @@ mod tests {
         crate::TransactionId::generate(&SystemEntropy).unwrap(),
         snapshot.revision().clone(),
         vec![crate::StoreOperation::Put {
-          namespace,
-          key: store_key,
+          namespace: namespace.clone(),
+          key: store_key.clone(),
           expected: StoreExpectation::Absent,
-          value: crate::StoreValue::new(Arc::from(
-            IdentityBindingV1::new(node.clone(), key.clone())
-              .encode()
-              .unwrap(),
-          )),
+          value: crate::storage::RowEnvelope::seal(
+            &namespace,
+            &store_key,
+            snapshot.revision(),
+            Arc::from(
+              IdentityBindingV1::new(node.clone(), key.clone())
+                .encode()
+                .unwrap(),
+            ),
+          )
+          .unwrap(),
         }],
       )
       .unwrap();
@@ -643,7 +660,7 @@ mod tests {
   async fn stored_bytes(store: &MetadataStore) -> Vec<u8> {
     let namespace = super::namespace().unwrap();
     let key = super::revocation_key(&subject());
-    store
+    let stored = store
       .snapshot()
       .await
       .unwrap()
@@ -652,7 +669,9 @@ mod tests {
       .unwrap()
       .expect("the stored revocation record")
       .as_bytes()
-      .to_vec()
+      .to_vec();
+    // The stored row is the envelope; the assertions compare payloads.
+    crate::storage::RowEnvelope::open(&stored).unwrap()
   }
 
   /// Two verified revocations of the same binding from different issuers
@@ -966,12 +985,16 @@ mod crash {
         crate::TransactionId::generate(&SystemEntropy).unwrap(),
         snapshot.revision().clone(),
         vec![crate::StoreOperation::Put {
-          namespace,
-          key: store_key,
+          namespace: namespace.clone(),
+          key: store_key.clone(),
           expected: StoreExpectation::Absent,
-          value: crate::StoreValue::new(Arc::from(
-            IdentityBindingV1::new(subject(), key()).encode().unwrap(),
-          )),
+          value: crate::storage::RowEnvelope::seal(
+            &namespace,
+            &store_key,
+            snapshot.revision(),
+            Arc::from(IdentityBindingV1::new(subject(), key()).encode().unwrap()),
+          )
+          .unwrap(),
         }],
       )
       .unwrap();
@@ -1072,7 +1095,10 @@ mod crash {
           .await
           .unwrap()
           .expect("the trusted binding survives every crash point");
-        let binding = IdentityBindingV1::decode(binding.as_bytes()).unwrap();
+        let binding = IdentityBindingV1::decode(
+          &crate::storage::RowEnvelope::open(binding.as_bytes()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(binding.public_key(), &key());
         drop(snapshot);
         drop(reopened);

@@ -43,7 +43,7 @@ use crate::{
   identity::records::LOCAL_IDENTITY_PURPOSE_TEXT as LOCAL_IDENTITY_PURPOSE,
   provider::{KeyProvider, StorageFactory, StoreSnapshot},
   storage::{
-    MetadataStore, WriterPermit,
+    MetadataStore, RowEnvelope, WriterPermit,
     pending::PendingCleanupOutcome,
     receipt::{PreparedTransaction, ReceiptReferenceChange, ReceiptReferenceToken},
   },
@@ -124,7 +124,7 @@ pub(crate) async fn ensure_self_binding(
   let expected = IdentityBindingV1::new(identity.node().clone(), identity.public_key().clone());
   let snapshot = store.snapshot().await?;
   if let Some(existing) = snapshot.get(&namespace, &key).await? {
-    return expect_exact_self_binding(existing.as_bytes(), identity);
+    return expect_exact_self_binding(&RowEnvelope::open(existing.as_bytes())?, identity);
   }
   let transaction = store.prepare_transaction(
     TransactionId::generate(entropy)?,
@@ -133,7 +133,12 @@ pub(crate) async fn ensure_self_binding(
       namespace: namespace.clone(),
       key: key.clone(),
       expected: StoreExpectation::Absent,
-      value: StoreValue::new(Arc::from(expected.encode()?)),
+      value: RowEnvelope::seal(
+        &namespace,
+        &key,
+        snapshot.revision(),
+        Arc::from(expected.encode()?),
+      )?,
     }],
   )?;
   drop(snapshot);
@@ -151,7 +156,7 @@ pub(crate) async fn ensure_self_binding(
         .get(&namespace, &key)
         .await?
         .ok_or_else(|| Error::conflict("self binding"))?;
-      expect_exact_self_binding(existing.as_bytes(), identity)
+      expect_exact_self_binding(&RowEnvelope::open(existing.as_bytes())?, identity)
     }
   }
 }
@@ -320,8 +325,10 @@ pub(crate) async fn discover_local_identity(
     if found.is_some() {
       return Err(discovery_corrupt());
     }
-    let record =
-      LocalIdentityV1::decode(entry.value().as_bytes()).map_err(|_| discovery_corrupt())?;
+    let record = LocalIdentityV1::decode(
+      &RowEnvelope::open(entry.value().as_bytes()).map_err(|_| discovery_corrupt())?,
+    )
+    .map_err(|_| discovery_corrupt())?;
     found = Some((entry.value().clone(), record));
   }
   Ok(found)
@@ -345,8 +352,10 @@ async fn discover_key_creation_intent(
     if found.is_some() {
       return Err(discovery_corrupt());
     }
-    let record =
-      KeyCreationIntentV1::decode(entry.value().as_bytes()).map_err(|_| discovery_corrupt())?;
+    let record = KeyCreationIntentV1::decode(
+      &RowEnvelope::open(entry.value().as_bytes()).map_err(|_| discovery_corrupt())?,
+    )
+    .map_err(|_| discovery_corrupt())?;
     let (_, expected_key) = key_creation_intent_key(record.operation())?;
     if entry.key() != &expected_key || record.purpose() != LOCAL_IDENTITY_PURPOSE {
       return Err(discovery_corrupt());
@@ -386,8 +395,13 @@ async fn create_identity(
     transaction,
     snapshot.revision().clone(),
   )?;
-  let value = StoreValue::new(Arc::from(intent.encode()?));
   let (namespace, key) = key_creation_intent_key(intent.operation())?;
+  let value = RowEnvelope::seal(
+    &namespace,
+    &key,
+    snapshot.revision(),
+    Arc::from(intent.encode()?),
+  )?;
   let token = ReceiptReferenceToken::for_record(&namespace, &key);
   let prepared = store
     .prepare_transaction_with_receipt_changes(
@@ -505,6 +519,12 @@ async fn finalize_identity(
   let reuse_guards = [deletion_check, deleted_check];
   let local_token = ReceiptReferenceToken::for_record(&local_namespace, &local_key);
   let intent_token = ReceiptReferenceToken::for_record(&intent_namespace, &intent_key);
+  let identity_value = RowEnvelope::seal(
+    &local_namespace,
+    &local_key,
+    snapshot.revision(),
+    Arc::from(identity.encode()?),
+  )?;
   let prepared = store
     .prepare_journaled_transaction(
       snapshot.as_ref(),
@@ -520,7 +540,7 @@ async fn finalize_identity(
           namespace: local_namespace,
           key: local_key,
           expected: StoreExpectation::Absent,
-          value: StoreValue::new(Arc::from(identity.encode()?)),
+          value: identity_value,
         },
       ]
       .into_iter()
@@ -775,7 +795,10 @@ mod tests {
       .unwrap()
       .entries
       .get(&(namespace, key))
-      .map(|value| LocalIdentityV1::decode(value.as_bytes()).unwrap())
+      .map(|value| {
+        LocalIdentityV1::decode(&crate::storage::RowEnvelope::open(value.as_bytes()).unwrap())
+          .unwrap()
+      })
   }
 
   /// Whether the default custody's seed row exists for one handle in the
@@ -801,7 +824,10 @@ mod tests {
       .entries
       .iter()
       .filter(|((entry_namespace, _), _)| entry_namespace == &namespace)
-      .map(|(_, value)| KeyCreationIntentV1::decode(value.as_bytes()).unwrap())
+      .map(|(_, value)| {
+        KeyCreationIntentV1::decode(&crate::storage::RowEnvelope::open(value.as_bytes()).unwrap())
+          .unwrap()
+      })
       .collect()
   }
 
@@ -1497,22 +1523,46 @@ mod tests {
     let public_key = PublicKey::from_bytes(scripted_signing(7).verifying_key().to_bytes());
     let handle =
       KeyHandle::from_provider_bytes(Arc::from(b"scripted-handle-x".as_slice())).unwrap();
-    LocalIdentityV1::new(node(1), public_key, operation(2), handle)
-      .encode()
-      .unwrap()
+    let (namespace, key) = local_identity_key().unwrap();
+    // The discovery readers open the row envelope; a valid injected row
+    // is the sealed envelope over the record bytes.
+    crate::storage::RowEnvelope::seal(
+      &namespace,
+      &key,
+      &StoreRevision::new(Arc::from([1_u8])).unwrap(),
+      Arc::from(
+        LocalIdentityV1::new(node(1), public_key, operation(2), handle)
+          .encode()
+          .unwrap(),
+      ),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec()
   }
 
   fn valid_intent_bytes(op: KeyOperationId, purpose: &str) -> Vec<u8> {
-    KeyCreationIntentV1::new(
-      op,
-      node(1),
-      purpose.to_owned(),
-      transaction(3),
-      StoreRevision::new(Arc::from([1])).unwrap(),
+    let (namespace, key) = key_creation_intent_key(&op).unwrap();
+    crate::storage::RowEnvelope::seal(
+      &namespace,
+      &key,
+      &StoreRevision::new(Arc::from([1_u8])).unwrap(),
+      Arc::from(
+        KeyCreationIntentV1::new(
+          op,
+          node(1),
+          purpose.to_owned(),
+          transaction(3),
+          StoreRevision::new(Arc::from([1])).unwrap(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap(),
+      ),
     )
     .unwrap()
-    .encode()
-    .unwrap()
+    .as_bytes()
+    .to_vec()
   }
 
   #[tokio::test]

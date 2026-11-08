@@ -39,7 +39,7 @@ use crate::{
   StoreNamespace, StoreOperation, StoreValue, TransactionId,
   api::Entropy,
   provider::KeyProvider,
-  storage::{MetadataStore, WriterPermit},
+  storage::{MetadataStore, RowEnvelope, WriterPermit},
 };
 
 /// The durable schema of the leave-intent record.
@@ -241,8 +241,11 @@ pub(crate) async fn persist_leave_record_ctx(
     crate::identity::records::identity_binding_key(record.node())?;
   let snapshot = store.snapshot().await?;
   if let Some(existing) = snapshot.get(&binding_namespace, &binding_key).await? {
-    let binding = crate::identity::records::IdentityBindingV1::decode(existing.as_bytes())
-      .map_err(|_| Error::invalid_input("leave record binding"))?;
+    let binding = crate::identity::records::IdentityBindingV1::decode(
+      &RowEnvelope::open(existing.as_bytes())
+        .map_err(|_| Error::invalid_input("leave record binding"))?,
+    )
+    .map_err(|_| Error::invalid_input("leave record binding"))?;
     if binding.public_key() != record.public_key() {
       return Err(Error::not_trusted("leave record binding"));
     }
@@ -394,7 +397,9 @@ async fn self_leave_record(store: &MetadataStore, node: &NodeId) -> Result<Optio
   let Some(value) = snapshot.get(&namespace, &leave_record_key(node)).await? else {
     return Ok(None);
   };
-  Ok(Some(LeaveRecordV1::decode(value.as_bytes())?))
+  Ok(Some(LeaveRecordV1::decode(&RowEnvelope::open(
+    value.as_bytes(),
+  )?)?))
 }
 
 impl LeaveIntentV1 {
@@ -418,7 +423,7 @@ pub(crate) async fn discover_leave_intent(
   };
   Ok(Some((
     value.clone(),
-    LeaveIntentV1::decode(value.as_bytes())?,
+    LeaveIntentV1::decode(&RowEnvelope::open(value.as_bytes())?)?,
   )))
 }
 
@@ -568,8 +573,11 @@ async fn swap_identity(
   let Some(former_value) = snapshot.get(&local_namespace, &local_key).await? else {
     return Err(Error::conflict("leave identity swap"));
   };
-  let former = LocalIdentityV1::decode(former_value.as_bytes())
-    .map_err(|_| Error::invalid_input("local identity"))?;
+  let former = LocalIdentityV1::decode(
+    &RowEnvelope::open(former_value.as_bytes())
+      .map_err(|_| Error::invalid_input("local identity"))?,
+  )
+  .map_err(|_| Error::invalid_input("local identity"))?;
   if former.node() != &intent.former_node {
     return Err(Error::conflict("leave identity swap"));
   }
@@ -578,6 +586,12 @@ async fn swap_identity(
   // same guard keys are re-checked transactionally below.
   records::assert_key_handle_fresh(snapshot.as_ref(), created.handle()).await?;
   let [deletion_check, deleted_check] = records::key_handle_fresh_checks(created.handle())?;
+  let swap_value = RowEnvelope::seal(
+    &local_namespace,
+    &local_key,
+    snapshot.revision(),
+    Arc::from(replacement.encode()?),
+  )?;
   let prepared = store.prepare_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
@@ -586,7 +600,7 @@ async fn swap_identity(
         namespace: local_namespace,
         key: local_key,
         expected: StoreExpectation::Exact(former_value.digest().clone()),
-        value: StoreValue::new(Arc::from(replacement.encode()?)),
+        value: swap_value,
       },
       deletion_check,
       deleted_check,
@@ -704,7 +718,7 @@ async fn begin_intent(
     replacement_node: NodeId::generate(entropy)?,
     replacement_operation: KeyOperationId::generate(entropy)?,
   };
-  let value = StoreValue::new(Arc::from(intent.encode()?));
+  let payload: Arc<[u8]> = Arc::from(intent.encode()?);
   // Losing the Absent expectation to an external writer is transient:
   // the bounded retries re-snapshot and re-prepare the same intent
   // instead of surfacing the conflict to the caller (the wipe batches
@@ -712,6 +726,15 @@ async fn begin_intent(
   const INTENT_RACE_BUDGET: usize = 8;
   for _ in 0..INTENT_RACE_BUDGET {
     let snapshot = store.snapshot().await?;
+    // The persisted intent body is the row envelope, versioned by the
+    // preparing CAS revision; the committed sealed value is the one
+    // returned to the caller.
+    let value = RowEnvelope::seal(
+      &leave_namespace()?,
+      &leave_key(),
+      snapshot.revision(),
+      payload.clone(),
+    )?;
     let prepared = store.prepare_transaction(
       TransactionId::generate(entropy)?,
       snapshot.revision().clone(),
@@ -1660,7 +1683,9 @@ mod crash {
     let mut scan = snapshot.scan(&namespace, &[]).await.unwrap();
     let mut leave_record = None;
     while let Some(entry) = scan.next().await.unwrap() {
-      if let Ok(record) = super::LeaveRecordV1::decode(entry.value().as_bytes()) {
+      if let Ok(record) = super::LeaveRecordV1::decode(
+        &crate::storage::RowEnvelope::open(entry.value().as_bytes()).unwrap(),
+      ) {
         leave_record = Some(record.node().clone());
       }
     }

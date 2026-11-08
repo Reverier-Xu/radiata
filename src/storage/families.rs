@@ -67,8 +67,6 @@ pub(crate) fn namespace(tag: &str) -> crate::Result<crate::StoreNamespace> {
   Ok(crate::StoreNamespace::new(tag))
 }
 
-#[cfg(all(test, unix, feature = "json", feature = "redb"))]
-pub(crate) use catalog::MetadataFamily;
 /// The owning domain of every catalog family; consumers classify families
 /// through the catalog itself (iterate [`metadata_families`]) instead of
 /// by copying namespace lists.

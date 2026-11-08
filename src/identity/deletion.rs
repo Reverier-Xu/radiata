@@ -23,7 +23,10 @@ use crate::{
   StoreOperation, StoreValue, TransactionId,
   api::Entropy,
   provider::KeyProvider,
-  storage::receipt::{ReceiptReferenceChange, ReceiptReferenceToken},
+  storage::{
+    RowEnvelope,
+    receipt::{ReceiptReferenceChange, ReceiptReferenceToken},
+  },
 };
 
 /// Deletes one unreferenced provider handle with exact crash recovery.
@@ -82,8 +85,8 @@ pub(crate) async fn delete_unreferenced_key(
     let existing = snapshot.get(&intent_namespace, &intent_key).await?;
     let (stored_intent, intent, resumed) = match existing {
       Some(stored) => {
-        let intent =
-          KeyDeletionIntentV1::decode(stored.as_bytes()).map_err(|_| discovery_corrupt())?;
+        let intent = KeyDeletionIntentV1::decode(&RowEnvelope::open(stored.as_bytes())?)
+          .map_err(|_| discovery_corrupt())?;
         if intent.handle() != handle || intent.purpose() != purpose {
           return Err(discovery_corrupt());
         }
@@ -98,7 +101,12 @@ pub(crate) async fn delete_unreferenced_key(
           snapshot.revision().clone(),
         )?;
         let token = ReceiptReferenceToken::for_record(&intent_namespace, &intent_key);
-        let value = StoreValue::new(Arc::from(intent.encode()?));
+        let value = RowEnvelope::seal(
+          &intent_namespace,
+          &intent_key,
+          snapshot.revision(),
+          Arc::from(intent.encode()?),
+        )?;
         // Transactional guard: pin the exact local-identity record this
         // snapshot proved unreferenced, so a concurrent finalization that
         // changes it aborts the intent install. The shared construction
@@ -228,10 +236,15 @@ async fn delete_provider_step(
           expected: current.digest().clone(),
         },
         StoreOperation::Put {
-          namespace: deleted_namespace,
-          key: deleted_key,
+          namespace: deleted_namespace.clone(),
+          key: deleted_key.clone(),
           expected: StoreExpectation::Absent,
-          value: StoreValue::new(Arc::from(tombstone.encode()?)),
+          value: RowEnvelope::seal(
+            &deleted_namespace,
+            &deleted_key,
+            snapshot.revision(),
+            Arc::from(tombstone.encode()?),
+          )?,
         },
       ],
       vec![
@@ -275,7 +288,10 @@ async fn accept_exact_tombstone(
   drop(snapshot);
   match tombstone_value {
     Some(value) if intent_gone => {
-      let stored = KeyDeletedV1::decode(value.as_bytes()).map_err(|_| discovery_corrupt())?;
+      let stored = KeyDeletedV1::decode(
+        &RowEnvelope::open(value.as_bytes()).map_err(|_| discovery_corrupt())?,
+      )
+      .map_err(|_| discovery_corrupt())?;
       if &stored == tombstone {
         return Ok(());
       }
@@ -308,7 +324,7 @@ mod tests {
 
   use super::delete_under_permit;
   use crate::{
-    ErrorKind, KeyOperationId, StoreValue,
+    ErrorKind, KeyOperationId,
     identity::{
       lifecycle::LocalIdentityContext,
       records::{
@@ -592,7 +608,15 @@ mod tests {
           KeyOperationId::parse("keyop-000000000000000000002").unwrap(),
           expected_handle.clone(),
         );
-        let value = StoreValue::new(Arc::from(tombstone.encode().unwrap()));
+        // The injected rows are read through the envelope decoder; valid
+        // injections are sealed envelopes over the record bytes.
+        let value = crate::storage::RowEnvelope::seal(
+          &namespace,
+          &key,
+          &crate::StoreRevision::new(Arc::from(0_u64.to_be_bytes())).unwrap(),
+          Arc::from(tombstone.encode().unwrap()),
+        )
+        .unwrap();
         reference
           .state
           .lock()
@@ -607,10 +631,16 @@ mod tests {
           expected_handle.clone(),
           "key-delete-test".to_owned(),
           crate::TransactionId::parse("txn-000000000000000000002").unwrap(),
-          revision,
+          revision.clone(),
         )
         .unwrap();
-        let value = StoreValue::new(Arc::from(intent.encode().unwrap()));
+        let value = crate::storage::RowEnvelope::seal(
+          &namespace,
+          &key,
+          &revision,
+          Arc::from(intent.encode().unwrap()),
+        )
+        .unwrap();
         reference
           .state
           .lock()
