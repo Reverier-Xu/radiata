@@ -1,14 +1,15 @@
 # Remediation Roadmap — post-audit decision record
 
-Status: **Track 0 dispatched and fully merged (2026-11-08)** — all eleven
-items plus the quick-fix pool landed via the merge queue (main at
-`1895bf8`; 1159 tests, 0 failures, clippy clean). `radiata-cadence`
-delivered as a workspace crate. Remaining: Phase A-E below (direction
-approved, dispatch pending), Wave 2 leftovers (route_policy consumer-side
-completion, redaction-stance doc sweep in error.rs/guide.rs/audit.rs),
-and the deferred specialist tracks. Companion documents:
-`docs/code-quality-audit.md` (findings), `docs/work-item-radiata-cadence.md`
-(syntax-library work item). Delivery has no deadline.
+Status: **COMPLETE (2026-11-08)** — Track 0 (eleven items + quick-fix
+pool), Wave 2 (route_policy completion, subscription predicates,
+redaction-stance sweep, cadence time-lib features), and Phases A-E all
+landed via the merge queue. Final main: `5e3a8d0` — 1235 tests, 0
+failures, clippy clean, ABI baseline current. Remaining out of scope by
+owner decision: the deferred specialist tracks below (docs/
+extensibility, SLO strata) and the pre-0.1.0 release process.
+Companion documents: `docs/code-quality-audit.md` (findings),
+`docs/work-item-radiata-{cadence,phase-a..e}.md` (per-phase work items
+with embedded decision records).
 
 ## Decided scope stances (binding)
 
