@@ -754,8 +754,6 @@ mod tests {
     StoreNamespace::new(QualifiedTag::parse(tag).unwrap())
   }
 
-  use crate::hex::encode as hex;
-
   fn fresh_reference() -> (Arc<ReferenceFactory>, Arc<dyn StorageFactory>) {
     let reference = Arc::new(ReferenceFactory::new(required_capabilities()));
     let factory: Arc<dyn StorageFactory> = reference.clone();
@@ -1598,7 +1596,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn identity_records_lifecycle_errors_are_typed_and_redacted() {
+  async fn identity_records_lifecycle_errors_are_typed() {
     let (_reference, factory) = fresh_reference();
     let keys = ScriptedKeys::full();
     let entropy = Arc::new(SequenceEntropy::default());
@@ -1606,7 +1604,6 @@ mod tests {
     let first = open_with(factory.clone(), keys, entropy.clone())
       .await
       .unwrap();
-    let identity = first.identity().clone();
     drop(first);
 
     let mismatched = ScriptedKeys::full();
@@ -1620,10 +1617,6 @@ mod tests {
       rendered,
       "Error { kind: Internal, context: \"key public key\" }"
     );
-    assert!(!rendered.contains(&hex(identity.public_key().as_bytes())));
-    assert!(!rendered.contains(&hex(identity.handle().expose_provider_handle())));
-    assert!(!rendered.contains("scripted-handle"));
-    assert!(!rendered.contains(identity.node().as_str()));
 
     let (reference, factory) = fresh_reference();
     let (local_namespace, local_key) = local_identity_key().unwrap();
@@ -1640,6 +1633,5 @@ mod tests {
       rendered,
       "Error { kind: StorageCorrupt, context: \"storage snapshot\" }"
     );
-    assert!(!rendered.contains("opaque-corrupt-value"));
   }
 }

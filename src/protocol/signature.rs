@@ -149,7 +149,7 @@ mod tests {
   }
 
   #[test]
-  fn authentication_errors_are_redacted() {
+  fn authentication_errors_are_typed() {
     let (public_key, signature) = signed(BODY, MERGE_DOMAIN);
 
     let error = verify_strict(
@@ -165,17 +165,5 @@ mod tests {
       rendered,
       "Error { kind: AuthenticationFailed, context: \"merge grant signature\" }"
     );
-    let key_hex: String = public_key
-      .as_bytes()
-      .iter()
-      .map(|byte| format!("{byte:02x}"))
-      .collect();
-    let signature_hex: String = signature
-      .as_bytes()
-      .iter()
-      .map(|byte| format!("{byte:02x}"))
-      .collect();
-    assert!(!rendered.contains(&key_hex));
-    assert!(!rendered.contains(&signature_hex));
   }
 }
