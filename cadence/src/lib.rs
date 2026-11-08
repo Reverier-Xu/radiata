@@ -75,11 +75,65 @@
 //! let impossible = Pattern::parse("{*}-{02}-{30}T00:00:00Z").unwrap();
 //! assert_eq!(impossible.next_fire(FieldValues::new(2026, 1, 1, 0, 0, 0).unwrap()), None);
 //! ```
+//!
+//! # Time-library interop
+//!
+//! The core stays dependency-free and clock-blind. Optional features
+//! bridge caller-side time libraries (all off by default):
+//!
+//! - `std-time`: `SystemTime` conversions for the `Utc` and fixed-offset frames
+//!   (see [`field_values_to_system_time`], [`system_time_to_field_values`]).
+//! - `chrono`: [`TryFrom`] any `chrono::DateTime<Tz>` into [`FieldValues`],
+//!   plus `to_chrono_fixed` back.
+//! - `jiff`: [`TryFrom`] for `jiff::Timestamp` and `jiff::Zoned`, plus
+//!   `to_jiff_timestamp` / `to_jiff_civil` back.
+//!
+//! The device-local frame needs a timezone database, so only `chrono`
+//! and `jiff` can resolve it: read the local civil fields from their
+//! types and match or search against an `Offset::Local` pattern. `std`
+//! alone cannot, and the `std-time` conversions reject the local frame
+//! explicitly.
 
 mod calendar;
+#[cfg(feature = "chrono")]
+mod compat_chrono;
+#[cfg(feature = "jiff")]
+mod compat_jiff;
+#[cfg(feature = "std-time")]
+mod compat_std;
+#[cfg(any(feature = "jiff", feature = "std-time"))]
+mod epoch;
 mod error;
 mod field;
 mod pattern;
 
+#[cfg(feature = "std-time")]
+pub use compat_std::{field_values_to_system_time, system_time_to_field_values};
 pub use error::{ParseError, ParseErrorKind, Result};
 pub use pattern::{FieldValues, Offset, Pattern};
+
+/// Why a time-library conversion failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeInteropError {
+  /// The pattern frame is [`Offset::Local`]: resolving the device's
+  /// local wall clock needs a timezone database, which `std` alone does
+  /// not have. Enable `chrono` or `jiff` and resolve local readings
+  /// through their timezone types.
+  LocalFrameUnsupported,
+  /// The instant or civil values do not round-trip through the crate's
+  /// 0000-9999 proleptic-Gregorian domain (or the arithmetic overflowed).
+  OutOfRange,
+}
+
+impl core::fmt::Display for TimeInteropError {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::LocalFrameUnsupported => f.write_str(
+        "the local frame needs a timezone-aware library (enable the chrono or jiff feature)",
+      ),
+      Self::OutOfRange => f.write_str("outside the 0000-9999 civil calendar domain"),
+    }
+  }
+}
+
+impl std::error::Error for TimeInteropError {}

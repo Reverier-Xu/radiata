@@ -9,3 +9,19 @@ version     = "0.0.1"
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[features]
+# Optional time-library interop, all off by default: the core stays
+# dependency-free and clock-blind. See the crate docs for the trade-offs.
+chrono = ["dep:chrono"]
+jiff = ["dep:jiff"]
+std-time = []
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = [
+  "std",
+  "clock",
+], optional = true }
+jiff = { version = "0.2", default-features = false, features = [
+  "std",
+], optional = true }

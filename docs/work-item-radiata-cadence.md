@@ -117,3 +117,43 @@ triggers, or task semantics.
    spaces, including DST-gap/duplicate and leap-day edges.
 4. All repository quality gates green for the new workspace member
    (`taplo`, nightly `rustfmt`, `check`, `clippy -D warnings`, `test`).
+
+## Time-library interop (delivered 2026-11-08, post-merge addendum)
+
+Three optional features bridge caller-side time libraries; all default
+off, the core stays dependency-free and clock-blind:
+
+- `std-time`: `SystemTime` <-> `FieldValues` for the `Utc` and
+  fixed-offset frames. Sub-second readings floor toward negative
+  infinity. The device-local frame is rejected — `std` has no timezone
+  database.
+- `chrono` (dep `chrono` 0.4, no default features): `TryFrom` any
+  `DateTime<Tz>` into `FieldValues` (local civil reading), and
+  `FieldValues::to_chrono_fixed` back into `DateTime<FixedOffset>`.
+- `jiff` (dep `jiff` 0.2, no default features): `TryFrom` for
+  `jiff::Timestamp` / `&jiff::Zoned` / `jiff::civil::DateTime`, and
+  `FieldValues::to_jiff_timestamp` / `to_jiff_civil` back.
+
+The device-local frame is resolvable only through `chrono`/`jiff` (their
+timezone types own the tz database); cadence deliberately never resolves
+local time itself. Errors surface as the shared `TimeInteropError`
+(`LocalFrameUnsupported` / `OutOfRange`).
+
+### Project time-library survey (decision record)
+
+- radiata core reads wall clock exclusively through `src/time.rs`
+  (`SystemTime` seam, unix seconds/millis scales); tokio's `time` feature
+  is the async runtime timer, not a date-time library.
+- Dependency tree contains `time` v0.3 only transitively (rcgen -> yasna,
+  X.509 timestamp encoding) — an implementation detail of cert issuance,
+  not used by, or exposed to, radiata logic. No chrono/jiff/iana-tz
+  anywhere. No mixing risk: one clock authority plus the documented
+  receipt wire-codec exception.
+- Migration to jiff for radiata core is **not warranted**: core semantics
+  need only unix-second/millis arithmetic and ordering (liveness,
+  LWW tuples); there is no civil-calendar or timezone need, and wall-clock
+  reliability is an operator obligation by standing decision. jiff's
+  timezone correctness matters only for `Offset::Local` resolution, which
+  cadence assigns to the caller's library of choice — hence opt-in
+  features for both chrono and jiff so downstream users match whichever
+  already sits in their dependency tree.
