@@ -81,6 +81,12 @@ impl ResourceName {
   pub fn as_str(&self) -> &str {
     self.0.as_str()
   }
+
+  /// The canonical lowercase domain prefix of the resource name: the key
+  /// a [`crate::SubscriptionPredicate`]'s domain set tests.
+  pub fn domain(&self) -> &str {
+    self.0.domain()
+  }
 }
 
 impl fmt::Display for ResourceName {

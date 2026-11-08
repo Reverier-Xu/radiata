@@ -712,8 +712,8 @@ async fn serve_control_command(
       let result = supervisor.page_resources(cursor, limit).await;
       let _ = reply.send(result);
     }
-    Control::WatchResources { from, reply } => {
-      let result = supervisor.watch_resources(from).await;
+    Control::WatchResources { options, reply } => {
+      let result = supervisor.watch_resources(options).await;
       let _ = reply.send(result);
     }
     Control::PageListeners {

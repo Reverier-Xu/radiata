@@ -110,7 +110,7 @@ pub(crate) enum Control {
     reply: oneshot::Sender<Result<crate::ResourcePage>>,
   },
   WatchResources {
-    from: Option<u64>,
+    options: crate::ResourceWatchOptions,
     reply: oneshot::Sender<Result<crate::ResourceWatch>>,
   },
   PageListeners {

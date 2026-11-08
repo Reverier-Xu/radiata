@@ -67,7 +67,15 @@ pub(super) fn resource_mutation_outcome(
 ) -> Result<crate::ResourceMutationView> {
   match outcome {
     crate::resource::store::ResourceCommitOutcome::Installed(_) => {
-      events.emit(crate::ResourceChanged::new(name.clone(), origin, removal));
+      // The emitted event carries the committed record's labels: they are
+      // already in hand on the winner view, so emit-side predicate
+      // evaluation needs no register re-read.
+      events.emit(crate::ResourceChanged::new(
+        name.clone(),
+        winner.accepted().labels().clone(),
+        origin,
+        removal,
+      ));
       Ok(winner)
     }
     crate::resource::store::ResourceCommitOutcome::Superseded(_) => superseded

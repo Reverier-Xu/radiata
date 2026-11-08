@@ -11,8 +11,8 @@ use std::{sync::Arc, time::Duration};
 use radiata::extension::StorageFactory;
 use radiata::{
   Endpoint, EventOptions, EventReceive, NodeBuilder, NodeConfig, NodeHandle, PageSpec,
-  ResourceChanged, ResourceLabels, ResourceName, ResourceOrigin, ResourceUri, ResourceWrite,
-  Selector, ShutdownReason, extension::KeyProvider,
+  ResourceChanged, ResourceLabels, ResourceName, ResourceOrigin, ResourceUri, ResourceWatchOptions,
+  ResourceWrite, Selector, ShutdownReason, SubscriptionPredicate, extension::KeyProvider,
 };
 
 mod common;
@@ -925,5 +925,204 @@ async fn concurrent_expected_puts_commit_exactly_one() {
   assert_eq!(current.version(), winner.accepted().version());
 
   let outcome = handle.shutdown().await.unwrap();
+  assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
+}
+
+/// A subscription predicate filters the live `ResourceChanged` watch
+/// emit-side: a non-matching resource's commit event is never delivered
+/// to the filtered subscriber, a matching one arrives with its labels,
+/// and an unfiltered subscriber of the same event type still sees
+/// everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscription_predicates_filter_the_live_resource_watch() {
+  let node = start_node(
+    0,
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+  )
+  .await;
+  let mut filtered = node
+    .handle
+    .watch::<ResourceChanged>(
+      EventOptions::new().predicate(
+        SubscriptionPredicate::new()
+          .domain("example.net")
+          .unwrap()
+          .selector("example.org/labels/lane=lane-1")
+          .unwrap(),
+      ),
+    )
+    .unwrap();
+  let mut unfiltered = node
+    .handle
+    .watch::<ResourceChanged>(EventOptions::new())
+    .unwrap();
+
+  // A non-matching commit (wrong domain): only the unfiltered subscriber
+  // observes it; the event was evaluated emit-side against the filtered
+  // subscriber's predicate and never sent.
+  node
+    .handle
+    .resources()
+    .put(ResourceWrite::new(
+      ResourceName::parse("radiata.woooo.tech/resources/g9-pred-001").unwrap(),
+      resource_labels("document", 1),
+    ))
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  assert!(matches!(
+    tokio::time::timeout(std::time::Duration::from_secs(90), unfiltered.recv())
+      .await
+      .unwrap()
+      .unwrap(),
+    EventReceive::Item(_)
+  ));
+  assert!(matches!(
+    filtered.try_recv().unwrap(),
+    EventReceive::Empty | EventReceive::Closed
+  ));
+
+  // A matching commit (right domain, right custom label) reaches the
+  // filtered subscriber with its committed label space, and the
+  // unfiltered subscriber still sees it.
+  node
+    .handle
+    .resources()
+    .put(ResourceWrite::new(
+      ResourceName::parse("example.net/resources/g9-pred-002").unwrap(),
+      resource_labels("document", 1),
+    ))
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let EventReceive::Item(matched) =
+    tokio::time::timeout(std::time::Duration::from_secs(90), filtered.recv())
+      .await
+      .unwrap()
+      .unwrap()
+  else {
+    panic!("the filtered subscriber must receive the matching event")
+  };
+  assert_eq!(
+    matched.resource(),
+    &ResourceName::parse("example.net/resources/g9-pred-002").unwrap()
+  );
+  assert_eq!(
+    matched
+      .labels()
+      .custom_labels()
+      .get(&radiata::LabelKey::parse("example.org/labels/lane").unwrap())
+      .map(|value| value.as_str()),
+    Some("lane-1")
+  );
+  assert!(matches!(
+    tokio::time::timeout(std::time::Duration::from_secs(90), unfiltered.recv())
+      .await
+      .unwrap()
+      .unwrap(),
+    EventReceive::Item(_)
+  ));
+
+  let outcome = node.handle.shutdown().await.unwrap();
+  assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
+}
+
+/// The durable feed watch pushes the predicate into the replay: only
+/// matching changes replay, the resume stays record-stream based (the
+/// last processed version is the exact resume point even with filtered
+/// entries between), and a matching commit after the resume arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_resources_pushes_the_predicate_into_the_replay() {
+  let node = start_node(
+    1,
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+  )
+  .await;
+  let predicate = SubscriptionPredicate::new().domain("example.net").unwrap();
+  let options = ResourceWatchOptions::new()
+    .from(0)
+    .predicate(predicate.clone());
+  let mut feed = node.handle.watch_resources_with(options).await.unwrap();
+
+  // Three commits, one matching: the replay delivers exactly it.
+  for (name, seed) in [
+    ("radiata.woooo.tech/resources/g9-feed-001", 1_u8),
+    ("example.net/resources/g9-feed-002", 2),
+    ("radiata.woooo.tech/resources/g9-feed-003", 3),
+  ] {
+    node
+      .handle
+      .resources()
+      .put(ResourceWrite::new(
+        ResourceName::parse(name).unwrap(),
+        resource_labels("document", seed),
+      ))
+      .await
+      .unwrap()
+      .wait()
+      .await
+      .unwrap();
+  }
+  let replayed = tokio::time::timeout(std::time::Duration::from_secs(5), feed.next())
+    .await
+    .unwrap()
+    .unwrap();
+  assert_eq!(
+    replayed.name(),
+    &ResourceName::parse("example.net/resources/g9-feed-002").unwrap()
+  );
+  assert!(
+    tokio::time::timeout(std::time::Duration::from_millis(200), feed.next())
+      .await
+      .is_err(),
+    "non-matching replay entries must not be delivered"
+  );
+
+  // The resume is the record stream, not the match stream: resuming
+  // from the last processed version (1) replays the matching 2 (the
+  // non-matching 3 in between is skipped), and the later matching
+  // commit still arrives after it.
+  let mut resumed = node
+    .handle
+    .watch_resources_with(ResourceWatchOptions::new().from(1).predicate(predicate))
+    .await
+    .unwrap();
+  drop(feed);
+  let replayed_again = tokio::time::timeout(std::time::Duration::from_secs(5), resumed.next())
+    .await
+    .unwrap()
+    .unwrap();
+  assert_eq!(
+    replayed_again.name(),
+    &ResourceName::parse("example.net/resources/g9-feed-002").unwrap()
+  );
+  assert_eq!(replayed_again.version(), 2);
+  node
+    .handle
+    .resources()
+    .put(ResourceWrite::new(
+      ResourceName::parse("example.net/resources/g9-feed-004").unwrap(),
+      resource_labels("document", 4),
+    ))
+    .await
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+  let observed = tokio::time::timeout(std::time::Duration::from_secs(5), resumed.next())
+    .await
+    .unwrap()
+    .unwrap();
+  assert_eq!(
+    observed.name(),
+    &ResourceName::parse("example.net/resources/g9-feed-004").unwrap()
+  );
+  assert_eq!(observed.version(), 4);
+
+  let outcome = node.handle.shutdown().await.unwrap();
   assert_eq!(outcome.reason(), &ShutdownReason::Explicit);
 }
