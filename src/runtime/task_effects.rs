@@ -101,6 +101,10 @@ pub(crate) struct EffectPlanes {
   /// The memoized departed-members exclusion set, shared with the
   /// supervisor's own pages: the checkpoint guard reads the same cache.
   pub(crate) exclusion_cache: super::recovery::ExclusionCache,
+  /// The node's endpoint selector: the registration-channel-resolved
+  /// policy wrapped with the per-member rotation serials every dial
+  /// plane shares (see `crate::endpoint_selection`).
+  pub(crate) endpoint_selector: Arc<crate::EndpointSelector>,
   /// The writer's monotonic resource-write stamp clock, shared by the
   /// put and removal effects (see
   /// [`super::resources::issue_write_stamp`]).
@@ -179,6 +183,9 @@ impl OperationDeps {
         published_endpoints: Arc::default(),
         descriptor_publication: DescriptorPublication::default(),
         exclusion_cache: Arc::new(Mutex::new(None)),
+        endpoint_selector: Arc::new(crate::EndpointSelector::new(Arc::clone(
+          &dependencies.endpoint_policy,
+        ))),
         resource_write_clock: Arc::default(),
         recovery: Arc::new(Mutex::new(
           crate::membership::recovery::RecoveryController::new(
@@ -2194,6 +2201,9 @@ mod lazy_publication_shutdown_tests {
     let route_policy = extensions
       .effective_route_policy(NodeConfig::new().route_policy())
       .unwrap();
+    let endpoint_policy = extensions
+      .effective_endpoint_policy(NodeConfig::new().endpoint_policy(), None)
+      .unwrap();
     let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
     let (round_tx, round_rx) = tokio::sync::mpsc::channel(SYNC_ROUND_CHANNEL_CAPACITY);
     let (packet_tx, packet_rx) = tokio::sync::mpsc::channel(PACKET_CHANNEL_CAPACITY);
@@ -2205,6 +2215,7 @@ mod lazy_publication_shutdown_tests {
         keys: Some(keys.as_provider()),
         config: NodeConfig::new(),
         route_policy,
+        endpoint_policy,
         entropy,
         extensions,
         sessions: Default::default(),

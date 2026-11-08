@@ -66,7 +66,7 @@ use std::{
 use tracing::debug;
 
 use super::{
-  recovery::{recovery_endpoint, spawn_member_dial},
+  recovery::spawn_member_dial,
   supervisor::{Supervisor, TickState},
 };
 use crate::{Error, NodeId, Result};
@@ -210,8 +210,8 @@ impl TickState {
     )?;
     // Per-member endpoint rotation: every dial of a member advances that
     // member's OWN serial, wrapping per member — the same per-member
-    // `recovery_endpoint` rotation the recovery plane applies, through
-    // one shared serial map. A member
+    // rotation the recovery plane applies, through the shared endpoint
+    // selector's serial map. A member
     // whose dialed endpoint is unreachable is retried on its next
     // endpoint by the next tick that selects it, regardless of which
     // members any one tick happens to select.
@@ -231,10 +231,7 @@ impl TickState {
         debug!("degree maintenance batch truncated at the in-flight budget");
         break;
       }
-      let Some(serial) = self.member_dial_serial(&peer) else {
-        continue;
-      };
-      let Some(endpoint) = recovery_endpoint(&endpoints, serial) else {
+      let Some(endpoint) = self.endpoint_selector().next_endpoint(&peer, &endpoints) else {
         continue;
       };
       self.spawn_maintenance_dial(
@@ -370,10 +367,7 @@ impl TickState {
     // endpoints rotate across successive probes of that member,
     // wrapping per member.
     for (peer, endpoints) in dials {
-      let Some(serial) = self.member_dial_serial(&peer) else {
-        continue;
-      };
-      let Some(endpoint) = recovery_endpoint(&endpoints, serial) else {
+      let Some(endpoint) = self.endpoint_selector().next_endpoint(&peer, &endpoints) else {
         continue;
       };
       debug!(

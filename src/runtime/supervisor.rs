@@ -13,7 +13,7 @@ use super::{
   task_manager::{TaskClient, TaskManagerHandle, spawn_task_manager},
 };
 use crate::{
-  Endpoint, Error, NodeConfig, NodeId, Result, ShutdownOutcome, ShutdownReason,
+  Endpoint, Error, NodeConfig, Result, ShutdownOutcome, ShutdownReason,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   identity::{
@@ -173,6 +173,14 @@ pub(crate) struct RuntimeDependencies {
   /// registry pass) and read everywhere the runtime plans a node-level
   /// route. The runtime never defaults the policy itself.
   pub(crate) route_policy: crate::QualifiedTag,
+  /// The node's effective endpoint-selection policy: the caller's
+  /// selection, or the built-in preference-order policy over a declared
+  /// scheme preference list, or the built-in published-order rotation —
+  /// resolved once in the registration channel (the node builder, after
+  /// the default registry pass) and wrapped with the per-member rotation
+  /// serials every dial plane shares. The runtime never defaults the
+  /// policy itself.
+  pub(crate) endpoint_policy: Arc<dyn crate::EndpointSelectionPolicy>,
   pub(crate) entropy: Arc<dyn Entropy>,
   pub(crate) extensions: Arc<ExtensionRegistry>,
   pub(crate) sessions: SessionTable,
@@ -966,13 +974,6 @@ pub(super) struct TickState {
   /// batch so a slow mesh never doubles its own dial load every cadence
   /// (see `runtime/degree.rs`).
   pub(super) maintenance_pending: Arc<std::sync::atomic::AtomicUsize>,
-  /// Per-member endpoint dial serials shared by both dial planes
-  /// (recovery and degree maintenance): each dial of a member advances
-  /// that member's own serial, so `recovery_endpoint` rotates the
-  /// member through ALL its published endpoints — endpoint-level
-  /// failover independent of which members any one step happens to
-  /// select (see `runtime/recovery.rs`).
-  pub(super) endpoint_attempts: std::sync::Mutex<std::collections::BTreeMap<NodeId, u64>>,
   /// The bridge-probe cadence bracket: maintenance ticks an otherwise
   /// quiescent healthy node waits before its next cross-partition probe
   /// dial (the plane's residual boundary — see `runtime/degree.rs`).
@@ -1047,6 +1048,13 @@ impl TickState {
   /// planes).
   pub(super) fn exclusion_cache(&self) -> &super::recovery::ExclusionCache {
     &self.operations.planes().exclusion_cache
+  }
+
+  /// The node's endpoint selector: the registration-channel-resolved
+  /// policy wrapped with the per-member rotation serials every dial
+  /// plane shares (through the operation planes).
+  pub(super) fn endpoint_selector(&self) -> &Arc<crate::EndpointSelector> {
+    &self.operations.planes().endpoint_selector
   }
 
   /// The task manager's client half, when the incarnation carries a
@@ -1235,7 +1243,6 @@ impl Supervisor {
       tasks: self.dependencies.tasks.clone(),
       recovery_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
       maintenance_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-      endpoint_attempts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
       bridge_probe_ticks: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
         super::degree::BRIDGE_PROBE_INTERVAL_TICKS,
       )),
@@ -1353,6 +1360,9 @@ mod receipt_retention_sweep_tests {
     let route_policy = extensions
       .effective_route_policy(config.route_policy())
       .unwrap();
+    let endpoint_policy = extensions
+      .effective_endpoint_policy(config.endpoint_policy(), config.endpoint_preference())
+      .unwrap();
     let definitions = extensions.feature_definitions();
     let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
     let offer = node_offer(&registry, config.required_features()).unwrap();
@@ -1365,6 +1375,7 @@ mod receipt_retention_sweep_tests {
       keys: Some(keys),
       config,
       route_policy,
+      endpoint_policy,
       entropy: entropy.clone(),
       extensions,
       sessions: Default::default(),
@@ -2295,6 +2306,9 @@ pub(crate) mod test_support {
     let route_policy = extensions
       .effective_route_policy(config.route_policy())
       .unwrap();
+    let endpoint_policy = extensions
+      .effective_endpoint_policy(config.endpoint_policy(), config.endpoint_preference())
+      .unwrap();
     let definitions = extensions.feature_definitions();
     let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
     let offer = node_offer(&registry, config.required_features()).unwrap();
@@ -2308,6 +2322,7 @@ pub(crate) mod test_support {
       keys: Some(keys),
       config,
       route_policy,
+      endpoint_policy,
       entropy: entropy.clone(),
       extensions,
       sessions: sessions.clone(),

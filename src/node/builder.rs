@@ -72,6 +72,15 @@ impl NodeBuilder {
     // registry missing the default fails the start typed here instead of
     // surfacing at the first routed frame.
     let route_policy = extensions.effective_route_policy(self.config.route_policy())?;
+    // The effective endpoint-selection policy resolves on the same
+    // channel, the same way: the caller's selection (or preference-list
+    // shape) if configured, else the built-in published-order rotation.
+    // A registry missing the resolution target fails the start typed
+    // here instead of surfacing at the first member dial.
+    let endpoint_policy = extensions.effective_endpoint_policy(
+      self.config.endpoint_policy(),
+      self.config.endpoint_preference(),
+    )?;
     let extensions = Arc::new(extensions);
     let events = Arc::new(crate::node::EventHub::new());
     let (revision_tx, revision_rx) = tokio::sync::watch::channel(0_u64);
@@ -87,6 +96,7 @@ impl NodeBuilder {
           keys: self.keys,
           config: self.config,
           route_policy,
+          endpoint_policy,
           entropy: self.entropy.clone(),
           extensions: extensions.clone(),
           sessions: Default::default(),

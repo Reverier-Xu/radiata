@@ -233,13 +233,12 @@ impl TickState {
     let known: std::collections::BTreeSet<NodeId> = known_members.keys().cloned().collect();
     // Bounded endpoint-rotation state: a serial for a member that left
     // the member table is dead rotation phase. Drop such entries each
-    // tick so the per-member serial map tracks the live member
-    // universe, not the node's dial history (the maintenance worker
-    // advances serials under the same lock for members of this same
-    // universe).
-    if let Ok(mut attempts) = self.endpoint_attempts.lock() {
-      attempts.retain(|member, _| known_members.contains_key(member));
-    }
+    // tick so the selector's per-member serial map tracks the live
+    // member universe, not the node's dial history (the maintenance
+    // worker rotates serials of members of this same universe).
+    self
+      .endpoint_selector()
+      .retain_members(|member| known_members.contains_key(member));
     let now = crate::time::now_seconds();
     let dial_due = {
       let mut controller = self
@@ -310,11 +309,10 @@ impl TickState {
       // each member sweeps ALL its published endpoints no matter which
       // members the schedule picks (a shared
       // schedule serial aliases member position with endpoint index and
-      // can pin a member to one endpoint forever).
-      let Some(serial) = self.member_dial_serial(&member) else {
-        continue;
-      };
-      let Some(endpoint) = recovery_endpoint(endpoints, serial) else {
+      // can pin a member to one endpoint forever). The selector's
+      // candidate filter is fail-closed: only descriptor-published
+      // endpoints can come back.
+      let Some(endpoint) = self.endpoint_selector().next_endpoint(&member, endpoints) else {
         continue;
       };
       // Recovery dials run in their own task so the tick worker never
@@ -333,24 +331,6 @@ impl TickState {
       );
     }
     Ok(())
-  }
-
-  /// Consumes one per-member endpoint serial for the dial about to
-  /// start — shared by both dial planes (recovery and degree
-  /// maintenance): the serial is the member's dial count, so
-  /// [`recovery_endpoint`] lands a member's first dial on its first
-  /// published endpoint and every further dial of that member on its
-  /// next one, wrapping per member. That is the failover liveness
-  /// contract: every member sweeps all its published endpoints for any
-  /// candidate count, endpoint count, or fan-out.
-  ///
-  /// A poisoned lock only costs this dial's rotation advance: the dial
-  /// is skipped this tick and the member stays a candidate for the
-  /// next step (the map's critical sections are panic-free, so poison
-  /// is unreachable in practice).
-  pub(super) fn member_dial_serial(&self, member: &NodeId) -> Option<u64> {
-    let mut attempts = self.endpoint_attempts.lock().ok()?;
-    Some(advance_member_serial(&mut attempts, member))
   }
 
   /// Bounded pruning of recovery-accumulated redundant edges.
@@ -543,22 +523,36 @@ pub(super) fn spawn_member_dial(
   let shutdown = state.shutdown.clone();
   let connection_tasks = state.connection_tasks().clone();
   let dial_deadline = state.config().dial_deadline();
+  // The dial's outcome feeds the endpoint-selection policy's observation
+  // table (a no-op under the default published-order policy): the scheme
+  // keyed EWMA is what the outcome-weighted built-in ranks candidates
+  // from. Strictly observational — the dial path itself never branches
+  // on it.
+  let selector = state.endpoint_selector().clone();
   let dial = tokio::spawn(async move {
     let _slot = permit;
-    if let Err(error) = dial_member(
+    let started = std::time::Instant::now();
+    let result = dial_member(
       transport,
       driver,
       sessions,
       packet,
       shutdown,
       connection_tasks,
-      receiver,
+      receiver.clone(),
       &peer,
       class,
       dial_deadline,
     )
-    .await
-    {
+    .await;
+    selector.observe_outcome(
+      &receiver,
+      match &result {
+        Ok(_) => crate::DialObservation::Delivered(started.elapsed()),
+        Err(_) => crate::DialObservation::Failed,
+      },
+    );
+    if let Err(error) = result {
       report(&peer, &error);
     }
   });
@@ -582,45 +576,6 @@ fn report_recovery_dial_failure(peer: &NodeId, error: &Error) {
     kind = ?error.kind(),
     "recovery dial failed"
   );
-}
-
-/// Advances a per-member endpoint serial map for `member`'s next dial
-/// and returns the 1-based serial that dial consumes: a member's first
-/// dial is serial 1 (its first published endpoint), and every further
-/// dial of that member advances its OWN serial, wrapping per member.
-/// The pure half of the rotation [`TickState::member_dial_serial`]
-/// applies across both dial planes — keyed per member, never by a
-/// schedule-level serial.
-pub(super) fn advance_member_serial(
-  serials: &mut std::collections::BTreeMap<NodeId, u64>, member: &NodeId,
-) -> u64 {
-  let serial = serials.entry(member.clone()).or_insert(0);
-  *serial = serial.wrapping_add(1);
-  *serial
-}
-
-/// The endpoint one dial of a multi-homed member lands on: the serial
-/// is the member's OWN dial count (see [`advance_member_serial`]), so a
-/// member whose current endpoint is unreachable is retried on the
-/// others across successive dials of that member. A member's first dial
-/// lands on its first published endpoint.
-///
-/// The serial must be PER MEMBER, never a schedule-level attempt
-/// serial: member selection and a shared serial are both pure functions
-/// of the step number, so they alias — with `c` candidates in sorted
-/// order and fan-out one, member `p` is dialed exactly at attempts
-/// `a ≡ p+1 (mod c)` and its endpoint index `(a−1) mod len =
-/// (p + j·c) mod len` visits only a `len/gcd(c, len)` subset, fully
-/// pinned whenever `c ≡ 0 (mod len)`. Per-member serials decouple the
-/// two and guarantee every member sweeps every endpoint for any
-/// (candidates, endpoints, fan-out).
-///
-/// Shared FUNCTION with the degree maintenance plane, which feeds the
-/// member's serial from the same per-member rotation — the two planes
-/// rotate one member's endpoints together.
-pub(super) fn recovery_endpoint(endpoints: &[Endpoint], serial: u64) -> Option<&Endpoint> {
-  let index = serial.saturating_sub(1) as usize % endpoints.len().max(1);
-  endpoints.get(index)
 }
 
 /// The memoized departed-members exclusion set, keyed by the store
@@ -683,9 +638,7 @@ mod tests {
 
   use tokio::sync::watch;
 
-  use super::{
-    DialPermit, RECOVERY_TICK_PERIOD, advance_member_serial, recovery_endpoint, run_recovery_worker,
-  };
+  use super::{DialPermit, RECOVERY_TICK_PERIOD, run_recovery_worker};
   use crate::{
     BoxFuture, Endpoint, NodeConfig,
     membership::recovery::{RecoveryController, RecoveryPolicy},
@@ -713,7 +666,11 @@ mod tests {
   /// dial every endpoint of every member at least once. A shared
   /// schedule-level serial fails this whenever
   /// gcd(candidate_count, endpoint_count) > 1 (the aliasing above);
-  /// per-member serials sweep unconditionally.
+  /// per-member serials sweep unconditionally. Driven through the
+  /// endpoint selector — the shared implementation the recovery and
+  /// degree planes both resolve through — with the default
+  /// published-order policy, so the contract pins the exact rotation
+  /// the planes run.
   #[test]
   fn every_member_sweeps_every_endpoint_for_any_schedule_shape() {
     for candidate_count in 1..=8_usize {
@@ -736,18 +693,15 @@ mod tests {
             .collect();
           let mut controller = RecoveryController::new(RecoveryPolicy::new(fan_out, 1, 60));
           controller.observe(&candidates, &BTreeSet::new());
-          let mut serials = BTreeMap::new();
+          let selector =
+            crate::EndpointSelector::new(std::sync::Arc::new(crate::PublishedOrderPolicy));
           let mut dialed: BTreeMap<crate::NodeId, BTreeSet<usize>> = BTreeMap::new();
           for step in 0..candidate_count * endpoint_count {
             let decision = controller.next_step(step as u64, &candidates, &entropy);
             for target in decision.targets {
-              let serial = advance_member_serial(&mut serials, &target);
-              let index = recovery_endpoint(&endpoints[&target], serial)
-                .and_then(|endpoint| {
-                  endpoints[&target]
-                    .iter()
-                    .position(|other| other == endpoint)
-                })
+              let index = selector
+                .next_endpoint(&target, &endpoints[&target])
+                .and_then(|landed| endpoints[&target].iter().position(|other| *other == landed))
                 .unwrap();
               dialed.entry(target).or_default().insert(index);
             }
@@ -1126,6 +1080,9 @@ mod tests {
     let route_policy = extensions
       .effective_route_policy(config.route_policy())
       .unwrap();
+    let endpoint_policy = extensions
+      .effective_endpoint_policy(config.endpoint_policy(), config.endpoint_preference())
+      .unwrap();
     let client = crate::runtime::spawn_runtime(
       crate::runtime::RuntimeDependencies {
         storage_factory: reference as Arc<dyn crate::provider::StorageFactory>,
@@ -1133,6 +1090,7 @@ mod tests {
         keys: Some(keys.as_provider()),
         config,
         route_policy,
+        endpoint_policy,
         entropy,
         extensions,
         sessions: Default::default(),
