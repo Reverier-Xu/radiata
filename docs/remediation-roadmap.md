@@ -11,6 +11,21 @@ Companion documents: `docs/code-quality-audit.md` (findings),
 `docs/work-item-radiata-{cadence,phase-a..e}.md` (per-phase work items
 with embedded decision records).
 
+## Test-philosophy ruling (owner decision, 2026-11-08)
+
+Tests cover **current expected behavior only** — no historical-behavior
+description, no change-confirmation assertions, no in-repo pinning of
+wire/ABI history (git is the history mechanism; in-repo golden/ABI pins
+regenerated alongside every amendment guard nothing). Consequences:
+
+- Golden vectors and the public-ABI baseline fixture are removed unless
+  a vector is a genuinely independent oracle (hand-derived constant or
+  external-standard vector) — those stay.
+- Short unit tests whose scenario is subsumed by an external-API long
+  test on the same path are removed; injection-only coverage (poison,
+  races, torn state) keeps its short tests.
+- Test names/comments describe the live contract, not the transition.
+
 ## Decided scope stances (binding)
 
 - Payload persistence/retry/reliable-delivery semantics are **application
