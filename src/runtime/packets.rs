@@ -12,7 +12,7 @@ use tracing::debug;
 
 use super::supervisor::Supervisor;
 use crate::{
-  Error, ErrorKind, ExtensionRegistry, NodeConfig, NodeId, Result, Selector, StreamTarget, TraceId,
+  Error, ErrorKind, ExtensionRegistry, NodeId, Result, Selector, StreamTarget, TraceId,
   identity::lifecycle::LocalIdentityContext,
   packet::{OutboundRequest, RouteRecord},
   routing::{RouteTable, insert_route, record_terminal_failure},
@@ -64,7 +64,10 @@ pub(super) struct PumpHandoff {
 /// trace sink, which itself carries the identity context.
 #[derive(Clone)]
 pub(super) struct PacketAdmission {
-  config: NodeConfig,
+  /// The node's effective next-hop route policy tag, resolved in the
+  /// registration channel (the node builder) and shipped with the
+  /// runtime dependencies.
+  route_policy: crate::QualifiedTag,
   extensions: Arc<ExtensionRegistry>,
   sessions: SessionTable,
   local: NodeId,
@@ -77,7 +80,7 @@ impl PacketAdmission {
   /// Clones the collaborators one admission needs off `supervisor`.
   pub(super) fn new(supervisor: &Supervisor) -> Self {
     Self {
-      config: supervisor.dependencies.config.clone(),
+      route_policy: supervisor.dependencies.route_policy.clone(),
       extensions: Arc::clone(&supervisor.dependencies.extensions),
       sessions: supervisor.dependencies.sessions.clone(),
       local: supervisor.packet.local().clone(),
@@ -358,7 +361,7 @@ impl PacketAdmission {
       // The stream's policy deferred: the node-level route policy keeps
       // planning (the direct policy's lane — no tag is special-cased).
       None => {
-        let tag = self.config.route_policy()?;
+        let tag = self.route_policy.clone();
         match crate::routing::resolve_plan(
           self.extensions.routing(),
           &tag,

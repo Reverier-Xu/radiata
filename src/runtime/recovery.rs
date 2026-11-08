@@ -1116,14 +1116,20 @@ mod tests {
       tokio::sync::mpsc::channel(crate::runtime::PACKET_CHANNEL_CAPACITY);
     let connection_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
       Arc::new(std::sync::Mutex::new(Vec::new()));
+    let extensions = Arc::new(extensions);
+    // The same registration-channel resolution the node builder applies.
+    let route_policy = extensions
+      .effective_route_policy(config.route_policy())
+      .unwrap();
     let client = crate::runtime::spawn_runtime(
       crate::runtime::RuntimeDependencies {
         storage_factory: reference as Arc<dyn crate::provider::StorageFactory>,
         context: None,
         keys: Some(keys.as_provider()),
         config,
+        route_policy,
         entropy,
-        extensions: Arc::new(extensions),
+        extensions,
         sessions: Default::default(),
         routes: Default::default(),
         events: Arc::new(crate::node::EventHub::new()),

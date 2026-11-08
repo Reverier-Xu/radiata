@@ -362,6 +362,31 @@ impl ExtensionRegistry {
     self.routing.routing_policy(tag)
   }
 
+  /// The node's effective next-hop route policy tag: the caller's
+  /// selection when configured, else the built-in default policy's tag.
+  /// The builder resolves this once in the registration channel — right
+  /// after the default registry pass installs the default policy — and
+  /// the runtime reads only the resolved tag. Fail-closed: a registry
+  /// without the built-in default fails typed here instead of handing
+  /// the runtime a tag nothing resolves.
+  pub(crate) fn effective_route_policy(
+    &self, configured: Option<&crate::QualifiedTag>,
+  ) -> Result<crate::QualifiedTag> {
+    match configured {
+      Some(tag) => Ok(tag.clone()),
+      None => {
+        let tag = crate::routing::DefaultNextHop::tag()?;
+        if self.routing().next_hop_policy(&tag)?.is_none() {
+          return Err(Error::internal(format!(
+            "default next-hop policy {} missing from the registry",
+            crate::routing::DefaultNextHop::TAG
+          )));
+        }
+        Ok(tag)
+      }
+    }
+  }
+
   /// Registers one resource-write hook under a canonical tag. The built-in
   /// `radiata.woooo.tech` domain is reserved — the crate defines no built-in
   /// resource hooks, and the namespace stays closed for them — so a caller
@@ -1168,5 +1193,23 @@ mod tests {
     assert!(registry.next_hop_policy(&tag).unwrap().is_some());
     let second_pass = registry.register_default().unwrap_err();
     assert_eq!(second_pass.kind(), ErrorKind::Conflict);
+  }
+
+  /// Fail-closed: a registry that never ran the default pass holds no
+  /// built-in default next-hop policy, so resolving the effective route
+  /// policy fails typed — internal error, context naming the missing
+  /// entry — instead of handing the runtime a tag nothing resolves.
+  #[test]
+  fn effective_route_policy_fails_closed_without_the_default_next_hop() {
+    let registry = ExtensionRegistry::new();
+    let error = registry.effective_route_policy(None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(
+      error.context(),
+      format!(
+        "default next-hop policy {} missing from the registry",
+        crate::routing::DefaultNextHop::TAG
+      )
+    );
   }
 }
