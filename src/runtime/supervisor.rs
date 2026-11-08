@@ -167,6 +167,12 @@ pub(crate) struct RuntimeDependencies {
   /// the pre-open injection.
   pub(crate) keys: Option<Arc<dyn KeyProvider>>,
   pub(crate) config: NodeConfig,
+  /// The node's effective next-hop route policy tag: the caller's
+  /// selection, or the built-in default policy's tag — resolved once in
+  /// the registration channel (the node builder, after the default
+  /// registry pass) and read everywhere the runtime plans a node-level
+  /// route. The runtime never defaults the policy itself.
+  pub(crate) route_policy: crate::QualifiedTag,
   pub(crate) entropy: Arc<dyn Entropy>,
   pub(crate) extensions: Arc<ExtensionRegistry>,
   pub(crate) sessions: SessionTable,
@@ -1001,9 +1007,9 @@ fn session_packet_context(
   policy: crate::session::stream::SessionPolicy,
   authorization: crate::session::stream::AuthorizationBoundary,
 ) -> Result<SessionPacketContext> {
-  // The effective route policy: the caller selection, or the built-in
-  // default policy tag (registered by the builder out of the box).
-  let route_policy = dependencies.config.route_policy()?;
+  // The effective route policy tag was resolved in the registration
+  // channel (the node builder) and ships with the dependencies.
+  let route_policy = dependencies.route_policy.clone();
   let trace_metadata_active = dependencies.config.trace_metadata_limits().active();
   // The durable trace sink is born with the packet context it serves (one
   // construction site): the origin pump's terminal facts and the read
@@ -1282,6 +1288,11 @@ mod receipt_retention_sweep_tests {
     let config = NodeConfig::new().with_receipt_retention(retention).unwrap();
     let mut extensions = ExtensionRegistry::new();
     extensions.register_default().unwrap();
+    let extensions = Arc::new(extensions);
+    // The same registration-channel resolution the node builder applies.
+    let route_policy = extensions
+      .effective_route_policy(config.route_policy())
+      .unwrap();
     let definitions = extensions.feature_definitions();
     let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
     let offer = node_offer(&registry, config.required_features()).unwrap();
@@ -1293,8 +1304,9 @@ mod receipt_retention_sweep_tests {
       context: Some(context.clone()),
       keys: Some(keys),
       config,
+      route_policy,
       entropy: entropy.clone(),
-      extensions: Arc::new(extensions),
+      extensions,
       sessions: Default::default(),
       routes: Default::default(),
       events: Arc::new(crate::node::EventHub::new()),
@@ -2216,6 +2228,11 @@ pub(crate) mod test_support {
     // caller-claimed next-hop tag wins over the official entry.
     prepare(&mut extensions);
     extensions.register_default().unwrap();
+    let extensions = Arc::new(extensions);
+    // The same registration-channel resolution the node builder applies.
+    let route_policy = extensions
+      .effective_route_policy(config.route_policy())
+      .unwrap();
     let definitions = extensions.feature_definitions();
     let registry = Arc::new(feature::FeatureRegistry::build(definitions).unwrap());
     let offer = node_offer(&registry, config.required_features()).unwrap();
@@ -2228,8 +2245,9 @@ pub(crate) mod test_support {
       context: Some(context),
       keys: Some(keys),
       config,
+      route_policy,
       entropy: entropy.clone(),
-      extensions: Arc::new(extensions),
+      extensions,
       sessions: sessions.clone(),
       routes: Default::default(),
       events: Arc::new(crate::node::EventHub::new()),

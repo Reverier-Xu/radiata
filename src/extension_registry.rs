@@ -362,6 +362,28 @@ impl ExtensionRegistry {
     self.routing.routing_policy(tag)
   }
 
+  /// The node's effective next-hop route policy tag: the caller's
+  /// selection when configured, else the built-in default policy's tag.
+  /// The builder resolves this once in the registration channel — right
+  /// after the default registry pass installs the default policy — and
+  /// the runtime reads only the resolved tag. Fail-closed: a registry
+  /// without the built-in default fails typed here instead of handing
+  /// the runtime a tag nothing resolves.
+  pub(crate) fn effective_route_policy(
+    &self, configured: Option<&crate::QualifiedTag>,
+  ) -> Result<crate::QualifiedTag> {
+    match configured {
+      Some(tag) => Ok(tag.clone()),
+      None => {
+        let tag = crate::routing::DefaultNextHop::tag()?;
+        if self.routing_policy(&tag)?.is_none() {
+          return Err(Error::internal("default next-hop policy"));
+        }
+        Ok(tag)
+      }
+    }
+  }
+
   /// Registers one resource-write hook under a canonical tag. The built-in
   /// `radiata.woooo.tech` domain is reserved — the crate defines no built-in
   /// resource hooks, and the namespace stays closed for them — so a caller

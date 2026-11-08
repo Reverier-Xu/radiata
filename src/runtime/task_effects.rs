@@ -2019,6 +2019,11 @@ mod lazy_publication_shutdown_tests {
     let entropy: Arc<dyn crate::api::Entropy> = Arc::new(SequenceEntropy::default());
     let mut extensions = ExtensionRegistry::new();
     extensions.register_default().unwrap();
+    let extensions = Arc::new(extensions);
+    // The same registration-channel resolution the node builder applies.
+    let route_policy = extensions
+      .effective_route_policy(NodeConfig::new().route_policy())
+      .unwrap();
     let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0_u64);
     let (round_tx, round_rx) = tokio::sync::mpsc::channel(SYNC_ROUND_CHANNEL_CAPACITY);
     let (packet_tx, packet_rx) = tokio::sync::mpsc::channel(PACKET_CHANNEL_CAPACITY);
@@ -2029,8 +2034,9 @@ mod lazy_publication_shutdown_tests {
         context: None,
         keys: Some(keys.as_provider()),
         config: NodeConfig::new(),
+        route_policy,
         entropy,
-        extensions: Arc::new(extensions),
+        extensions,
         sessions: Default::default(),
         routes: Default::default(),
         events: Arc::new(crate::node::EventHub::new()),

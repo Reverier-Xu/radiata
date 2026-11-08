@@ -401,14 +401,13 @@ impl NodeConfig {
   pub(crate) const fn trace_metadata_limits(&self) -> &TraceMetadataLimits {
     &self.trace_metadata_limits
   }
-  /// The node's effective next-hop routing policy tag: the caller-selected
-  /// tag, or the built-in default policy's tag when unset (the builder
-  /// registers that policy out of the box).
-  pub(crate) fn route_policy(&self) -> Result<crate::QualifiedTag> {
-    match &self.route_policy {
-      Some(tag) => Ok(tag.clone()),
-      None => crate::routing::DefaultNextHop::tag(),
-    }
+  /// The caller-selected next-hop routing policy tag, if any. This is a
+  /// plain configuration read: the effective tag — this selection, or the
+  /// built-in default policy's tag when unset — resolves in the
+  /// registration channel (the node builder, right after the default
+  /// registry pass) and the runtime reads only the resolved tag.
+  pub(crate) const fn route_policy(&self) -> Option<&crate::QualifiedTag> {
+    self.route_policy.as_ref()
   }
 
   pub(crate) const fn required_features(&self) -> &BTreeSet<FeatureTag> {

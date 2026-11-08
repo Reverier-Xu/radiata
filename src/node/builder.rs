@@ -66,6 +66,12 @@ impl NodeBuilder {
     // Dial and listen resolve their transport from the endpoint's
     // selector through the registry at runtime.
     extensions.register_default()?;
+    // The effective route policy resolves in the registration channel,
+    // right after the default pass installs the built-in policy: the
+    // caller's selection if configured, else the default's tag. A
+    // registry missing the default fails the start typed here instead of
+    // surfacing at the first routed frame.
+    let route_policy = extensions.effective_route_policy(self.config.route_policy())?;
     let extensions = Arc::new(extensions);
     let events = Arc::new(crate::node::EventHub::new());
     let (revision_tx, revision_rx) = tokio::sync::watch::channel(0_u64);
@@ -80,6 +86,7 @@ impl NodeBuilder {
           context: None,
           keys: self.keys,
           config: self.config,
+          route_policy,
           entropy: self.entropy.clone(),
           extensions: extensions.clone(),
           sessions: Default::default(),
