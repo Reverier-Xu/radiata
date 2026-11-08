@@ -946,7 +946,7 @@ pub(crate) async fn prepare_plain_put(
 ) -> PreparedTransaction {
   let snapshot = store.snapshot().await.unwrap();
   store
-    .prepare_transaction(
+    .prepare_core_verb_transaction(
       contract_transaction_id(transaction),
       snapshot.revision().clone(),
       vec![StoreOperation::Put {

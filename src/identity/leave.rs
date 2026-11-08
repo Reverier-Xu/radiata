@@ -487,8 +487,11 @@ async fn wipe_family(
     let revision = snapshot.revision().clone();
     drop(scan);
     drop(snapshot);
-    let prepared =
-      store.prepare_transaction(TransactionId::generate(entropy)?, revision, operations)?;
+    let prepared = store.prepare_core_verb_transaction(
+      TransactionId::generate(entropy)?,
+      revision,
+      operations,
+    )?;
     match commit_with_reconcile(permit, store, prepared).await? {
       CommitWithReconcile::Committed => {}
       // A concurrent write raced the batch: restart the family scan with
@@ -577,9 +580,10 @@ async fn swap_identity(
     &local_namespace,
     &local_key,
     snapshot.revision(),
+    &crate::LabelSet::new(),
     Arc::from(replacement.encode()?),
   )?;
-  let prepared = store.prepare_transaction(
+  let prepared = store.prepare_core_verb_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![
@@ -605,7 +609,7 @@ async fn complete_leave(
   permit: &WriterPermit<'_>, store: &MetadataStore, entropy: &dyn Entropy, stored: &StoreValue,
 ) -> Result<()> {
   let snapshot = store.snapshot().await?;
-  let prepared = store.prepare_transaction(
+  let prepared = store.prepare_core_verb_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![StoreOperation::Delete {
@@ -720,9 +724,10 @@ async fn begin_intent(
       &leave_namespace()?,
       &leave_key(),
       snapshot.revision(),
+      &crate::LabelSet::new(),
       payload.clone(),
     )?;
-    let prepared = store.prepare_transaction(
+    let prepared = store.prepare_core_verb_transaction(
       TransactionId::generate(entropy)?,
       snapshot.revision().clone(),
       vec![StoreOperation::Put {
@@ -835,7 +840,7 @@ mod tests {
     for tag in wipe_namespaces() {
       let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(tag)?);
       let snapshot = store.snapshot().await?;
-      let prepared = store.prepare_transaction(
+      let prepared = store.prepare_core_verb_transaction(
         TransactionId::generate(entropy)?,
         snapshot.revision().clone(),
         vec![StoreOperation::Put {
@@ -1621,7 +1626,7 @@ mod crash {
       let namespace = StoreNamespace::new(crate::QualifiedTag::parse(tag).unwrap());
       let snapshot = store.snapshot().await.unwrap();
       let prepared = store
-        .prepare_transaction(
+        .prepare_core_verb_transaction(
           TransactionId::generate(entropy).unwrap(),
           snapshot.revision().clone(),
           vec![StoreOperation::Put {

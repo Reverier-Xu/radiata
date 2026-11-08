@@ -710,7 +710,7 @@ async fn require_members_connected(planes: &EffectPlanes) -> Result<()> {
   let mut scan = snapshot.scan_from(&namespace, &[], None).await?;
   let mut unreachable = 0_usize;
   while let Some(entry) = scan.next().await? {
-    let descriptor = match crate::membership::page::decode_descriptor(entry.value().as_bytes()) {
+    let descriptor = match crate::membership::page::decode_stored_row(entry.value().as_bytes()) {
       Ok(descriptor) => descriptor,
       // The scan is best-effort over durable evidence, matching the
       // recovery tick's enumeration; an undecodable entry stays visible

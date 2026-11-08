@@ -256,6 +256,7 @@ pub(crate) async fn commit_merge(
         &binding_namespace,
         &binding_key,
         snapshot.revision(),
+        &crate::LabelSet::new(),
         Arc::from(binding.encode()?),
       )?,
     });
@@ -272,6 +273,7 @@ pub(crate) async fn commit_merge(
       &use_namespace,
       &use_key,
       snapshot.revision(),
+      &crate::LabelSet::new(),
       Arc::from(credential_use.encode()?),
     )?,
   });
@@ -283,6 +285,7 @@ pub(crate) async fn commit_merge(
       &grant_namespace,
       &grant_key,
       snapshot.revision(),
+      &crate::LabelSet::new(),
       Arc::from(grant.encode()?),
     )?,
   });
@@ -420,6 +423,7 @@ pub(crate) async fn adopt_merge(
         &binding_namespace,
         &binding_key,
         snapshot.revision(),
+        &crate::LabelSet::new(),
         Arc::from(binding.encode()?),
       )?,
     });
@@ -437,6 +441,7 @@ pub(crate) async fn adopt_merge(
         &grant_namespace,
         &grant_key,
         snapshot.revision(),
+        &crate::LabelSet::new(),
         Arc::from(grant.encode()?),
       )?,
     });

@@ -387,103 +387,31 @@ pub(crate) fn sync_protocol_definition() -> Result<ProtocolDefinition> {
 }
 
 /// Ensures the local descriptor exists (revision 1) with the given
-/// endpoint candidates, so the anti-entropy tick can page it. An install
-/// or an endpoint change advances the store's descriptor revision — a
-/// member-set change — so the paired member-set notification fires here:
-/// the transient [`crate::MemberChanged`] event plus the persistent
-/// revision bump, keeping the revision counter's one-to-one promise.
+/// endpoint candidates, so the anti-entropy tick can page it. The
+/// read-decide-rewrite and its race recovery live in the unified
+/// register persist path
+/// ([`crate::membership::store::ensure_local_descriptor_ctx`]); this wrapper
+/// adds the member-set reporting: an install or an endpoint change advances the
+/// store's descriptor revision — a member-set change — so the paired member-set
+/// notification fires here: the transient [`crate::MemberChanged`] event plus
+/// the persistent revision bump, keeping the revision counter's one-to-one
+/// promise.
 pub(crate) async fn ensure_local_descriptor(
   context: &Arc<LocalIdentityContext>, entropy: &Arc<dyn Entropy>, endpoints: Vec<crate::Endpoint>,
   events: &Arc<crate::node::EventHub>, revision: &crate::node::MemberRevisionSignal,
 ) -> Result<()> {
-  let store = context.store();
   let node = context.identity().node().clone();
-  let public_key = context.identity().public_key().clone();
-  let existing = crate::membership::store::read_descriptor_ctx(store, &node).await?;
-  let changed = match &existing {
-    Some(current) => {
-      let same_endpoints = current.endpoints().len() == endpoints.len()
-        && current
-          .endpoints()
-          .iter()
-          .zip(&endpoints)
-          .all(|(left, right)| left == right);
-      if same_endpoints {
-        false
-      } else if endpoints.is_empty() {
-        // An empty candidate set never downgrades published endpoints:
-        // the startup tick fires before any listener exists and must not
-        // bump the revision (descriptor endpoint stability).
-        return Ok(());
-      } else {
-        true
-      }
-    }
-    None => true,
-  };
-  if !changed {
-    return Ok(());
-  }
-  let descriptor_revision = existing
-    .as_ref()
-    .map_or(1, |current| current.revision().saturating_add(1));
-  // The endpoint rewrite carries the descriptor's existing capability
-  // labels: labels mutate only through the owner patch path
-  // ([`crate::membership::apply_metadata_patch`], which preserves them),
-  // so an endpoint-set rewrite must not clear them. A rewrite that
-  // dropped labels would publish an empty set at a higher revision and
-  // propagate the loss to every peer.
-  //
-  // Endpoint-set semantics: the bound listeners' published endpoints
-  // are the descriptor's endpoint truth. An endpoint patched in without
-  // a bound listener is advisory and this rewrite rolls it back on the
-  // next maintenance tick — from `(existing, published)` alone there is
-  // no way to distinguish an owner-added unlistened endpoint from one
-  // whose listener stopped, and resurrecting stopped listeners would
-  // break the unpublish contract of `stop_listener`.
-  let labels = existing
-    .as_ref()
-    .map_or_else(crate::LabelSet::new, |current| current.labels().clone());
-  let descriptor = crate::membership::NodeDescriptorV1::new(
-    node.clone(),
-    public_key,
+  let changed = crate::membership::store::ensure_local_descriptor_ctx(
+    context.store(),
+    entropy.as_ref(),
+    &node,
+    context.identity().public_key(),
     endpoints,
-    descriptor_revision,
-    1,
   )
-  .with_labels(labels);
-  if let Err(error) =
-    crate::membership::store::store_descriptor_ctx(store, entropy.as_ref(), &descriptor).await
-  {
-    // A concurrent caller may have installed the same descriptor between
-    // the read and the commit (every public operation ensures the local
-    // descriptor first). The ensure is idempotent: the conflict is
-    // acceptable only when the descriptor now exists at revision >= ours
-    // for this exact node and key — another writer won the race, and the
-    // next maintenance tick rewrites the endpoint set.
-    let Some(current) = crate::membership::store::read_descriptor_ctx(store, &node).await? else {
-      return Err(error);
-    };
-    if current.revision() < descriptor_revision {
-      return Err(error);
-    }
-    // The paired notification belongs to this call's own write only: the
-    // stored record must be exactly the descriptor attempted here. A
-    // concurrent writer's different record (endpoint set, labels, or a
-    // higher revision from another flow) already fired its own
-    // notification, so notifying from the losing call would bump the
-    // member revision twice for one install. An identical record written
-    // concurrently is indistinguishable from this call's own landed write,
-    // and its content is exactly what this call wanted, so that bump
-    // stands.
-    if current != descriptor {
-      return Ok(());
-    }
+  .await?;
+  if changed {
+    member_changed(events, revision, node);
   }
-  // The member set genuinely changed (the local descriptor was installed
-  // or its endpoint set moved): fire the paired notification so a watcher
-  // that subscribes before acting never misses the bump.
-  member_changed(events, revision, node);
   Ok(())
 }
 
@@ -700,7 +628,7 @@ mod tests {
     use crate::{
       identity::{
         lifecycle,
-        testing::{FaultingFactory, ScriptedKeys, SequenceEntropy, inject_entry},
+        testing::{FaultingFactory, ScriptedKeys, SequenceEntropy, inject_enveloped_entry},
       },
       storage::contract::{ReferenceFactory, required_capabilities},
     };
@@ -766,8 +694,17 @@ mod tests {
         .expect("the installed local descriptor row")
     };
     let encoded = concurrent.encode().unwrap();
+    let injected_namespace = descriptor_namespace.clone();
+    let injected_key = descriptor_key.clone();
     faulting.push_hook(Box::new(move || {
-      inject_entry(&reference, (descriptor_namespace, descriptor_key), encoded);
+      // The injected row is exactly what the production persist path
+      // stores: the sealed row envelope over the record bytes.
+      inject_enveloped_entry(
+        &reference,
+        &injected_namespace,
+        &injected_key,
+        encoded.clone(),
+      );
     }));
 
     // The endpoint rewrite conflicts at the same revision. The conflict

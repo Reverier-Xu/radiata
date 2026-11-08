@@ -469,9 +469,9 @@ impl ResourceRecordV1 {
     time::from_millis(self.timestamp_millis)
   }
 
-  /// The host wall-clock timestamp in milliseconds (test-only: readers
-  /// consume the normalized time view instead).
-  #[cfg(test)]
+  /// The host wall-clock timestamp in milliseconds (the register row's
+  /// envelope-version tuple element; readers consume the normalized
+  /// time view instead).
   pub(crate) const fn timestamp_millis(&self) -> i64 {
     self.timestamp_millis
   }

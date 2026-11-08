@@ -100,7 +100,7 @@ pub(crate) mod sync {
     let mut last: Option<Vec<u8>> = None;
     let mut exhausted = true;
     while let Some(entry) = scan.next().await? {
-      if let Ok(record) = ResourceRecordV1::decode(entry.value().as_bytes()) {
+      if let Ok(record) = super::super::store::decode_stored_row(entry.value().as_bytes()) {
         if records.len() >= limit.clamp(1, super::MAX_PAGE_RECORDS) {
           exhausted = false;
           break;
@@ -442,7 +442,8 @@ mod tests {
       "both records apply over the corrupt incumbent"
     );
 
-    // The corrupt incumbent is replaced by the incoming record.
+    // The corrupt incumbent is replaced by the incoming record; the
+    // stored row is the envelope, so the assertion compares payloads.
     let stored = store
       .snapshot()
       .await
@@ -452,8 +453,8 @@ mod tests {
       .unwrap()
       .expect("the register holds the incoming record");
     assert_eq!(
-      stored.as_bytes(),
-      poisoned_record.encode().unwrap().as_slice()
+      super::super::store::decode_stored_row(stored.as_bytes()).unwrap(),
+      poisoned_record
     );
     assert_eq!(read_current(&store, &poisoned).await, Some(poisoned_record));
 

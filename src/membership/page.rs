@@ -104,6 +104,16 @@ impl MembershipPage {
   }
 }
 
+/// Decodes one stored descriptor row: the row envelope's payload element
+/// is the canonical record bytes the wire codec decodes. The single
+/// stored-row decoder, so every stored-row reader (the register read
+/// path, the corrupt-incumbent policy, the derived-view and recovery
+/// scans, and the reconcile lane's projection) opens the envelope the
+/// same one way.
+pub(crate) fn decode_stored_row(bytes: &[u8]) -> Result<NodeDescriptorV1> {
+  crate::storage::RowEnvelope::open(bytes).and_then(|payload| decode_descriptor(&payload))
+}
+
 /// The anti-entropy apply path: the reconciliation plane's descriptors
 /// lane applies its row batches through the store's page commit (the emit
 /// side lives in `crate::reconcile::plane`).

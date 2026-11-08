@@ -91,7 +91,7 @@ pub use provider::{
   CommitOutcome, CommitReceipt, CreatedKey, DurabilityLevel, KeyCapabilities, KeyCreateState,
   KeyDeleteState, KeyHandle, KeyOperationId, ReconcileOutcome, StoreCapabilities, StoreEntry,
   StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRequirements, StoreRevision,
-  StoreTransaction, StoreValue, store_scan_stream,
+  StoreTransaction, StoreValue, commit_precheck, condition_matches, store_scan_stream,
 };
 pub use resource::{
   ResourceLabels, ResourceName, ResourceUri, ResourceVersion,
@@ -120,6 +120,18 @@ pub use view::{
   RevokeOutcome, SessionFeatureView, SessionPage, SessionView, ShutdownOutcome, ShutdownReason,
   TaskPage, TaskView, TopologyEdgeView, TopologyPage, TrustPage, TrustStatus, TrustedIdentityView,
 };
+
+pub mod contract {
+  //! The storage contract suite: the reference oracle a metadata backend
+  //! author runs their own backend through. Opt-in by invocation —
+  //! nothing in the crate runs it on its own backends' behalf — so a
+  //! third-party [`Storage`](crate::extension::Storage) implementation
+  //! calls [`run_storage_contract`] from its own tests and every clause
+  //! of the provider contract (snapshots, conditional commits, receipts,
+  //! reconciliation, scans) is asserted against it.
+
+  pub use crate::storage::contract_suite::run_storage_contract;
+}
 
 pub mod extension {
   pub use crate::{
@@ -161,6 +173,28 @@ pub mod adapters {
   #[cfg(feature = "redb")]
   pub fn redb_store(path: PathBuf) -> Arc<dyn StorageFactory> {
     Arc::new(crate::storage::redb::RedbStoreFactory::new(path))
+  }
+
+  /// Creates a fully in-memory metadata store factory: the crate's
+  /// reference [`Storage`](crate::extension::Storage) implementation.
+  ///
+  /// Every commit is atomic and receipt-tracked within the process; the
+  /// store's lifetime is the returned handle's — there is no persistence
+  /// beyond it, so **metadata written here is lost when the factory (and
+  /// every store opened from it) is dropped or the process exits**. One
+  /// factory holds one alias-safe exclusive open, exactly like the file
+  /// backends: a second concurrent open fails typed.
+  ///
+  /// This constructor exists for tests, examples, and nodes whose
+  /// metadata is deliberately ephemeral; a production node needs a
+  /// durable backend ([`json_store`], [`redb_store`]). The same
+  /// implementation is the storage contract suite's oracle, so a backend
+  /// author can compare their own adapter against it by running
+  /// [`crate::contract::run_storage_contract`] over both.
+  pub fn memory_store() -> Arc<dyn StorageFactory> {
+    Arc::new(crate::storage::memory::ReferenceFactory::new(
+      crate::StoreCapabilities::full_metadata(crate::DurabilityLevel::OsCrashDurable),
+    ))
   }
 
   /// Creates a durable file-backed Ed25519 key store rooted at the

@@ -5,11 +5,11 @@ use std::{
 
 use super::reference::ReferenceFactory;
 use crate::{
-  CommitOutcome, CommitReceipt, DurabilityLevel, NodeId, Result, StoreCapabilities, StoreEntry,
+  CommitOutcome, CommitReceipt, DurabilityLevel, NodeId, Result, StoreCapabilities,
   StoreExpectation, StoreKey, StoreNamespace, StoreOperation, StoreRevision, StoreTransaction,
   TransactionId,
   identity::records::{identity_binding_key, local_identity_key},
-  provider::{StorageFactory, StoreScan},
+  provider::StorageFactory,
   storage::{
     MetadataStore,
     receipt::{PreparedTransaction, ReceiptIdentity},
@@ -55,7 +55,7 @@ pub(crate) async fn prepare_contract_put(
 ) -> PreparedTransaction {
   let snapshot = store.snapshot().await.unwrap();
   store
-    .prepare_transaction(
+    .prepare_core_verb_transaction(
       contract_transaction_id(transaction),
       snapshot.revision().clone(),
       vec![StoreOperation::Put {
@@ -73,7 +73,7 @@ pub(crate) async fn commit_target(
 ) -> (PreparedTransaction, ReceiptIdentity) {
   let snapshot = store.snapshot().await.unwrap();
   let prepared = store
-    .prepare_transaction(
+    .prepare_core_verb_transaction(
       contract_transaction_id(transaction),
       snapshot.revision().clone(),
       vec![StoreOperation::Put {
@@ -104,15 +104,6 @@ pub(crate) use crate::storage::test_util::transaction_id;
 /// single-sourced [`transaction_id`].
 pub(crate) fn contract_transaction_id(index: u16) -> TransactionId {
   transaction_id(u64::from(index))
-}
-
-pub(crate) async fn collect_scan(mut scan: Box<dyn StoreScan + '_>) -> Vec<StoreEntry> {
-  let mut entries = Vec::new();
-  while let Some(entry) = scan.next().await.unwrap() {
-    entries.push(entry);
-  }
-  assert!(scan.next().await.unwrap().is_none());
-  entries
 }
 
 pub(crate) fn required_capabilities() -> StoreCapabilities {

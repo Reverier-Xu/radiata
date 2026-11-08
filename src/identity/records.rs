@@ -347,7 +347,7 @@ async fn install_terminal_record(
   store: &MetadataStore, entropy: &dyn Entropy, namespace: &StoreNamespace, key: StoreKey,
   encoded: Arc<[u8]>, expected: StoreExpectation, revision: StoreRevision, label: &'static str,
 ) -> Result<()> {
-  let transaction = store.prepare_transaction(
+  let transaction = store.prepare_core_verb_transaction(
     TransactionId::generate(entropy)?,
     revision.clone(),
     vec![StoreOperation::Put {
@@ -356,7 +356,7 @@ async fn install_terminal_record(
       expected,
       // The persisted body is the row envelope: the record bytes ride as
       // the payload element, versioned by the preparing CAS revision.
-      value: RowEnvelope::seal(namespace, &key, &revision, encoded)?,
+      value: RowEnvelope::seal(namespace, &key, &revision, &crate::LabelSet::new(), encoded)?,
     }],
   )?;
   // A discarded commit outcome would silently drop the tombstone: a
@@ -584,8 +584,11 @@ pub(crate) async fn collect_tombstones_before(
     }
     let revision = snapshot.revision().clone();
     drop(snapshot);
-    let transaction =
-      store.prepare_transaction(TransactionId::generate(entropy)?, revision, operations)?;
+    let transaction = store.prepare_core_verb_transaction(
+      TransactionId::generate(entropy)?,
+      revision,
+      operations,
+    )?;
     if let crate::CommitOutcome::Committed(_) = store.commit(transaction).await? {
       // The retired binding changes what the trust lane sends: the write
       // epoch arms the plane's next rescan exactly like an adoption.

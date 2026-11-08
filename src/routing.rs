@@ -867,7 +867,7 @@ impl CandidateNodeReader for StoreCandidateReader {
         cursor.as_ref().map(|cursor| cursor.as_bytes()),
         limit,
         |_key, bytes| {
-          let Ok(descriptor) = crate::membership::page::decode_descriptor(bytes) else {
+          let Ok(descriptor) = crate::membership::page::decode_stored_row(bytes) else {
             return Ok(None);
           };
           if !selector.matches(descriptor.labels()) {

@@ -307,7 +307,7 @@ pub(crate) mod store {
     let Some(value) = value else {
       return Ok(None);
     };
-    Ok(Some(crate::membership::page::decode_descriptor(
+    Ok(Some(crate::membership::page::decode_stored_row(
       value.as_bytes(),
     )?))
   }
@@ -320,11 +320,11 @@ pub(crate) mod store {
   /// paths resolve their incumbent here, so they cannot disagree about a
   /// corrupt row, and the consequence warning lives here once.
   fn decode_stored_descriptor(value: &StoreValue, node: &NodeId) -> Option<NodeDescriptorV1> {
-    // `decode_descriptor` is total on success, so `None` means exactly
+    // `decode_stored_row` is total on success, so `None` means exactly
     // one thing: the stored row did not decode.
     let descriptor = crate::storage::incumbent::decode_or_absent(
       value.as_bytes(),
-      crate::membership::page::decode_descriptor,
+      crate::membership::page::decode_stored_row,
       node.as_str(),
     );
     if descriptor.is_none() {
@@ -382,14 +382,26 @@ pub(crate) mod store {
     // revision, so a concurrent writer cannot make them disagree.
     let expected =
       crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
-    let transaction = store.prepare_transaction(
+    // The persisted body is the row envelope: the record bytes ride as
+    // the payload element with the descriptor's own label vocabulary
+    // beside them. The envelope version is the descriptor's own record
+    // revision (the family's monotone-max ordering element), so a
+    // converged descriptor row is byte-identical on every replica.
+    let value = crate::storage::RowEnvelope::seal_versioned(
+      &namespace,
+      &key,
+      crate::storage::RowVersion::record_revision(descriptor.revision()),
+      descriptor.labels(),
+      Arc::from(descriptor.encode()?),
+    )?;
+    let transaction = store.prepare_core_verb_transaction(
       TransactionId::generate(entropy)?,
       snapshot.revision().clone(),
       vec![StoreOperation::Put {
         namespace,
         key,
         expected,
-        value: StoreValue::new(Arc::from(descriptor.encode()?)),
+        value,
       }],
     )?;
     // A discarded commit outcome would silently drop the descriptor: a
@@ -429,6 +441,106 @@ pub(crate) mod store {
       return Some("node descriptor revision");
     }
     None
+  }
+
+  /// The unified ensure path for this node's own descriptor: reads the
+  /// register once, decides the endpoint rewrite (an empty candidate set
+  /// never downgrades published endpoints and never bumps the revision;
+  /// an unchanged set is a no-op; a change rewrites at the next revision
+  /// carrying the descriptor's existing capability labels), stores
+  /// through [`store_descriptor_ctx`], and recovers the raced writer's
+  /// conflict in one place. The single owner of the ensure semantics —
+  /// the maintenance tick, the listener transition, and the read views'
+  /// lazy publication all drive their rewrites through here, so the
+  /// endpoint-set rules and the race classification cannot drift from
+  /// the register they act on. Returns whether the member set genuinely
+  /// changed (a first install or an endpoint-set move): the caller fires
+  /// the paired member-set notification so a watcher that subscribes
+  /// before acting never misses the bump.
+  pub(crate) async fn ensure_local_descriptor_ctx(
+    store: &MetadataStore, entropy: &dyn Entropy, node: &NodeId, public_key: &crate::PublicKey,
+    endpoints: Vec<crate::Endpoint>,
+  ) -> Result<bool> {
+    let existing = read_descriptor_ctx(store, node).await?;
+    let changed = match &existing {
+      Some(current) => {
+        let same_endpoints = current.endpoints().len() == endpoints.len()
+          && current
+            .endpoints()
+            .iter()
+            .zip(&endpoints)
+            .all(|(left, right)| left == right);
+        if same_endpoints {
+          false
+        } else if endpoints.is_empty() {
+          // An empty candidate set never downgrades published endpoints:
+          // the startup tick fires before any listener exists and must not
+          // bump the revision (descriptor endpoint stability).
+          return Ok(false);
+        } else {
+          true
+        }
+      }
+      None => true,
+    };
+    if !changed {
+      return Ok(false);
+    }
+    let descriptor_revision = existing
+      .as_ref()
+      .map_or(1, |current| current.revision().saturating_add(1));
+    // The endpoint rewrite carries the descriptor's existing capability
+    // labels: labels mutate only through the owner patch path
+    // ([`crate::membership::apply_metadata_patch`], which preserves them),
+    // so an endpoint-set rewrite must not clear them. A rewrite that
+    // dropped labels would publish an empty set at a higher revision and
+    // propagate the loss to every peer.
+    //
+    // Endpoint-set semantics: the bound listeners' published endpoints
+    // are the descriptor's endpoint truth. An endpoint patched in without
+    // a bound listener is advisory and this rewrite rolls it back on the
+    // next maintenance tick — from `(existing, published)` alone there is
+    // no way to distinguish an owner-added unlistened endpoint from one
+    // whose listener stopped, and resurrecting stopped listeners would
+    // break the unpublish contract of `stop_listener`.
+    let labels = existing
+      .as_ref()
+      .map_or_else(crate::LabelSet::new, |current| current.labels().clone());
+    let descriptor = NodeDescriptorV1::new(
+      node.clone(),
+      public_key.clone(),
+      endpoints,
+      descriptor_revision,
+      1,
+    )
+    .with_labels(labels);
+    if let Err(error) = store_descriptor_ctx(store, entropy, &descriptor).await {
+      // A concurrent caller may have installed the same descriptor between
+      // the read and the commit (every public operation ensures the local
+      // descriptor first). The ensure is idempotent: the conflict is
+      // acceptable only when the descriptor now exists at revision >= ours
+      // for this exact node and key — another writer won the race, and the
+      // next maintenance tick rewrites the endpoint set.
+      let Some(current) = read_descriptor_ctx(store, node).await? else {
+        return Err(error);
+      };
+      if current.revision() < descriptor_revision {
+        return Err(error);
+      }
+      // The paired notification belongs to this call's own write only: the
+      // stored record must be exactly the descriptor attempted here. A
+      // concurrent writer's different record (endpoint set, labels, or a
+      // higher revision from another flow) already fired its own
+      // notification, so notifying from the losing call would bump the
+      // member revision twice for one install. An identical record written
+      // concurrently is indistinguishable from this call's own landed write,
+      // and its content is exactly what this call wanted, so that bump
+      // stands.
+      if current != descriptor {
+        return Ok(false);
+      }
+    }
+    Ok(true)
   }
 
   /// The same-key page-order contest over one descriptor batch: per
@@ -531,18 +643,31 @@ pub(crate) mod store {
         }
         let expected =
           crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
+        // The persisted body is the row envelope: the record bytes ride
+        // as the payload element with the descriptor's own label
+        // vocabulary beside them. The envelope version is the
+        // descriptor's own record revision (the family's monotone-max
+        // ordering element), so a converged descriptor row is
+        // byte-identical on every replica.
+        let value = crate::storage::RowEnvelope::seal_versioned(
+          &namespace,
+          &key,
+          crate::storage::RowVersion::record_revision(descriptor.revision()),
+          descriptor.labels(),
+          Arc::from(descriptor.encode()?),
+        )?;
         operations.push(StoreOperation::Put {
           namespace: namespace.clone(),
           key,
           expected,
-          value: StoreValue::new(Arc::from(descriptor.encode()?)),
+          value,
         });
         applied.push(descriptor.node().clone());
       }
       if operations.is_empty() {
         return Ok((applied, skipped));
       }
-      let transaction = store.prepare_transaction(
+      let transaction = store.prepare_core_verb_transaction(
         TransactionId::generate(entropy)?,
         snapshot.revision().clone(),
         operations,
@@ -834,7 +959,7 @@ mod tests {
     let key = crate::StoreKey::new(Arc::from(node(1).as_str().as_bytes().to_vec()));
     let snapshot = store.snapshot().await.unwrap();
     let transaction = store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         crate::TransactionId::generate(&crate::api::SystemEntropy).unwrap(),
         snapshot.revision().clone(),
         vec![crate::StoreOperation::Put {
@@ -857,10 +982,14 @@ mod tests {
     assert_eq!(applied, vec![node(1)]);
     assert!(skipped.is_empty(), "the corrupt incumbent is not a skip");
 
-    // The corrupt incumbent is replaced by the verified descriptor.
+    // The corrupt incumbent is replaced by the verified descriptor; the
+    // stored row is the envelope, so the assertion compares payloads.
     let snapshot = store.snapshot().await.unwrap();
     let stored = snapshot.get(&namespace, &key).await.unwrap().unwrap();
-    assert_eq!(stored.as_bytes(), incoming.encode().unwrap().as_slice());
+    assert_eq!(
+      crate::membership::page::decode_stored_row(stored.as_bytes()).unwrap(),
+      incoming
+    );
   }
 
   /// The single-record twin of the page-batch case: the same corrupt
@@ -886,7 +1015,7 @@ mod tests {
     let key = crate::StoreKey::new(Arc::from(node(1).as_str().as_bytes().to_vec()));
     let snapshot = store.snapshot().await.unwrap();
     let transaction = store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         crate::TransactionId::generate(&crate::api::SystemEntropy).unwrap(),
         snapshot.revision().clone(),
         vec![crate::StoreOperation::Put {
@@ -906,11 +1035,12 @@ mod tests {
       .unwrap();
 
     // The corrupt incumbent is replaced by the verified descriptor, and
-    // the read path now sees it.
+    // the read path now sees it. The stored row is the envelope; the
+    // assertion compares payloads.
     let snapshot = store.snapshot().await.unwrap();
     let stored = snapshot.get(&namespace, &key).await.unwrap().unwrap();
     assert_eq!(
-      crate::membership::page::decode_descriptor(stored.as_bytes()).unwrap(),
+      crate::membership::page::decode_stored_row(stored.as_bytes()).unwrap(),
       incoming
     );
     assert_eq!(

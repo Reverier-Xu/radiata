@@ -105,6 +105,7 @@ pub(crate) async fn delete_unreferenced_key(
           &intent_namespace,
           &intent_key,
           snapshot.revision(),
+          &crate::LabelSet::new(),
           Arc::from(intent.encode()?),
         )?;
         // Transactional guard: pin the exact local-identity record this
@@ -243,6 +244,7 @@ async fn delete_provider_step(
             &deleted_namespace,
             &deleted_key,
             snapshot.revision(),
+            &crate::LabelSet::new(),
             Arc::from(tombstone.encode()?),
           )?,
         },
@@ -614,6 +616,7 @@ mod tests {
           &namespace,
           &key,
           &crate::StoreRevision::new(Arc::from(0_u64.to_be_bytes())).unwrap(),
+          &crate::LabelSet::new(),
           Arc::from(tombstone.encode().unwrap()),
         )
         .unwrap();
@@ -638,6 +641,7 @@ mod tests {
           &namespace,
           &key,
           &revision,
+          &crate::LabelSet::new(),
           Arc::from(intent.encode().unwrap()),
         )
         .unwrap();

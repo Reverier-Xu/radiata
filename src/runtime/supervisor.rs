@@ -1356,7 +1356,7 @@ mod receipt_retention_sweep_tests {
     let store = context.store();
     let snapshot = store.snapshot().await.unwrap();
     let prepared = store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         TransactionId::generate(entropy).unwrap(),
         snapshot.revision().clone(),
         vec![StoreOperation::Put {

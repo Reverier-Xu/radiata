@@ -126,7 +126,7 @@ pub(crate) async fn ensure_self_binding(
   if let Some(existing) = snapshot.get(&namespace, &key).await? {
     return expect_exact_self_binding(&RowEnvelope::open(existing.as_bytes())?, identity);
   }
-  let transaction = store.prepare_transaction(
+  let transaction = store.prepare_core_verb_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![StoreOperation::Put {
@@ -137,6 +137,7 @@ pub(crate) async fn ensure_self_binding(
         &namespace,
         &key,
         snapshot.revision(),
+        &crate::LabelSet::new(),
         Arc::from(expected.encode()?),
       )?,
     }],
@@ -400,6 +401,7 @@ async fn create_identity(
     &namespace,
     &key,
     snapshot.revision(),
+    &crate::LabelSet::new(),
     Arc::from(intent.encode()?),
   )?;
   let token = ReceiptReferenceToken::for_record(&namespace, &key);
@@ -523,6 +525,7 @@ async fn finalize_identity(
     &local_namespace,
     &local_key,
     snapshot.revision(),
+    &crate::LabelSet::new(),
     Arc::from(identity.encode()?),
   )?;
   let prepared = store
@@ -1530,6 +1533,7 @@ mod tests {
       &namespace,
       &key,
       &StoreRevision::new(Arc::from([1_u8])).unwrap(),
+      &crate::LabelSet::new(),
       Arc::from(
         LocalIdentityV1::new(node(1), public_key, operation(2), handle)
           .encode()
@@ -1547,6 +1551,7 @@ mod tests {
       &namespace,
       &key,
       &StoreRevision::new(Arc::from([1_u8])).unwrap(),
+      &crate::LabelSet::new(),
       Arc::from(
         KeyCreationIntentV1::new(
           op,

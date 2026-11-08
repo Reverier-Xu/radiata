@@ -31,4 +31,5 @@ pub(crate) use cbor::{
 };
 pub(crate) use envelope::{PRELUDE_LEN, Prelude, check_frame, split_message};
 pub use feature::FeatureDefinition;
+pub(crate) use minicbor::data::Type;
 pub use tag::{EventTag, FeatureTag, ProtocolTag, QualifiedTag, TransportTag};

@@ -836,10 +836,23 @@ fn digest_store_value(value: &[u8]) -> Digest {
 /// adapter; the storage-contract reference oracle deliberately keeps its
 /// own derivation of the expectation table (see
 /// `src/storage/contract/reference.rs`) so the oracle and the
-/// adapters cannot drift in lockstep. Without a storage-backend feature
-/// there are no callers, which is intentionally allowed.
+/// adapters cannot drift in lockstep.
+///
+/// # Storage-author contract
+///
+/// Public for third-party [`Storage`](crate::extension::Storage)
+/// authors: a backend that evaluates conditional operations through this
+/// function inherits the exact commit semantics every built-in adapter
+/// enforces, instead of re-deriving them. The lookups are per-site
+/// closures so the caller keeps its own read order and error contexts.
+/// The clause set (per [`StoreOperation`]): `Check`/`Put` hold their
+/// [`StoreExpectation`] against the entry's content digest, `Delete`
+/// holds only over an exactly-matching existing record, and
+/// `ForgetReceipt` holds only over a stored receipt carrying the exact
+/// operation digest. The result is a pure predicate: it mutates nothing
+/// and never observes anything outside the closures.
 #[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
-pub(crate) fn condition_matches(
+pub fn condition_matches(
   mut entry: impl FnMut(&StoreNamespace, &StoreKey) -> Result<Option<Digest>>,
   mut receipt: impl FnMut(&TransactionId) -> Result<Option<Digest>>, operation: &StoreOperation,
 ) -> Result<bool> {
@@ -889,8 +902,19 @@ fn expectation_matches(digest: Option<Digest>, expected: &StoreExpectation) -> b
 /// from it, the `ForgetReceipt` digest expectation), `current_revision`
 /// resolves the current store revision, and `entry` resolves one record
 /// to its content digest.
+///
+/// # Storage-author contract
+///
+/// Public for third-party [`Storage`](crate::extension::Storage) authors:
+/// a backend that runs this precheck in its own `commit` inherits the
+/// exact commit ordering every built-in adapter enforces — receipt
+/// replay, base revision, then conditional expectations, in that order,
+/// first miss conflicts and nothing applies — and a `Some` outcome must
+/// be returned to the caller without applying anything. The function is
+/// a pure decision over the closures: it mutates nothing and the apply
+/// phase after a `None` remains the backend's own atomic obligation.
 #[cfg_attr(not(any(feature = "json", feature = "redb")), allow(dead_code))]
-pub(crate) fn commit_precheck(
+pub fn commit_precheck(
   transaction: &StoreTransaction,
   mut receipt: impl FnMut(&TransactionId) -> Result<Option<CommitReceipt>>,
   current_revision: impl FnOnce() -> Result<StoreRevision>,

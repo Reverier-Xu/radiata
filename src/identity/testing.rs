@@ -713,6 +713,7 @@ pub(crate) fn inject_enveloped_entry(
     namespace,
     key,
     &crate::StoreRevision::new(Arc::from(&b"test-revision"[..])).unwrap(),
+    &crate::LabelSet::new(),
     Arc::from(payload),
   )
   .unwrap();

@@ -131,7 +131,7 @@ async fn seed_local_families(store: &MetadataStore, marker: &[u8]) {
     })
     .collect();
   let prepared = store
-    .prepare_transaction(
+    .prepare_core_verb_transaction(
       crate::storage::test_util::transaction_id(877),
       snapshot.revision().clone(),
       operations,
@@ -222,7 +222,7 @@ async fn converge(sides: [&MetadataStore; 2]) {
         crate::storage::families::namespace(crate::membership::NODE_DESCRIPTOR_NAMESPACE).unwrap();
       let mut scan = snapshot.scan_from(&namespace, &[], None).await.unwrap();
       while let Some(entry) = scan.next().await.unwrap() {
-        if let Ok(descriptor) = crate::membership::page::decode_descriptor(entry.value().as_bytes())
+        if let Ok(descriptor) = crate::membership::page::decode_stored_row(entry.value().as_bytes())
         {
           descriptors.push(descriptor);
         }
