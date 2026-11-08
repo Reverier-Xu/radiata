@@ -73,6 +73,14 @@ pub struct NodeConfig {
   keepalive_timeout: Duration,
   trace_metadata_limits: TraceMetadataLimits,
   route_policy: Option<crate::QualifiedTag>,
+  // The caller-selected endpoint-selection policy tag, if any. Resolved
+  // against the extension registry once in the registration channel (the
+  // effective_route_policy discipline).
+  endpoint_policy: Option<crate::QualifiedTag>,
+  // The caller-declared transport scheme preference list, if any. Its
+  // presence selects the built-in preference-order policy at resolution
+  // time; unmatched candidate schemes fall back to published order.
+  endpoint_preference: Option<Vec<crate::TransportName>>,
   receipt_retention: Duration,
   // The resource removal-evidence policy: how long a signed removal
   // record stays convergence-eligible after its own timestamp, and the
@@ -198,6 +206,45 @@ impl NodeConfig {
   pub fn with_route_policy(mut self, tag: crate::QualifiedTag) -> Self {
     self.route_policy = Some(tag);
     self
+  }
+
+  /// Selects the node's endpoint-selection policy tag: the registered
+  /// policy decides which of a member's published endpoints each dial
+  /// lands on (recovery, degree maintenance, and bridge-probe dials
+  /// alike). The tag resolves in the extension registry; without a tag
+  /// the node runs the built-in published-order rotation, or the built-in
+  /// preference-order policy when a scheme preference list is declared
+  /// with [`NodeConfig::with_endpoint_preference`].
+  pub fn with_endpoint_policy(mut self, tag: crate::QualifiedTag) -> Self {
+    self.endpoint_policy = Some(tag);
+    self
+  }
+
+  /// Declares the node's transport scheme preference list (e.g. `wss`
+  /// before `tcp`) and selects the built-in preference-order policy for
+  /// every dial plane: candidates on a preferred scheme dial first, by
+  /// list position; candidates on unknown or unpreferred schemes keep
+  /// their published order behind the preferred ones — the per-candidate
+  /// fallback is the fail-safe, so an entry no member publishes is
+  /// harmless (it simply never matches) and needs no registration
+  /// knowledge here. The list must be nonempty and duplicate-free.
+  /// Setting an explicit policy tag with
+  /// [`NodeConfig::with_endpoint_policy`] other than the built-in
+  /// preference-order policy rejects a declared list at node start (the
+  /// list would silently do nothing); declaring the built-in
+  /// preference-order tag carries the list.
+  pub fn with_endpoint_preference(mut self, preference: Vec<crate::TransportName>) -> Result<Self> {
+    if preference.is_empty() {
+      return Err(Error::invalid_input("endpoint preference list"));
+    }
+    let mut seen = BTreeSet::new();
+    for name in &preference {
+      if !seen.insert(name.as_str()) {
+        return Err(Error::conflict("endpoint preference entry"));
+      }
+    }
+    self.endpoint_preference = Some(preference);
+    Ok(self)
   }
 
   /// Replaces the merge admission limits (see
@@ -428,6 +475,23 @@ impl NodeConfig {
     self.route_policy.as_ref()
   }
 
+  /// The caller-selected endpoint-selection policy tag, if any. This is a
+  /// plain configuration read: the effective policy — this selection, or
+  /// the built-in preference-order policy when a preference list is
+  /// declared, or the built-in published-order rotation otherwise —
+  /// resolves in the registration channel (the node builder, right after
+  /// the default registry pass) and the runtime reads only the resolved
+  /// instance.
+  pub(crate) const fn endpoint_policy(&self) -> Option<&crate::QualifiedTag> {
+    self.endpoint_policy.as_ref()
+  }
+
+  /// The caller-declared transport scheme preference list, if any.
+  /// Consumed by the registration channel's policy resolution.
+  pub(crate) fn endpoint_preference(&self) -> Option<&[crate::TransportName]> {
+    self.endpoint_preference.as_deref()
+  }
+
   pub(crate) const fn required_features(&self) -> &BTreeSet<FeatureTag> {
     &self.required_features
   }
@@ -516,6 +580,8 @@ impl Default for NodeConfig {
       keepalive_timeout: Duration::from_secs(60),
       trace_metadata_limits: TraceMetadataLimits::default(),
       route_policy: None,
+      endpoint_policy: None,
+      endpoint_preference: None,
       receipt_retention: Duration::from_secs(30 * 24 * 60 * 60),
       // The shipped removal-evidence policy: one month of retention and
       // a quarter-million removal rows per node, the same defaults the
@@ -1064,5 +1130,53 @@ mod tests {
     let whole = RecoveryConfig::new(1, Duration::from_secs(1), Duration::from_secs(2)).unwrap();
     assert_eq!(whole.initial_backoff_seconds(), 1);
     assert_eq!(whole.maximum_backoff_seconds(), 2);
+  }
+
+  /// The endpoint-selection surface: both accessors default to unset
+  /// (plain `Option` reads; the effective policy resolves in the
+  /// registration channel), the policy tag stores verbatim, and the
+  /// preference list refuses an empty list and duplicate entries while
+  /// keeping its declared order.
+  #[test]
+  fn endpoint_selection_surface_stores_and_validates() {
+    // Unset: both reads are `None`.
+    let default = NodeConfig::new();
+    assert!(default.endpoint_policy().is_none());
+    assert!(default.endpoint_preference().is_none());
+
+    // The policy tag stores verbatim (the with_route_policy shape).
+    let tag = crate::QualifiedTag::parse("example.com/endpoint-policies/pinned").unwrap();
+    let configured = NodeConfig::new().with_endpoint_policy(tag.clone());
+    assert_eq!(configured.endpoint_policy(), Some(&tag));
+    assert!(configured.endpoint_preference().is_none());
+
+    // The preference list keeps its declared order and reads back.
+    let preference = vec![
+      crate::TransportName::parse("wss").unwrap(),
+      crate::TransportName::parse("tcp").unwrap(),
+    ];
+    let configured = NodeConfig::new()
+      .with_endpoint_preference(preference.clone())
+      .unwrap();
+    assert_eq!(configured.endpoint_preference(), Some(&preference[..]));
+    assert!(configured.endpoint_policy().is_none());
+
+    // An empty list is a caller mistake, not a "no preference" spelling.
+    let error = NodeConfig::new()
+      .with_endpoint_preference(Vec::new())
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(error.context(), "endpoint preference list");
+
+    // A duplicate entry is a conflict.
+    let duplicated = vec![
+      crate::TransportName::parse("wss").unwrap(),
+      crate::TransportName::parse("wss").unwrap(),
+    ];
+    let error = NodeConfig::new()
+      .with_endpoint_preference(duplicated)
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+    assert_eq!(error.context(), "endpoint preference entry");
   }
 }

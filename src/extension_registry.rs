@@ -76,6 +76,8 @@ pub struct ExtensionRegistry {
   routing: RoutingRegistry,
   load_balancers:
     std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::LoadBalancingPolicy>>>,
+  endpoint_policies:
+    std::sync::RwLock<BTreeMap<crate::QualifiedTag, Arc<dyn crate::EndpointSelectionPolicy>>>,
   resource_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ResourceHook>>>,
   action_hooks: std::sync::Mutex<BTreeMap<crate::QualifiedTag, Arc<dyn crate::ActionHook>>>,
   task_reconcilers:
@@ -95,6 +97,7 @@ impl Default for ExtensionRegistry {
       transports: TransportRegistry::new(),
       routing: RoutingRegistry::new(),
       load_balancers: std::sync::RwLock::new(BTreeMap::new()),
+      endpoint_policies: std::sync::RwLock::new(BTreeMap::new()),
       resource_hooks: std::sync::Mutex::new(BTreeMap::new()),
       action_hooks: std::sync::Mutex::new(BTreeMap::new()),
       task_reconcilers: std::sync::Mutex::new(BTreeMap::new()),
@@ -136,6 +139,30 @@ impl ExtensionRegistry {
       self.register_core_feature(definition)?;
     }
     self.register_core_task_policies()?;
+    {
+      let mut policies = self
+        .endpoint_policies
+        .write()
+        .map_err(|_| Error::poisoned("extension registry"))?;
+      crate::api::insert_once(
+        &mut policies,
+        crate::endpoint_selection::PublishedOrderPolicy::tag()?,
+        Arc::new(crate::endpoint_selection::PublishedOrderPolicy),
+        "endpoint policy registration",
+      )?;
+      crate::api::insert_once(
+        &mut policies,
+        crate::endpoint_selection::PreferenceOrderPolicy::tag()?,
+        Arc::new(crate::endpoint_selection::PreferenceOrderPolicy::default()),
+        "endpoint policy registration",
+      )?;
+      crate::api::insert_once(
+        &mut policies,
+        crate::endpoint_selection::OutcomeWeightedPolicy::tag()?,
+        Arc::new(crate::endpoint_selection::OutcomeWeightedPolicy::default()),
+        "endpoint policy registration",
+      )?;
+    }
     Ok(self)
   }
 
@@ -387,6 +414,94 @@ impl ExtensionRegistry {
     }
   }
 
+  /// Registers one endpoint-selection policy under a canonical tag. The
+  /// built-in `radiata.woooo.tech` domain is reserved — the three built-in
+  /// policies are installed there by the default path — so a caller
+  /// policy registers under a caller-owned domain. A duplicate tag is a
+  /// conflict; registration never replaces an existing entry. The node's
+  /// configured policy tag (see
+  /// [`crate::NodeConfig::with_endpoint_policy`]) resolves here when the
+  /// registration channel resolves the effective policy.
+  pub fn register_endpoint_policy(
+    &mut self, tag: crate::QualifiedTag, value: Arc<dyn crate::EndpointSelectionPolicy>,
+  ) -> Result<&mut Self> {
+    crate::protocol::tag::require_caller_domain(tag.domain(), "endpoint policy tag")?;
+    {
+      let mut policies = self
+        .endpoint_policies
+        .write()
+        .map_err(|_| Error::poisoned("extension registry"))?;
+      insert_once(&mut policies, tag, value, "endpoint policy registration")?;
+    }
+    Ok(self)
+  }
+
+  /// The registered endpoint-selection policy for one tag, when present.
+  /// A poisoned registry lock surfaces as the typed registry error
+  /// instead of degrading to "no policy".
+  pub(crate) fn endpoint_policy(
+    &self, tag: &crate::QualifiedTag,
+  ) -> Result<Option<Arc<dyn crate::EndpointSelectionPolicy>>> {
+    Ok(
+      self
+        .endpoint_policies
+        .read()
+        .map_err(|_| Error::poisoned("extension registry"))?
+        .get(tag)
+        .cloned(),
+    )
+  }
+
+  /// The node's effective endpoint-selection policy: the caller's
+  /// selection when configured, else the built-in preference-order
+  /// policy carrying the caller's scheme preference list, else the
+  /// built-in published-order rotation. The builder resolves this once
+  /// in the registration channel — right after the default registry
+  /// pass installs the built-ins — and the runtime reads only the
+  /// resolved instance. Fail-closed: a registry without the built-in
+  /// default (or the explicitly selected tag) fails typed here instead
+  /// of handing the runtime a policy nothing resolves. A declared
+  /// preference list paired with an explicit non-preference tag is
+  /// rejected: the list would silently do nothing under another policy.
+  pub(crate) fn effective_endpoint_policy(
+    &self, configured: Option<&crate::QualifiedTag>, preference: Option<&[crate::TransportName]>,
+  ) -> Result<Arc<dyn crate::EndpointSelectionPolicy>> {
+    let preference_tag = crate::endpoint_selection::PreferenceOrderPolicy::tag()?;
+    match configured {
+      Some(tag) => {
+        if preference.is_some() && *tag != preference_tag {
+          return Err(Error::invalid_input("endpoint preference list"));
+        }
+        if *tag == preference_tag {
+          return Ok(Arc::new(
+            crate::endpoint_selection::PreferenceOrderPolicy::new(
+              preference.unwrap_or(&[]).to_vec(),
+            ),
+          ));
+        }
+        self.endpoint_policy(tag)?.ok_or_else(|| {
+          Error::internal(format!(
+            "endpoint selection policy {tag} missing from the registry"
+          ))
+        })
+      }
+      None => match preference {
+        Some(list) => Ok(Arc::new(
+          crate::endpoint_selection::PreferenceOrderPolicy::new(list.to_vec()),
+        )),
+        None => {
+          let tag = crate::endpoint_selection::PublishedOrderPolicy::tag()?;
+          self.endpoint_policy(&tag)?.ok_or_else(|| {
+            Error::internal(format!(
+              "default endpoint selection policy {} missing from the registry",
+              crate::endpoint_selection::PublishedOrderPolicy::TAG
+            ))
+          })
+        }
+      },
+    }
+  }
+
   /// Registers one resource-write hook under a canonical tag. The built-in
   /// `radiata.woooo.tech` domain is reserved — the crate defines no built-in
   /// resource hooks, and the namespace stays closed for them — so a caller
@@ -624,6 +739,14 @@ impl fmt::Debug for ExtensionRegistry {
           .map(|balancers| balancers.len())
           .unwrap_or(0),
       )
+      .field(
+        "endpoint_policies",
+        &self
+          .endpoint_policies
+          .read()
+          .map(|policies| policies.len())
+          .unwrap_or(0),
+      )
       .field("next_hops", &self.routing.next_hop_count())
       .field("routing_policies", &self.routing.routing_policy_count())
       .field(
@@ -661,7 +784,7 @@ mod tests {
   use super::{ExtensionRegistry, PacketConsumer, ProtocolDefinition};
   use crate::{
     Digest, ErrorKind, FeatureDefinition, FeatureTag, IncomingStream, ProtocolTag, Result,
-    api::BoxFuture,
+    TransportName, api::BoxFuture,
   };
 
   #[derive(Debug)]
@@ -1211,5 +1334,133 @@ mod tests {
         crate::routing::DefaultNextHop::TAG
       )
     );
+  }
+
+  /// The endpoint-selection seam's registration rules: the default pass
+  /// installs the three built-ins, the built-in domain stays reserved on
+  /// the caller seam, a caller tag registers under the ordinary
+  /// insertion-once rule, and the default pass itself stays
+  /// insertion-once (a second pass conflicts).
+  #[test]
+  fn endpoint_policy_registrations_follow_the_standard_registry_rules() {
+    use crate::endpoint_selection::{
+      OutcomeWeightedPolicy, PreferenceOrderPolicy, PublishedOrderPolicy,
+    };
+
+    let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
+    for tag in [
+      PublishedOrderPolicy::tag().unwrap(),
+      PreferenceOrderPolicy::tag().unwrap(),
+      OutcomeWeightedPolicy::tag().unwrap(),
+    ] {
+      assert!(registry.endpoint_policy(&tag).unwrap().is_some());
+    }
+
+    // The built-in domain is reserved on the caller seam.
+    let refused = registry
+      .register_endpoint_policy(
+        PublishedOrderPolicy::tag().unwrap(),
+        Arc::new(PublishedOrderPolicy),
+      )
+      .unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    assert_eq!(refused.context(), "endpoint policy tag");
+
+    // A caller-owned domain follows the insertion-once duplicate rule.
+    let caller = crate::QualifiedTag::parse("example.com/endpoint-policies/pinned").unwrap();
+    registry
+      .register_endpoint_policy(caller.clone(), Arc::new(PublishedOrderPolicy))
+      .unwrap();
+    let duplicate = registry
+      .register_endpoint_policy(caller, Arc::new(PublishedOrderPolicy))
+      .unwrap_err();
+    assert_eq!(duplicate.kind(), ErrorKind::Conflict);
+    assert!(format!("{registry:?}").contains("endpoint_policies: 4"));
+
+    // The default pass itself stays insertion-once.
+    let second_pass = registry.register_default().unwrap_err();
+    assert_eq!(second_pass.kind(), ErrorKind::Conflict);
+  }
+
+  /// The effective endpoint policy resolves once in the registration
+  /// channel: published order by default, preference-order when a
+  /// preference list is declared, the selected tag when configured — and
+  /// every missing-registry path fails closed.
+  #[test]
+  fn effective_endpoint_policy_resolves_the_configured_shape_fail_closed() {
+    use crate::{
+      Endpoint,
+      endpoint_selection::{
+        EndpointSelectionPolicy, OutcomeWeightedPolicy, PreferenceOrderPolicy, PublishedOrderPolicy,
+      },
+    };
+
+    let candidates = vec![
+      Endpoint::parse("wss://10.0.0.1:1").unwrap(),
+      Endpoint::parse("tcp://10.0.0.1:2").unwrap(),
+    ];
+    let order_of = |policy: &Arc<dyn EndpointSelectionPolicy>| -> Vec<String> {
+      policy
+        .rank_candidates(
+          &crate::NodeId::parse("node-000000000000000000001").unwrap(),
+          &candidates,
+        )
+        .into_iter()
+        .map(|index| candidates[index].selector().as_str().to_owned())
+        .collect()
+    };
+
+    // A registry without the default pass fails closed on every path.
+    let bare = ExtensionRegistry::new();
+    let error = bare.effective_endpoint_policy(None, None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    let unknown = crate::QualifiedTag::parse("example.com/endpoint-policies/pinned").unwrap();
+    assert_eq!(
+      bare
+        .effective_endpoint_policy(Some(&unknown), None)
+        .unwrap_err()
+        .kind(),
+      ErrorKind::Internal
+    );
+
+    // Default shape: the built-in published-order rotation.
+    let mut registry = ExtensionRegistry::new();
+    registry.register_default().unwrap();
+    let default = registry.effective_endpoint_policy(None, None).unwrap();
+    assert_eq!(order_of(&default), ["wss", "tcp"]);
+
+    // A declared preference list selects preference-order and carries
+    // the list; the same shape holds when the caller names the built-in
+    // preference-order tag explicitly.
+    let preference = [TransportName::parse("tcp").unwrap()];
+    let resolved = registry
+      .effective_endpoint_policy(None, Some(&preference))
+      .unwrap();
+    assert_eq!(order_of(&resolved), ["tcp", "wss"]);
+    let resolved = registry
+      .effective_endpoint_policy(
+        Some(&PreferenceOrderPolicy::tag().unwrap()),
+        Some(&preference),
+      )
+      .unwrap();
+    assert_eq!(order_of(&resolved), ["tcp", "wss"]);
+
+    // An explicit outcome-weighted selection resolves the registered
+    // built-in; a missing tag stays fail-closed even after the pass.
+    let resolved = registry
+      .effective_endpoint_policy(Some(&OutcomeWeightedPolicy::tag().unwrap()), None)
+      .unwrap();
+    assert_eq!(order_of(&resolved), ["wss", "tcp"]);
+
+    // A declared preference list under an explicit non-preference tag is
+    // rejected: the list would silently do nothing.
+    let error = registry
+      .effective_endpoint_policy(
+        Some(&PublishedOrderPolicy::tag().unwrap()),
+        Some(&preference),
+      )
+      .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
   }
 }

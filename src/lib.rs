@@ -19,6 +19,7 @@
 mod api;
 mod audit;
 mod config;
+mod endpoint_selection;
 mod error;
 mod extension_registry;
 pub mod guide;
@@ -65,6 +66,10 @@ mod simulation;
 
 pub use api::BoxFuture;
 pub use config::{MergeAdmissionLimits, NodeConfig, RecoveryConfig, TraceMetadataLimits};
+pub use endpoint_selection::{
+  DialObservation, EndpointSelectionPolicy, EndpointSelector, OutcomeWeightedPolicy,
+  PreferenceOrderPolicy, PublishedOrderPolicy,
+};
 pub use error::{Error, ErrorKind, ProviderErrorContext, ProviderErrorKind, Result};
 pub use extension_registry::{ExtensionRegistry, PacketConsumer, ProtocolDefinition};
 pub use identity::{
