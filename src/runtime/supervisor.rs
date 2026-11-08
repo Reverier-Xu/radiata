@@ -379,8 +379,12 @@ pub(crate) async fn spawn_runtime(
   // and the live change stream, exiting on the incarnation's shutdown
   // signal. Its reconciler contexts ride an ordinary public node handle
   // over the internal engine client — no node-command sender, so holding
-  // it never delays the last-handle-drop shutdown detection.
-  runtime.spawn(super::trigger_engine::run_trigger_engine(
+  // it never delays the last-handle-drop shutdown detection. The handle
+  // joins the tracked task set the shutdown path drains and awaits, so
+  // the engine's captures (the operation planes, the store) release
+  // before the shutdown reply resolves and never race a restart's
+  // storage reopen.
+  let trigger_engine = runtime.spawn(super::trigger_engine::run_trigger_engine(
     operations,
     task_client,
     crate::NodeHandle::new(
@@ -397,6 +401,9 @@ pub(crate) async fn spawn_runtime(
     ),
     trigger_fires_rx,
   ));
+  if let Ok(mut handles) = dependencies.connection_tasks.lock() {
+    handles.push(trigger_engine);
+  }
 
   runtime.spawn(supervise(
     dependencies,

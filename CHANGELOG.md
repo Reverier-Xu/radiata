@@ -55,7 +55,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `NodeConfig::with_task_reconcile_controller_slots`), bounded
   observable task records per pass, and the shutdown drain honoring the
   declared policy. The sweep engines and the checkpoint gate are
-  unchanged, so swept and retained sets are identical.
+  unchanged, so swept and retained sets are identical. `TaskChanged`
+  now also carries the controllers' own transitions (an additive fact:
+  the controller passes are admitted tasks on the same unified task
+  machine), so a subscriber pinning a cross-task event sequence sees
+  the controllers' records interleave; scope subscriptions by task id
+  to observe one task's lifecycle.
 
 ### Changed
 

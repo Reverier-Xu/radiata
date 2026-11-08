@@ -185,24 +185,42 @@ async fn reads_and_packets_flow_while_a_join_is_wedged_on_a_silent_peer() {
   // no polling race): the dial is now wedged for the full deadline, and
   // every probe below must answer from the loop's own lanes — the
   // pre-refactor shape queued reads and packets behind the inline join
-  // for the whole deadline.
-  let admission = tokio::time::timeout(READ_BOX, join_events.recv())
-    .await
-    .unwrap()
-    .unwrap();
-  assert!(
-    matches!(admission, radiata::EventReceive::Item(ref event) if event.phase() == radiata::TaskPhase::Pending),
-    "the admission transition must publish first"
-  );
-  let running = tokio::time::timeout(READ_BOX, join_events.recv())
-    .await
-    .unwrap()
-    .unwrap();
-  assert!(
-    matches!(running, radiata::EventReceive::Item(ref event) if event.phase() == radiata::TaskPhase::Running),
-    "the first reconcile spawn must publish running"
-  );
-
+  // for the whole deadline. The receive is scoped to the join task's
+  // own id: the core's controller passes share the stream by design.
+  loop {
+    let event = tokio::time::timeout(READ_BOX, join_events.recv())
+      .await
+      .unwrap()
+      .unwrap();
+    let radiata::EventReceive::Item(event) = event else {
+      continue;
+    };
+    if event.task() != join.id() {
+      continue;
+    }
+    assert!(
+      event.phase() == radiata::TaskPhase::Pending,
+      "the admission transition must publish first"
+    );
+    break;
+  }
+  loop {
+    let event = tokio::time::timeout(READ_BOX, join_events.recv())
+      .await
+      .unwrap()
+      .unwrap();
+    let radiata::EventReceive::Item(event) = event else {
+      continue;
+    };
+    if event.task() != join.id() {
+      continue;
+    }
+    assert!(
+      event.phase() == radiata::TaskPhase::Running,
+      "the first reconcile spawn must publish running"
+    );
+    break;
+  }
   let started = Instant::now();
   let members = tokio::time::timeout(
     READ_BOX,

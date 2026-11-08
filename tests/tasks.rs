@@ -164,19 +164,27 @@ fn probe_extensions(
   (extensions, log, release)
 }
 
-/// Receives one event item with a bound, failing the test on lag or a
-/// miss (the subscriptions are sized for the pinned sequences).
-async fn next_changed(events: &mut radiata::EventSubscription<TaskChanged>) -> TaskChanged {
-  match tokio::time::timeout(Duration::from_secs(30), events.recv())
-    .await
-    .unwrap()
-    .unwrap()
-  {
-    EventReceive::Item(item) => item,
-    EventReceive::Lagged { missed } => panic!("task event subscription lagged by {missed}"),
-    EventReceive::Empty => panic!("task event stream returned empty from a pending recv"),
-    EventReceive::Closed => panic!("task event stream closed before the pinned sequence"),
-    _ => panic!("unexpected task event stream state"),
+/// Receives the next event of exactly `id` with a bound, failing the
+/// test on lag or a miss (the subscriptions are sized for the pinned
+/// sequences). Other tasks' events — the core's controller passes now
+/// share the stream by design — are skipped, so the pinned per-task
+/// sequence stays exact.
+async fn next_changed_for(
+  events: &mut radiata::EventSubscription<TaskChanged>, id: &radiata::TaskId,
+) -> TaskChanged {
+  loop {
+    let item = match tokio::time::timeout(Duration::from_secs(30), events.recv()).await {
+      Ok(Ok(EventReceive::Item(item))) => item,
+      Ok(Ok(EventReceive::Lagged { missed })) => {
+        panic!("task event subscription lagged by {missed}")
+      }
+      Ok(Ok(_)) => panic!("task event stream ended before the pinned item"),
+      Ok(Err(error)) => panic!("task event receive failed: {error:?}"),
+      Err(_) => panic!("the pinned task event never arrived"),
+    };
+    if item.task() == id {
+      return item;
+    }
   }
 }
 
@@ -193,11 +201,13 @@ async fn lifecycle_phases_and_value_based_waits() {
   let task = node.tasks().submit(probe_spec()).await.unwrap();
   assert_eq!(task.kind(), &TaskKind::parse(PROBE_KIND).unwrap());
 
-  // Admission then the first spawn: exactly one event per transition.
-  let pending = next_changed(&mut events).await;
+  // Admission then the first spawn: exactly one event per transition
+  // for this task (other tasks' events — the core's controller passes —
+  // are skipped by the scoped receive).
+  let pending = next_changed_for(&mut events, task.id()).await;
   assert_eq!(pending.task(), task.id());
   assert_eq!(pending.phase(), TaskPhase::Pending);
-  let running = next_changed(&mut events).await;
+  let running = next_changed_for(&mut events, task.id()).await;
   assert_eq!(running.phase(), TaskPhase::Running);
 
   // The live snapshot through the accessor: one attempt spent, started
@@ -215,7 +225,7 @@ async fn lifecycle_phases_and_value_based_waits() {
 
   // Release the effect; the terminal publication lands before any wait.
   release.send(true).unwrap();
-  let done = next_changed(&mut events).await;
+  let done = next_changed_for(&mut events, task.id()).await;
   assert_eq!(done.phase(), TaskPhase::Succeeded);
 
   // Both wait forms resolve from an already-terminal state: the typed
@@ -275,22 +285,48 @@ async fn list_reports_admission_order_with_keyset_pages() {
   second.clone().wait().await.unwrap();
   assert!(second.id() > first.id(), "admission order must be id order");
 
-  let page = node
-    .tasks()
-    .list(PageSpec::first(1).unwrap())
-    .await
-    .unwrap();
-  assert_eq!(page.items().len(), 1);
-  assert_eq!(page.items()[0].id(), first.id());
-  let cursor = page.next().unwrap().clone();
-  let rest = node
-    .tasks()
-    .list(PageSpec::after(cursor, 8).unwrap())
-    .await
-    .unwrap();
-  assert_eq!(rest.items().len(), 1);
-  assert_eq!(rest.items()[0].id(), second.id());
-  assert!(rest.next().is_none());
+  // The core's controller passes now share the task surface by design,
+  // so the page carries their records too; the pinned invariants are
+  // the page's own contract: ids strictly ascending across pages
+  // (admission order == id order), the two probe tasks present in
+  // order, and the keyset pagination terminating exactly once.
+  let mut ids = Vec::new();
+  let mut cursor = None;
+  loop {
+    let page = match cursor.take() {
+      Some(cursor) => node
+        .tasks()
+        .list(PageSpec::after(cursor, 1).unwrap())
+        .await
+        .unwrap(),
+      None => node
+        .tasks()
+        .list(PageSpec::first(1).unwrap())
+        .await
+        .unwrap(),
+    };
+    ids.extend(page.items().iter().map(|view| view.id().clone()));
+    match page.next() {
+      Some(next) => cursor = Some(next.clone()),
+      None => break,
+    }
+  }
+  assert!(
+    ids.windows(2).all(|pair| pair[0] < pair[1]),
+    "ids stay in admission order"
+  );
+  let first_index = ids
+    .iter()
+    .position(|id| id == first.id())
+    .expect("the first probe task");
+  let second_index = ids
+    .iter()
+    .position(|id| id == second.id())
+    .expect("the second probe task");
+  assert!(
+    first_index < second_index,
+    "the probe tasks keep their admission order"
+  );
   node.shutdown().await.unwrap();
 }
 
@@ -307,13 +343,15 @@ async fn explicit_retry_decisions_republish_running_with_the_last_error() {
   let task = node.tasks().submit(probe_spec()).await.unwrap();
   task.clone().wait().await.unwrap();
 
-  // Pending, three running wakes (one per attempt), then the terminal.
+  // Pending, three running wakes (one per attempt), then the terminal —
+  // this task's events only (the core's controller passes share the
+  // stream by design and are skipped by the scoped receive).
   let phases = [
-    next_changed(&mut events).await,
-    next_changed(&mut events).await,
-    next_changed(&mut events).await,
-    next_changed(&mut events).await,
-    next_changed(&mut events).await,
+    next_changed_for(&mut events, task.id()).await,
+    next_changed_for(&mut events, task.id()).await,
+    next_changed_for(&mut events, task.id()).await,
+    next_changed_for(&mut events, task.id()).await,
+    next_changed_for(&mut events, task.id()).await,
   ]
   .map(|event| event.phase());
   assert_eq!(
