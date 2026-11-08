@@ -72,7 +72,20 @@ pub(crate) use catalog::MetadataFamily;
 /// The owning domain of every catalog family; consumers classify families
 /// through the catalog itself (iterate [`metadata_families`]) instead of
 /// by copying namespace lists.
-pub(crate) use catalog::{MetadataDomain, metadata_families};
+pub(crate) use catalog::{
+  FamilyContest, FamilyPolicy, MetadataDomain, MetadataFamily, metadata_families,
+};
+
+/// The declared policy of one catalog family, resolved by namespace: the
+/// single policy lookup for the catalog. An unknown namespace fails closed
+/// — only catalog families carry rows.
+pub(crate) fn family_policy(namespace: &crate::StoreNamespace) -> crate::Result<FamilyPolicy> {
+  metadata_families()
+    .iter()
+    .find(|family| family.namespace_tag() == namespace.as_str())
+    .map(MetadataFamily::policy)
+    .ok_or_else(|| crate::Error::invalid_input("metadata family policy"))
+}
 
 mod catalog {
   /// The domain that owns one metadata family's record encodings.
@@ -98,36 +111,143 @@ mod catalog {
     Schema,
   }
 
+  /// The contest policy of one family's slot: what happens when two
+  /// writers compete for the same row.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(crate) enum FamilyContest {
+    /// One legitimate record per slot: a fresh record installs through a
+    /// conditional absent put, a snapshot-identical replay is a no-op,
+    /// and any divergence conflicts (the terminal-record install).
+    GuardedSingleRecord,
+    /// Divergent valid evidence for one slot competes through the
+    /// family's canonical winner decision (the `decides` function
+    /// precedent): the loser is replaced through an exact-digest
+    /// conditional put, so partitioned writers converge (the convergent
+    /// terminal-record install).
+    CanonicalWinner,
+    /// A monotone maximum wins: a stale value never rolls the slot back
+    /// (the cleanup checkpoint watermark).
+    MonotoneMax,
+  }
+
+  /// Who may write one family's rows.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(crate) enum FamilyAdmission {
+    /// Writes flow only through the crate's core verbs under the store's
+    /// writer permit; peers never carry the family's rows.
+    CoreVerbGated,
+    /// Any member may write through the public register API, and the
+    /// reconcile plane carries the rows between nodes.
+    Multiwriter,
+    /// Only this node writes the family: its rows follow this store's own
+    /// commit order and the reconcile plane never carries them.
+    NodeLocalOnly,
+  }
+
+  /// The read scope of one family's rows.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(crate) enum FamilyVisibility {
+    /// Read only by core flows inside the crate; nothing in the family
+    /// reaches a public read API.
+    CoreOnly,
+    /// Readable through the crate's public read APIs (the resource
+    /// register).
+    PublicRead,
+  }
+
+  /// The cleanup vocabulary of one family: the sweep class its rows
+  /// belong to. This is the typed placeholder mirroring today's hardcoded
+  /// sweep classes (the leave wipe scope, the checkpoint GC collection,
+  /// the provider deletion flow, and the storage-internal families); the
+  /// sweep implementations still consume their own scoped logic, and a
+  /// later phase replaces those hardcoded classes with these
+  /// declarations. One class per family; per-row refinement is that
+  /// phase's work.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(crate) enum FamilyCleanup {
+    /// Wiped whole by a leave's domain wipe (the member-visible families
+    /// of the old identity, node descriptors, resources, and traces).
+    LeaveWipe,
+    /// Collected by the checkpoint GC watermark sweep once the record's
+    /// signed removal stamp passes the watermark (the leave and cleanup
+    /// tombstones; the collection retires the pinned subject binding).
+    CheckpointCollected,
+    /// A hygiene record of the store itself: replaced or swapped by its
+    /// own flow, never wiped by a leave and never GC-collected (the
+    /// local-identity singleton, the leave intent, the checkpoint).
+    StoreHygiene,
+    /// Removed only through the key provider's own deletion flow; never
+    /// swept by a domain wipe or GC (the key custody families).
+    ProviderDeletionFlow,
+    /// Storage-internal bookkeeping; never swept by identity cleanup
+    /// (the pending journal, receipts, and schema record).
+    StorageInternal,
+  }
+
+  /// The declared policy of one metadata family: the four aspects the
+  /// storage contract and later phases consume. Declared per family at
+  /// the catalog rows, so a new family is correct by declaration instead
+  /// of by consumer edits.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(crate) struct FamilyPolicy {
+    contest: FamilyContest,
+    admission: FamilyAdmission,
+    visibility: FamilyVisibility,
+    cleanup: FamilyCleanup,
+  }
+
+  impl FamilyPolicy {
+    /// Declares the four aspects of one family.
+    pub(crate) const fn new(
+      contest: FamilyContest, admission: FamilyAdmission, visibility: FamilyVisibility,
+      cleanup: FamilyCleanup,
+    ) -> Self {
+      Self {
+        contest,
+        admission,
+        visibility,
+        cleanup,
+      }
+    }
+
+    pub(crate) const fn contest(&self) -> FamilyContest {
+      self.contest
+    }
+
+    pub(crate) const fn admission(&self) -> FamilyAdmission {
+      self.admission
+    }
+
+    pub(crate) const fn visibility(&self) -> FamilyVisibility {
+      self.visibility
+    }
+
+    pub(crate) const fn cleanup(&self) -> FamilyCleanup {
+      self.cleanup
+    }
+  }
+
   /// One persisted metadata family: the owning domain, its namespace tag,
-  /// and whether the reconcile plane replicates it.
+  /// and its declared policy. The former per-family `replicated` flag is
+  /// the admission declaration: a node-local family is one no other node
+  /// may write, so the reconcile plane never carries its rows.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   pub(crate) struct MetadataFamily {
     domain: MetadataDomain,
     namespace_tag: &'static str,
-    replicated: bool,
+    policy: FamilyPolicy,
   }
 
   impl MetadataFamily {
-    /// A family every node converges: the reconcile plane carries its rows
-    /// between nodes, so two converged stores hold byte-identical content.
-    pub(crate) const fn new(domain: MetadataDomain, namespace_tag: &'static str) -> Self {
+    /// One catalog row: the owning domain, the namespace tag, and the
+    /// family's declared policy.
+    pub(crate) const fn new(
+      domain: MetadataDomain, namespace_tag: &'static str, policy: FamilyPolicy,
+    ) -> Self {
       Self {
         domain,
         namespace_tag,
-        replicated: true,
-      }
-    }
-
-    /// A node-local family: its rows follow this store's own commit order,
-    /// so two stores that converged through different orders legitimately
-    /// hold different content and the reconcile plane never carries them.
-    /// Consumers that compare or seed stores across nodes filter on
-    /// [`Self::replicated`] instead of naming the excluded families.
-    pub(crate) const fn node_local(domain: MetadataDomain, namespace_tag: &'static str) -> Self {
-      Self {
-        domain,
-        namespace_tag,
-        replicated: false,
+        policy,
       }
     }
 
@@ -139,13 +259,19 @@ mod catalog {
       self.namespace_tag
     }
 
-    /// Whether the reconcile plane replicates this family between nodes.
-    /// Test-only today: the cross-store comparisons are the consumers, and
-    /// production already excludes node-local families by construction (no
-    /// lane owns their namespaces).
+    pub(crate) const fn policy(&self) -> FamilyPolicy {
+      self.policy
+    }
+
+    /// Whether the reconcile plane replicates this family between nodes:
+    /// derived from the admission declaration (a family no other node may
+    /// write is never carried between nodes). Test-only today: the
+    /// cross-store comparisons are the consumers, and production already
+    /// excludes node-local families by construction (no lane owns their
+    /// namespaces).
     #[cfg(test)]
-    pub(crate) const fn replicated(&self) -> bool {
-      self.replicated
+    pub(crate) fn replicated(&self) -> bool {
+      self.policy.admission != FamilyAdmission::NodeLocalOnly
     }
 
     /// The namespace parsed for provider use (test-only: the storage
@@ -167,35 +293,170 @@ mod catalog {
     SCHEMA_NAMESPACE, TRACE_NAMESPACE,
   };
 
+  /// Shorthand for the core-verb-gated, core-only policy every
+  /// non-register family shares; the row names its contest and cleanup
+  /// class explicitly.
+  const fn core_policy(contest: FamilyContest, cleanup: FamilyCleanup) -> FamilyPolicy {
+    FamilyPolicy::new(
+      contest,
+      FamilyAdmission::CoreVerbGated,
+      FamilyVisibility::CoreOnly,
+      cleanup,
+    )
+  }
+
   /// Every core metadata family, in domain order and then declaration order.
   pub(crate) fn metadata_families() -> Vec<MetadataFamily> {
     vec![
-      MetadataFamily::new(MetadataDomain::Identity, LOCAL_IDENTITY_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Identity, IDENTITY_BINDING_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Identity, CREDENTIAL_USE_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Identity, MERGE_GRANT_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Identity, REVOCATION_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Identity, LEAVE_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Identity, CLEANUP_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Identity, CHECKPOINT_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::KeyIntent, KEY_CREATION_INTENT_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETION_INTENT_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::KeyIntent, KEY_DELETED_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Custody, KEY_SEED_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Node, NODE_DESCRIPTOR_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Resource, RESOURCE_RECORD_NAMESPACE),
-      MetadataFamily::node_local(MetadataDomain::Resource, RESOURCE_CHANGE_FEED_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Route, TRACE_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Receipt, PENDING_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Receipt, INTERNAL_NAMESPACE),
-      MetadataFamily::new(MetadataDomain::Schema, SCHEMA_NAMESPACE),
+      // The old identity itself: the local singleton is swapped, never
+      // wiped; the trust and admission evidence is wiped with it; the
+      // terminal tombstones are GC-collected; the checkpoint is hygiene.
+      MetadataFamily::new(
+        MetadataDomain::Identity,
+        LOCAL_IDENTITY_NAMESPACE,
+        core_policy(
+          FamilyContest::GuardedSingleRecord,
+          FamilyCleanup::StoreHygiene,
+        ),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Identity,
+        IDENTITY_BINDING_NAMESPACE,
+        core_policy(FamilyContest::GuardedSingleRecord, FamilyCleanup::LeaveWipe),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Identity,
+        CREDENTIAL_USE_NAMESPACE,
+        core_policy(FamilyContest::GuardedSingleRecord, FamilyCleanup::LeaveWipe),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Identity,
+        MERGE_GRANT_NAMESPACE,
+        core_policy(FamilyContest::GuardedSingleRecord, FamilyCleanup::LeaveWipe),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Identity,
+        REVOCATION_NAMESPACE,
+        core_policy(FamilyContest::CanonicalWinner, FamilyCleanup::LeaveWipe),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Identity,
+        LEAVE_NAMESPACE,
+        core_policy(
+          FamilyContest::GuardedSingleRecord,
+          FamilyCleanup::CheckpointCollected,
+        ),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Identity,
+        CLEANUP_NAMESPACE,
+        core_policy(
+          FamilyContest::CanonicalWinner,
+          FamilyCleanup::CheckpointCollected,
+        ),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Identity,
+        CHECKPOINT_NAMESPACE,
+        core_policy(FamilyContest::MonotoneMax, FamilyCleanup::StoreHygiene),
+      ),
+      // Key custody: intents, outcomes, and seed material leave through
+      // the provider's own deletion flow, never a domain wipe.
+      MetadataFamily::new(
+        MetadataDomain::KeyIntent,
+        KEY_CREATION_INTENT_NAMESPACE,
+        core_policy(
+          FamilyContest::GuardedSingleRecord,
+          FamilyCleanup::ProviderDeletionFlow,
+        ),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::KeyIntent,
+        KEY_DELETION_INTENT_NAMESPACE,
+        core_policy(
+          FamilyContest::GuardedSingleRecord,
+          FamilyCleanup::ProviderDeletionFlow,
+        ),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::KeyIntent,
+        KEY_DELETED_NAMESPACE,
+        core_policy(
+          FamilyContest::GuardedSingleRecord,
+          FamilyCleanup::ProviderDeletionFlow,
+        ),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Custody,
+        KEY_SEED_NAMESPACE,
+        core_policy(
+          FamilyContest::GuardedSingleRecord,
+          FamilyCleanup::ProviderDeletionFlow,
+        ),
+      ),
+      // Member-visible registers and metadata, wiped whole by a leave.
+      MetadataFamily::new(
+        MetadataDomain::Node,
+        NODE_DESCRIPTOR_NAMESPACE,
+        core_policy(FamilyContest::MonotoneMax, FamilyCleanup::LeaveWipe),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Resource,
+        RESOURCE_RECORD_NAMESPACE,
+        FamilyPolicy::new(
+          FamilyContest::MonotoneMax,
+          FamilyAdmission::Multiwriter,
+          FamilyVisibility::PublicRead,
+          FamilyCleanup::LeaveWipe,
+        ),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Resource,
+        RESOURCE_CHANGE_FEED_NAMESPACE,
+        FamilyPolicy::new(
+          FamilyContest::MonotoneMax,
+          FamilyAdmission::NodeLocalOnly,
+          FamilyVisibility::CoreOnly,
+          FamilyCleanup::LeaveWipe,
+        ),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Route,
+        TRACE_NAMESPACE,
+        core_policy(FamilyContest::GuardedSingleRecord, FamilyCleanup::LeaveWipe),
+      ),
+      // Storage infrastructure: never swept by identity cleanup.
+      MetadataFamily::new(
+        MetadataDomain::Receipt,
+        PENDING_NAMESPACE,
+        core_policy(
+          FamilyContest::GuardedSingleRecord,
+          FamilyCleanup::StorageInternal,
+        ),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Receipt,
+        INTERNAL_NAMESPACE,
+        core_policy(
+          FamilyContest::GuardedSingleRecord,
+          FamilyCleanup::StorageInternal,
+        ),
+      ),
+      MetadataFamily::new(
+        MetadataDomain::Schema,
+        SCHEMA_NAMESPACE,
+        core_policy(
+          FamilyContest::GuardedSingleRecord,
+          FamilyCleanup::StorageInternal,
+        ),
+      ),
     ]
   }
 
   #[cfg(test)]
   mod tests {
     use super::*;
-    use crate::protocol::tag::CATEGORY_METADATA;
+    use crate::{protocol::tag::CATEGORY_METADATA, storage::families::family_policy};
 
     #[test]
     fn storage_contract_family_catalog_covers_every_domain_with_distinct_namespaces() {
@@ -267,9 +528,10 @@ mod catalog {
       }
     }
 
-    /// The replication property is declared per family, not per consumer:
-    /// the resource change feed is the one node-local family, and every
-    /// other family converges through the reconcile plane.
+    /// The replication property is derived from the admission
+    /// declarations: the resource change feed is the one node-local
+    /// family (only this node writes it), and every other family
+    /// converges through the reconcile plane.
     #[test]
     fn only_the_resource_change_feed_is_node_local() {
       let node_local: Vec<&str> = metadata_families()
@@ -286,6 +548,71 @@ mod catalog {
         .into_iter()
         .find(|family| family.namespace_tag() == namespace_tag)
         .map(|family| family.domain())
+    }
+
+    /// Every family's policy resolves through the namespace lookup, and
+    /// the persist helpers' contest prerequisites hold by declaration:
+    /// the terminal tombstone families that merge divergent evidence
+    /// declare the canonical-winner contest, the guarded single-record
+    /// families declare it, and the checkpoint declares its monotone-max
+    /// watermark contest. A family added to the catalog must declare a
+    /// contest the helpers can enforce.
+    #[test]
+    fn family_policies_resolve_and_declare_the_enforced_contests() {
+      for tag in [
+        LOCAL_IDENTITY_NAMESPACE,
+        IDENTITY_BINDING_NAMESPACE,
+        CREDENTIAL_USE_NAMESPACE,
+        MERGE_GRANT_NAMESPACE,
+        REVOCATION_NAMESPACE,
+        LEAVE_NAMESPACE,
+        CLEANUP_NAMESPACE,
+        CHECKPOINT_NAMESPACE,
+        KEY_CREATION_INTENT_NAMESPACE,
+        KEY_DELETION_INTENT_NAMESPACE,
+        KEY_DELETED_NAMESPACE,
+        KEY_SEED_NAMESPACE,
+        NODE_DESCRIPTOR_NAMESPACE,
+        RESOURCE_RECORD_NAMESPACE,
+        RESOURCE_CHANGE_FEED_NAMESPACE,
+        TRACE_NAMESPACE,
+        PENDING_NAMESPACE,
+        INTERNAL_NAMESPACE,
+        SCHEMA_NAMESPACE,
+      ] {
+        let namespace = crate::StoreNamespace::new(crate::QualifiedTag::parse(tag).unwrap());
+        let policy = family_policy(&namespace).unwrap();
+        assert_eq!(policy, family_policy(&namespace).unwrap(), "{tag}");
+        // The canonical-winner contest is exactly the convergent
+        // terminal-record families; the guarded contest covers every
+        // single-record install; everything else is the checkpoint's and
+        // the registers' monotone maxima.
+        match policy.contest() {
+          FamilyContest::CanonicalWinner => {
+            assert!(
+              tag == CLEANUP_NAMESPACE || tag == REVOCATION_NAMESPACE,
+              "unexpected canonical-winner family {tag}"
+            );
+          }
+          FamilyContest::MonotoneMax => {
+            assert!(
+              tag == CHECKPOINT_NAMESPACE
+                || tag == NODE_DESCRIPTOR_NAMESPACE
+                || tag == RESOURCE_RECORD_NAMESPACE
+                || tag == RESOURCE_CHANGE_FEED_NAMESPACE,
+              "unexpected monotone-max family {tag}"
+            );
+          }
+          FamilyContest::GuardedSingleRecord => {}
+        }
+      }
+      let absent = format!("{}-not-a-family", LOCAL_IDENTITY_NAMESPACE);
+      let absent_namespace =
+        crate::StoreNamespace::new(crate::QualifiedTag::parse(&absent).unwrap());
+      assert_eq!(
+        family_policy(&absent_namespace).unwrap_err().kind(),
+        crate::ErrorKind::InvalidInput
+      );
     }
   }
 }

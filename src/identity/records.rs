@@ -222,6 +222,13 @@ pub(crate) async fn persist_terminal_record(
   store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, key: StoreKey,
   encoded: Arc<[u8]>, label: &'static str,
 ) -> Result<()> {
+  // The family's declared contest must be the guarded single-record
+  // install: a family whose slot merges divergent evidence never installs
+  // through this path.
+  require_contest(
+    &namespace,
+    crate::storage::families::FamilyContest::GuardedSingleRecord,
+  )?;
   let snapshot = store.snapshot().await?;
   let expected = match snapshot.get(&namespace, &key).await? {
     Some(existing) => {
@@ -285,6 +292,14 @@ pub(crate) async fn persist_convergent_terminal_record(
   store: &MetadataStore, entropy: &dyn Entropy, namespace: StoreNamespace, key: StoreKey,
   encoded: Arc<[u8]>, label: &'static str, decides: fn(&[u8], &[u8]) -> Result<TerminalWinner>,
 ) -> Result<TerminalInstall> {
+  // The family's declared contest must be the canonical-winner merge: the
+  // decider implements the family's declared competition, and only a
+  // family whose catalog row declares the canonical-winner contest may
+  // converge divergent evidence into its slot.
+  require_contest(
+    &namespace,
+    crate::storage::families::FamilyContest::CanonicalWinner,
+  )?;
   let snapshot = store.snapshot().await?;
   let expected = match snapshot.get(&namespace, &key).await? {
     Some(existing) => {
@@ -305,6 +320,20 @@ pub(crate) async fn persist_convergent_terminal_record(
   )
   .await?;
   Ok(TerminalInstall::Installed)
+}
+
+/// Enforces one family's declared contest: the install helpers replace
+/// implicit behavior with the catalog's declarations, so a helper only
+/// runs against a family whose catalog row declares the contest it
+/// implements.
+fn require_contest(
+  namespace: &StoreNamespace, expected: crate::storage::families::FamilyContest,
+) -> Result<()> {
+  let policy = crate::storage::families::family_policy(namespace)?;
+  if policy.contest() != expected {
+    return Err(Error::invalid_input("metadata family contest"));
+  }
+  Ok(())
 }
 
 /// The commit tail both terminal-record install paths share: one
