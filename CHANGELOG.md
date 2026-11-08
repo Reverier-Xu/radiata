@@ -7,6 +7,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Subscription predicates for resource-change watchers:
+  `SubscriptionPredicate` — a self-contained filter over resource
+  changes (an optional resource-domain set plus an optional label
+  selector reusing the existing selector grammar, reserved resource
+  label keys included) that is also the predicate primitive the Phase D
+  trigger declarations will embed.
+- `EventOptions::predicate` attaches a predicate to a
+  `ResourceChanged` watch: the hub evaluates it emit-side, at the
+  publication site where the committed record's labels are already in
+  hand, and a non-matching event is never delivered to that subscriber
+  (any other event type, and the tag-keyed channel, refuse it).
+- `ResourceChanged::labels` exposes the committed record's full label
+  space on the event.
+- `ResourceWatchOptions` and `NodeHandle::watch_resources_with` push a
+  predicate down into the durable replay: non-matching entries are
+  skipped during the replay scan and the live follow, while the resume
+  position stays based on the record stream, not on matching.
+
 ### Changed
 
 - Route planning replaces per-hop next-hop selection: a `RouteNextHop`

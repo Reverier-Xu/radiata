@@ -778,3 +778,29 @@ async fn resource_labels_never_enable_protocols() {
     node.handle.shutdown().await.unwrap();
   }
 }
+
+/// The tag-keyed channel carries opaque payloads: an
+/// `EventOptions::predicate` has no label space to evaluate there and is
+/// refused with `InvalidInput`, while the same options without a
+/// predicate subscribe normally. The untyped options shape is shared
+/// with the typed watch, but the predicate only has meaning on a
+/// `ResourceChanged` subscription.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_predicate_is_refused_on_the_tag_keyed_channel() {
+  let node = start_node(0, false).await;
+  let tag = radiata::EventTag::parse("example.com/events/pred-check").unwrap();
+  let predicate = radiata::SubscriptionPredicate::new()
+    .domain("example.net")
+    .unwrap();
+  let refused = node
+    .handle
+    .subscribe(tag.clone(), EventOptions::new().predicate(predicate));
+  assert!(
+    matches!(refused, Err(ref error) if error.kind() == ErrorKind::InvalidInput),
+    "a predicate-carrying tag-keyed subscription must be refused"
+  );
+  // The same options without a predicate subscribe normally.
+  assert!(node.handle.subscribe(tag, EventOptions::new()).is_ok());
+
+  node.handle.shutdown().await.unwrap();
+}

@@ -565,7 +565,7 @@ impl NodeHandle {
     if self.runtime.status() != NodeStatus::Running {
       return Err(Error::shutting_down("tag-keyed event channel"));
     }
-    if options.predicate_ref().is_some() {
+    if validate_tagged_watch_options(&options).is_err() {
       // A tagged payload is opaque bytes: there is no label space for a
       // subscription predicate to evaluate, so it fails closed.
       return Err(Error::invalid_input("event subscription predicate"));
@@ -654,9 +654,19 @@ fn validate_typed_watch_options<E: Event>(options: &EventOptions) -> Result<()> 
   Ok(())
 }
 
+/// Validates the tag-keyed subscription's options: a tagged payload is
+/// opaque bytes, so a subscription predicate has no label space to
+/// evaluate and fails closed instead of silently filtering nothing.
+fn validate_tagged_watch_options(options: &EventOptions) -> Result<()> {
+  if options.predicate_ref().is_some() {
+    return Err(Error::invalid_input("event subscription predicate"));
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-  use super::validate_typed_watch_options;
+  use super::{validate_tagged_watch_options, validate_typed_watch_options};
   use crate::{ErrorKind, EventOptions, MemberChanged, ResourceChanged, SubscriptionPredicate};
 
   /// A predicate is only meaningful on a `ResourceChanged` subscription:
@@ -675,5 +685,21 @@ mod tests {
     );
     // Absent predicate: every typed watch, exactly as before.
     assert!(validate_typed_watch_options::<MemberChanged>(&EventOptions::new()).is_ok());
+  }
+
+  /// The tag-keyed channel carries opaque payloads with no label space,
+  /// so a predicate-carrying `EventOptions` is refused there — the
+  /// untyped `EventOptions` shape is shared, but the predicate only has
+  /// meaning on a `ResourceChanged` watch.
+  #[test]
+  fn a_predicate_is_refused_on_the_tag_keyed_channel() {
+    let predicate = SubscriptionPredicate::new().domain("example.net").unwrap();
+    let options = EventOptions::new().predicate(predicate);
+    assert_eq!(
+      validate_tagged_watch_options(&options).unwrap_err().kind(),
+      ErrorKind::InvalidInput
+    );
+    // Absent predicate: the tag-keyed channel accepts the options.
+    assert!(validate_tagged_watch_options(&EventOptions::new()).is_ok());
   }
 }
