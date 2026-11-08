@@ -47,6 +47,10 @@ pub(crate) const RESOURCE_CHANGE_FEED_NAMESPACE: &str =
   "radiata.woooo.tech/metadata/v1/resource-change-feed";
 /// Bounded route-trace metadata per trace.
 pub(crate) const TRACE_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/route-trace";
+/// Durable node-local trigger declarations (time and event trigger
+/// rows). Written only through the core-verb entry, and the reconcile
+/// plane owns no lane for the family, so the rows never replicate.
+pub(crate) const TRIGGER_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/trigger";
 /// Durable pending-transaction journal record per transaction.
 pub(crate) const PENDING_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/pending-transaction";
 /// Storage-internal receipt markers and reference anchors.
@@ -412,7 +416,7 @@ mod catalog {
     KEY_DELETION_INTENT_NAMESPACE, KEY_SEED_NAMESPACE, LEAVE_NAMESPACE, LOCAL_IDENTITY_NAMESPACE,
     MERGE_GRANT_NAMESPACE, NODE_DESCRIPTOR_NAMESPACE, PENDING_NAMESPACE,
     RESOURCE_CHANGE_FEED_NAMESPACE, RESOURCE_RECORD_NAMESPACE, REVOCATION_NAMESPACE,
-    SCHEMA_NAMESPACE, TRACE_NAMESPACE,
+    SCHEMA_NAMESPACE, TRACE_NAMESPACE, TRIGGER_NAMESPACE,
   };
 
   /// Shorthand for the core-verb-gated, core-only policy every
@@ -552,6 +556,17 @@ mod catalog {
         MetadataDomain::Route,
         TRACE_NAMESPACE,
         core_policy(FamilyContest::GuardedSingleRecord, FamilyCleanup::LeaveWipe),
+      ),
+      // Trigger declarations: node policy, never replicated (no lane
+      // owns the namespace), managed by its own flow — a leave wipes the
+      // identity's credentials, not the node's declared triggers.
+      MetadataFamily::new(
+        MetadataDomain::Node,
+        TRIGGER_NAMESPACE,
+        core_policy(
+          FamilyContest::GuardedSingleRecord,
+          FamilyCleanup::StoreHygiene,
+        ),
       ),
       // Storage infrastructure: never swept by identity cleanup.
       MetadataFamily::new(
@@ -763,6 +778,7 @@ mod catalog {
         RESOURCE_RECORD_NAMESPACE,
         RESOURCE_CHANGE_FEED_NAMESPACE,
         TRACE_NAMESPACE,
+        TRIGGER_NAMESPACE,
         PENDING_NAMESPACE,
         INTERNAL_NAMESPACE,
         SCHEMA_NAMESPACE,

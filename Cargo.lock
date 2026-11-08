@@ -893,6 +893,7 @@ dependencies = [
  "hmac",
  "minicbor",
  "proptest",
+ "radiata-cadence",
  "radiata-test-support",
  "rand",
  "rcgen",

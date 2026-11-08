@@ -42,6 +42,10 @@ rand = { version = "0.10", default-features = false, features = [
   "std",
   "sys_rng",
 ] }
+# The cadence pattern grammar drives the time triggers (the
+# `std-time` feature provides the UNIX-second conversion the core's
+# wall-clock seam needs without a time-library dependency).
+radiata-cadence = { path = "cadence", features = ["std-time"] }
 rcgen = { version = "0.14", default-features = false, features = [
   "crypto",
   "aws_lc_rs",

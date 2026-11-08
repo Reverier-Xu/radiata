@@ -184,6 +184,7 @@ pub(crate) const BUILTIN_TAGS: &[&str] = &[
   crate::storage::families::RESOURCE_RECORD_NAMESPACE,
   crate::storage::families::REVOCATION_NAMESPACE,
   crate::storage::families::TRACE_NAMESPACE,
+  crate::storage::families::TRIGGER_NAMESPACE,
   crate::storage::families::SCHEMA_NAMESPACE,
   // protocols — authenticated stream wire contracts.
   "radiata.woooo.tech/protocols/v1/direct-request",
@@ -274,7 +275,7 @@ mod tests {
       if cfg!(feature = "json") { 26 } else { 23 },
     ),
     (CATEGORY_CRYPTO, 8),
-    (CATEGORY_METADATA, 19),
+    (CATEGORY_METADATA, 20),
     (CATEGORY_PROTOCOLS, 3),
     (CATEGORY_FEATURES, 5),
     (CATEGORY_TASKS, 19),

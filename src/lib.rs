@@ -43,6 +43,7 @@ mod sync_common;
 mod task;
 mod time;
 mod transport;
+mod trigger;
 mod view;
 
 /// The bounded fuzz adapters for the canonical decoder/selector fuzz
@@ -79,6 +80,7 @@ pub use node::{
 pub use operation::{
   Event, IdentityReplaced, MemberChanged, NodeRevoked, RecoveryChanged, ResourceChanged,
   ResourceOrigin, ResourceWrite, RouteChanged, SessionChanged, TaggedEvent, TaskChanged,
+  TriggerFired, TriggerSourceKind,
 };
 pub use packet::{
   DeliveryAck, IncomingStream, OutboundStream, RouteHandle, RouteState, RouteStatusView,

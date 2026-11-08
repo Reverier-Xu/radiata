@@ -283,6 +283,46 @@ impl private::Sealed for TaskChanged {}
 
 impl Event for TaskChanged {}
 
+/// What fired a trigger (see [`TriggerFired`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TriggerSourceKind {
+  /// The trigger's cadence pattern came due against the wall clock.
+  Time,
+  /// The trigger's subscription predicate matched a resource change on
+  /// the live change stream.
+  Event,
+}
+
+/// One trigger fired and admitted its target: emitted after the target
+/// task's admission succeeded, once per admitted run (a coalesced or
+/// skipped overlap never emits). Transient like every node event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TriggerFired {
+  trigger: String,
+  source: TriggerSourceKind,
+}
+
+impl TriggerFired {
+  /// The trigger that fired: its registered name.
+  pub fn trigger(&self) -> &str {
+    &self.trigger
+  }
+
+  /// What fired it.
+  pub const fn source(&self) -> TriggerSourceKind {
+    self.source
+  }
+
+  pub(crate) const fn new(trigger: String, source: TriggerSourceKind) -> Self {
+    Self { trigger, source }
+  }
+}
+
+impl private::Sealed for TriggerFired {}
+
+impl Event for TriggerFired {}
+
 /// One caller-published event on the node's tag-keyed channel: the
 /// [`EventTag`] key it was published under and its opaque payload bytes.
 /// The core never inspects the payload; the tag is the publish/subscribe
