@@ -1,5 +1,6 @@
 use tokio::sync::{mpsc, oneshot, watch};
 
+use super::task_manager::TaskClient;
 use crate::{
   Error, LocalNodeView, NodeId, NodeStatus, Result, RouteStatusView, ShutdownOutcome,
   ShutdownReason,
@@ -176,6 +177,25 @@ impl RuntimeClient {
       routes,
       packet,
       tasks: None,
+    }
+  }
+
+  /// An internal engine client: the task surface and lifecycle watch
+  /// without the node-command sender, so a runtime-owned engine holding
+  /// it (the trigger dispatch engine's reconciler contexts) never keeps
+  /// the supervisor's command channel open after the last external
+  /// `NodeHandle` drops — the drop-detection contract stays with the
+  /// caller's handles.
+  pub(crate) fn internal_engine_client(
+    state: watch::Receiver<LifecycleSnapshot>, routes: RouteTable,
+    packet: mpsc::Sender<OutboundRequest>, tasks: TaskClient,
+  ) -> Self {
+    Self {
+      control: None,
+      state,
+      routes,
+      packet,
+      tasks: Some(tasks),
     }
   }
 

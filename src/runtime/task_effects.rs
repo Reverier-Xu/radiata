@@ -29,7 +29,6 @@ use super::{
 };
 use crate::{
   Endpoint, Error, MergeView, NodeConfig, NodeId, PublicKey, Result, RevokeOutcome, Task, TaskKind,
-  TaskOutput,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   identity::{credential::MergeCredential, lifecycle::LocalIdentityContext},
@@ -38,11 +37,14 @@ use crate::{
     SessionDriver,
     stream::{SessionPacketContext, SessionTable, retire_session},
   },
-  task::{CoreTaskKind, output::{
-    encode_checkpoint, encode_connect, encode_join, encode_leave, encode_listen, encode_member,
-    encode_receipt_retention, encode_recovery, encode_resource_mutation, encode_revoke,
-    encode_unit,
-  }},
+  task::{
+    CoreTaskKind,
+    output::{
+      encode_checkpoint, encode_connect, encode_join, encode_leave, encode_listen, encode_member,
+      encode_receipt_retention, encode_recovery, encode_resource_mutation, encode_revoke,
+      encode_unit,
+    },
+  },
 };
 
 /// The node's tracked connection tasks: the kept session tasks of the
@@ -1548,7 +1550,7 @@ async fn reconcile_core_controller(
     _ => return Err(Error::internal("controller kind")),
   };
   match outcome {
-    Ok(()) => Ok(EffectOutcome::new(TaskOutput::new(Arc::from([])))),
+    Ok(()) => Ok(EffectOutcome::new(encode_unit()?)),
     Err(error) => {
       tracing::warn!(task = %kind, kind = ?error.kind(), "controller pass failed");
       Err(error)
@@ -1585,13 +1587,20 @@ pub(crate) async fn register_trigger(
         &row,
       )
       .await?;
-      Ok(EffectOutcome::new(TaskOutput::new(Arc::from([]))))
+      Ok(EffectOutcome::new(encode_unit()?))
     })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::REGISTER_TRIGGER, TaskPayload::None), effect)
+    .submit(
+      TaskSpec::new(TaskKind::REGISTER_TRIGGER, TaskPayload::None),
+      effect,
+    )
     .await?;
-  Ok(Task::from_parts(id, TaskKind::REGISTER_TRIGGER, tasks.observer.clone()))
+  Ok(Task::from_parts(
+    id,
+    TaskKind::REGISTER_TRIGGER,
+    tasks.observer.clone(),
+  ))
 }
 
 /// Admits one trigger declaration removal by name. Idempotent: removing
@@ -1606,13 +1615,20 @@ pub(crate) async fn remove_trigger(tasks: &TaskClient, name: String) -> Result<T
         &name,
       )
       .await?;
-      Ok(EffectOutcome::new(TaskOutput::new(Arc::from([]))))
+      Ok(EffectOutcome::new(encode_unit()?))
     })
   });
   let id = tasks
-    .submit(TaskSpec::new(TaskKind::REMOVE_TRIGGER, TaskPayload::None), effect)
+    .submit(
+      TaskSpec::new(TaskKind::REMOVE_TRIGGER, TaskPayload::None),
+      effect,
+    )
     .await?;
-  Ok(Task::from_parts(id, TaskKind::REMOVE_TRIGGER, tasks.observer.clone()))
+  Ok(Task::from_parts(
+    id,
+    TaskKind::REMOVE_TRIGGER,
+    tasks.observer.clone(),
+  ))
 }
 
 /// The listen effect: the moved supervisor body — bind the advertised

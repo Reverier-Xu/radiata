@@ -585,8 +585,7 @@ impl Triggers {
   /// subscriptions use), `target` the qualified tag of a registered
   /// caller-owned task reconciler.
   pub async fn register_event(
-    self, name: &str, predicate: crate::SubscriptionPredicate,
-    target: crate::QualifiedTag,
+    self, name: &str, predicate: crate::SubscriptionPredicate, target: crate::QualifiedTag,
   ) -> Result<Task<()>> {
     let row = crate::trigger::prepare_event_trigger(name, predicate, target.clone())?;
     crate::trigger::validate_trigger_target(&self.extensions, &target)?;

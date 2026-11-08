@@ -36,8 +36,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   atomicity); and `adapters::memory_store()` is the fully in-memory
   reference backend (process-lifetime durability only), which doubles
   as the contract suite's oracle.
+- Trigger declarations as durable node-local rows:
+  `NodeHandle::triggers()` registers a time trigger (a cadence pattern
+  in a declared `Z`/fixed-offset frame — the core resolves no local
+  timezone) or an event trigger (a `SubscriptionPredicate` over the
+  live resource-change stream, evaluated with the same emit-side
+  predicate evaluation the watch subscriptions use), each targeting a
+  registered caller-owned task reconciler kind. Rows live in a
+  node-local metadata family no reconcile lane owns, so declarations
+  never replicate; time triggers keep a durable per-row watermark whose
+  missed windows coalesce to one run; event-trigger fires skip while
+  the target run is in flight. Each admitted run emits the additive
+  `TriggerFired` event.
+- Core sweeps, the checkpoint-gated tombstone collection, and the
+  trigger evaluation pass run as core-owned controller tasks on the
+  existing `CustomTaskSpec`/`TaskReconciler` machinery: their own
+  `Controller` slot class (budget via
+  `NodeConfig::with_task_reconcile_controller_slots`), bounded
+  observable task records per pass, and the shutdown drain honoring the
+  declared policy. The sweep engines and the checkpoint gate are
+  unchanged, so swept and retained sets are identical.
 
 ### Changed
+
+- The Phase C deferral of per-row cleanup-policy labels on the
+  reconcile wire is final for 0.1.0: the Phase D consumer turned out
+  node-local — trigger rows live in a family no reconcile lane owns,
+  and controller runs are in-memory task records — so no replicated row
+  carries a per-row policy label that would ever need relabeling on the
+  wire. The declaration-driven auto-stamp at seal remains the sole
+  label carrier, and extending the tombstones-lane wire (with its
+  cross-version fail-closed decode amendment) would spend envelope
+  bytes and compatibility complexity with no consumer.
 
 - Persisted metadata rows unify onto one row envelope — name, labels,
   version, payload (a pre-release format amendment): the identity

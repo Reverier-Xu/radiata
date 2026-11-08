@@ -142,7 +142,10 @@ async fn dispatch_fire(
   }
   match handle
     .tasks()
-    .submit(crate::CustomTaskSpec::new(fire.target.clone(), LabelSet::new()))
+    .submit(crate::CustomTaskSpec::new(
+      fire.target.clone(),
+      LabelSet::new(),
+    ))
     .await
   {
     Ok(task) => {

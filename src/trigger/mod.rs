@@ -371,7 +371,12 @@ pub(crate) fn prepare_time_trigger(
 pub(crate) fn prepare_event_trigger(
   name: &str, predicate: SubscriptionPredicate, target: QualifiedTag,
 ) -> Result<TriggerRow> {
-  TriggerRow::new(name.to_owned(), TriggerSource::Event { predicate }, target, 0)
+  TriggerRow::new(
+    name.to_owned(),
+    TriggerSource::Event { predicate },
+    target,
+    0,
+  )
 }
 
 /// The next due fire of `pattern` at or after `start_seconds` (inclusive,
@@ -635,6 +640,25 @@ mod tests {
     )
     .await
     .expect("store")
+  }
+
+  /// The node-local pin: no reconcile lane owns the trigger namespace,
+  /// so no lane can ever carry a trigger row between nodes, and the
+  /// store's write seam refuses external writers for the core-verb-gated
+  /// family — the rows exist only on the node that declared them.
+  #[test]
+  fn trigger_rows_are_node_local() {
+    for lane in crate::reconcile::wire::LaneId::all() {
+      assert!(
+        !lane.namespaces().contains(&TRIGGER_NAMESPACE),
+        "lane {lane:?} must not own the trigger namespace"
+      );
+    }
+    let namespace = namespace().expect("namespace");
+    assert!(
+      !crate::storage::families::external_write_admitted(&namespace).expect("admission"),
+      "only the core-verb entry may write trigger rows"
+    );
   }
 
   /// A trigger row round-trips its canonical body exactly, for both

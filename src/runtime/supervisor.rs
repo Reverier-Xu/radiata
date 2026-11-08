@@ -336,6 +336,12 @@ pub(crate) async fn spawn_runtime(
   // teardown that already began (see `LeaveSignal`). The effect's half
   // rides the operation planes, so it is created before them.
   let (leave_signal, leave_signals) = mpsc::channel(LEAVE_SIGNAL_CAPACITY);
+  // The trigger engine's shared state is installed before the operation
+  // planes are built: the evaluation pass reaches the fire queue through
+  // them, and the dispatch engine owns the receiving end.
+  let (trigger_fires, trigger_fires_rx) =
+    tokio::sync::mpsc::channel(crate::trigger::TRIGGER_FIRE_QUEUE);
+  dependencies.triggers = Some(crate::trigger::TriggerState::new(trigger_fires));
   // The node-shared operation handles are built here rather than inside
   // the supervisor: the supervisor's own fields, the verb effects, and
   // every node handle must read the same session driver (one credential
@@ -349,12 +355,6 @@ pub(crate) async fn spawn_runtime(
     leave_signal.clone(),
   )?;
   dependencies.operations = Some(Arc::clone(&operations));
-  // The trigger engine's shared state: the fire queue's receiving end is
-  // handed to the engine task below, the state rides the operation planes
-  // (the evaluation pass reaches it through them).
-  let (trigger_fires, trigger_fires_rx) =
-    tokio::sync::mpsc::channel(crate::trigger::TRIGGER_FIRE_QUEUE);
-  dependencies.triggers = Some(crate::trigger::TriggerState::new(trigger_fires));
   // The task manager is spawned here, beside the supervisor and before the
   // node is marked running: the client side rides the node handle (so an
   // admitted task always has a live manager) and the teardown handle rides
@@ -367,21 +367,29 @@ pub(crate) async fn spawn_runtime(
   })?;
   dependencies.task_manager = Some(task_manager);
   dependencies.tasks = Some(task_client.clone());
+  let task_client_for_engine = task_client.clone();
   let client = RuntimeClient::new(
     control_tx,
-    state_rx,
-    routes,
+    state_rx.clone(),
+    routes.clone(),
     packet_tx.clone(),
     Some(task_client.clone()),
   );
   // The trigger dispatch engine: one long-lived task over the fire queue
   // and the live change stream, exiting on the incarnation's shutdown
-  // signal. Its reconciler contexts ride an ordinary public node handle.
+  // signal. Its reconciler contexts ride an ordinary public node handle
+  // over the internal engine client — no node-command sender, so holding
+  // it never delays the last-handle-drop shutdown detection.
   runtime.spawn(super::trigger_engine::run_trigger_engine(
     operations,
     task_client,
     crate::NodeHandle::new(
-      client.clone(),
+      RuntimeClient::internal_engine_client(
+        state_rx,
+        routes,
+        packet_tx.clone(),
+        task_client_for_engine,
+      ),
       dependencies.entropy.clone(),
       dependencies.extensions.clone(),
       dependencies.events.clone(),
