@@ -366,7 +366,7 @@ pub(crate) async fn issue_checkpoint_ctx(
     }
   }
   let expected = crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
-  let transaction = context.store().prepare_transaction(
+  let transaction = context.store().prepare_core_verb_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![StoreOperation::Put {
@@ -452,7 +452,7 @@ pub(crate) async fn persist_checkpoint_ctx(
     &crate::LabelSet::new(),
     Arc::from(checkpoint.encode()?),
   )?;
-  let transaction = store.prepare_transaction(
+  let transaction = store.prepare_core_verb_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![StoreOperation::Put {
@@ -570,7 +570,7 @@ mod tests {
     );
     let transaction = context
       .store()
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         crate::TransactionId::generate(entropy).unwrap(),
         snapshot.revision().clone(),
         vec![StoreOperation::Put {

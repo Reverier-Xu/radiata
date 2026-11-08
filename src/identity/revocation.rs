@@ -306,7 +306,7 @@ pub(crate) async fn revoke_binding_ctx(
     }
     None => (StoreExpectation::Absent, RevocationTransition::Revoked),
   };
-  let transaction = store.prepare_transaction(
+  let transaction = store.prepare_core_verb_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![
@@ -440,7 +440,7 @@ pub(crate) async fn purge_revocation_ctx(
   let Some(existing) = snapshot.get(&namespace, &store_key).await? else {
     return Ok(());
   };
-  let transaction = store.prepare_transaction(
+  let transaction = store.prepare_core_verb_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![StoreOperation::Delete {
@@ -531,7 +531,7 @@ mod tests {
     let (namespace, store_key) = records::identity_binding_key(node).unwrap();
     let snapshot = store.snapshot().await.unwrap();
     let transaction = store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         crate::TransactionId::generate(&SystemEntropy).unwrap(),
         snapshot.revision().clone(),
         vec![crate::StoreOperation::Put {
@@ -983,7 +983,7 @@ mod crash {
     let (namespace, store_key) = records::identity_binding_key(&subject()).unwrap();
     let snapshot = store.snapshot().await.unwrap();
     let transaction = store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         crate::TransactionId::generate(&SystemEntropy).unwrap(),
         snapshot.revision().clone(),
         vec![crate::StoreOperation::Put {

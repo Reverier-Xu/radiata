@@ -263,7 +263,7 @@ pub(crate) mod store {
       return Err(crate::Error::revoked("trust binding adoption"));
     }
     let binding = crate::identity::records::IdentityBindingV1::new(node.clone(), key.clone());
-    let transaction = store.prepare_transaction(
+    let transaction = store.prepare_core_verb_transaction(
       TransactionId::generate(entropy)?,
       snapshot.revision().clone(),
       vec![StoreOperation::Put {

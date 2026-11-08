@@ -270,7 +270,44 @@ pub(super) enum ReceiptCleanupOutcome {
 }
 
 impl MetadataStore {
+  /// The external-shape write entry: prepares one transaction whose
+  /// operations may touch only the families whose declared admission
+  /// permits a non-core-verb writer (the multiwriter and node-local
+  /// families). Every core-verb-gated family — and every namespace
+  /// outside the closed family catalog — refuses with the typed
+  /// admission denial, fail-closed: an external write attempt on a core
+  /// family changes nothing. Core flows (the crate's own verbs) enter
+  /// through [`Self::prepare_core_verb_transaction`]; the receipt and
+  /// journal machinery ([`Self::prepare_transaction_with_receipt_changes`],
+  /// [`Self::prepare_journaled_transaction`]) is core-only by construction
+  /// and never faces an external-shape writer.
   pub(crate) fn prepare_transaction(
+    &self, id: TransactionId, base_revision: StoreRevision, caller_operations: Vec<StoreOperation>,
+  ) -> crate::Result<PreparedTransaction> {
+    if caller_operations
+      .iter()
+      .any(operation_uses_reserved_namespace)
+    {
+      return Err(Error::invalid_input("metadata storage reserved namespace"));
+    }
+    if caller_operations
+      .iter()
+      .any(|operation| !operation_externally_admitted(operation))
+    {
+      return Err(Error::permission_denied("metadata family admission"));
+    }
+    prepare_internal_transaction(id, base_revision, caller_operations)
+  }
+
+  /// The core-verb write entry: the same preparation as the external
+  /// shape, plus the core verbs' authority over every catalog family.
+  /// The name is the capability: a write to a core-verb-gated family
+  /// must state its core-verb context here, so the gate cannot be
+  /// bypassed by a caller that reaches for the plain entry. The type is
+  /// crate-private end to end (the store, the entries, and the
+  /// operations are all `pub(crate)`), so no public-API caller can
+  /// reach either entry.
+  pub(crate) fn prepare_core_verb_transaction(
     &self, id: TransactionId, base_revision: StoreRevision, caller_operations: Vec<StoreOperation>,
   ) -> crate::Result<PreparedTransaction> {
     if caller_operations
@@ -1468,6 +1505,20 @@ pub(super) fn operation_uses_reserved_namespace(operation: &StoreOperation) -> b
   }
 }
 
+/// Whether one operation's namespace admits a non-core-verb writer: the
+/// family catalog's declared admission decides, and an unknown namespace
+/// denies (fail-closed — only catalog families carry rows).
+fn operation_externally_admitted(operation: &StoreOperation) -> bool {
+  match operation {
+    StoreOperation::Check { namespace, .. }
+    | StoreOperation::Put { namespace, .. }
+    | StoreOperation::Delete { namespace, .. } => {
+      super::families::external_write_admitted(namespace).unwrap_or(false)
+    }
+    StoreOperation::ForgetReceipt { .. } => false,
+  }
+}
+
 pub(crate) fn internal_namespace() -> crate::Result<StoreNamespace> {
   super::families::namespace(INTERNAL_NAMESPACE)
 }
@@ -1703,7 +1754,7 @@ mod receipt_retention_tests {
   async fn commit_and_anchor(store: &MetadataStore, index: u64) {
     let snapshot = store.snapshot().await.unwrap();
     let prepared = store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         transaction_id(index),
         snapshot.revision().clone(),
         vec![StoreOperation::Put {
@@ -2167,7 +2218,7 @@ mod receipt_retention_tests {
     ));
     let snapshot = store.snapshot().await.unwrap();
     let prepared = store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         transaction_id(602),
         snapshot.revision().clone(),
         vec![StoreOperation::Put {

@@ -131,7 +131,7 @@ async fn seed_local_families(store: &MetadataStore, marker: &[u8]) {
     })
     .collect();
   let prepared = store
-    .prepare_transaction(
+    .prepare_core_verb_transaction(
       crate::storage::test_util::transaction_id(877),
       snapshot.revision().clone(),
       operations,

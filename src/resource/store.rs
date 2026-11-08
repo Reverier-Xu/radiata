@@ -50,6 +50,25 @@ fn register_row_version(record: &ResourceRecordV1) -> crate::storage::RowVersion
   })
 }
 
+/// The public read seam's visibility gate: the resource register is
+/// readable through the crate's public read APIs by declaration (the
+/// family's `PublicRead` visibility), and the gate fails closed if the
+/// catalog ever declares otherwise — a public read helper refuses a
+/// family whose declared visibility does not admit it. The core-only
+/// families keep their own core read helpers, open where they are open
+/// today.
+pub(crate) fn require_public_read() -> Result<()> {
+  let namespace = namespace()?;
+  if crate::storage::families::family_policy(&namespace)?.visibility()
+    != crate::storage::families::FamilyVisibility::PublicRead
+  {
+    return Err(crate::Error::permission_denied(
+      "metadata family visibility",
+    ));
+  }
+  Ok(())
+}
+
 /// The outcome of one conditional resource commit.
 #[derive(Debug)]
 pub(crate) enum ResourceCommitOutcome {

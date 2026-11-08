@@ -126,7 +126,7 @@ pub(crate) async fn ensure_self_binding(
   if let Some(existing) = snapshot.get(&namespace, &key).await? {
     return expect_exact_self_binding(&RowEnvelope::open(existing.as_bytes())?, identity);
   }
-  let transaction = store.prepare_transaction(
+  let transaction = store.prepare_core_verb_transaction(
     TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![StoreOperation::Put {

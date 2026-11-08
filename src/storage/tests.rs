@@ -794,3 +794,167 @@ async fn commit_inside_section(
 ) -> Result<CommitOutcome> {
   store.commit(transaction).await
 }
+
+/// The enforced family admission at the store's write seam: the plain
+/// (external-shape) prepare entry refuses every core-verb-gated family —
+/// and every namespace outside the closed catalog — with the typed
+/// admission denial, while the multiwriter register and the node-local
+/// feed go through, and the core-verb entry keeps its authority over
+/// every catalog family.
+#[tokio::test]
+async fn the_plain_write_entry_refuses_core_verb_gated_families() {
+  let factory: Arc<dyn StorageFactory> = Arc::new(crate::storage::contract::ReferenceFactory::new(
+    complete_capabilities(),
+  ));
+  let store = MetadataStore::open(&factory, std::time::Duration::from_secs(30))
+    .await
+    .unwrap();
+  let put = |namespace: StoreNamespace| StoreOperation::Put {
+    namespace: namespace.clone(),
+    key: StoreKey::new(Arc::from(b"admission-probe".as_slice())),
+    expected: StoreExpectation::Absent,
+    value: StoreValue::new(Arc::from(b"probe".to_vec())),
+  };
+  let descriptor_namespace =
+    crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
+      .unwrap();
+  let register_namespace =
+    crate::storage::families::namespace(crate::storage::families::RESOURCE_RECORD_NAMESPACE)
+      .unwrap();
+  let feed_namespace =
+    crate::storage::families::namespace(crate::storage::families::RESOURCE_CHANGE_FEED_NAMESPACE)
+      .unwrap();
+  let foreign_namespace =
+    StoreNamespace::new(QualifiedTag::parse("radiata.woooo.tech/metadata/not-a-family").unwrap());
+
+  let snapshot = store.snapshot().await.unwrap();
+  let base = snapshot.revision().clone();
+  drop(snapshot);
+
+  // A core family refuses the external-shape write.
+  let error = store
+    .prepare_transaction(
+      transaction_id(1),
+      base.clone(),
+      vec![put(descriptor_namespace.clone())],
+    )
+    .unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::PermissionDenied, "{error:?}");
+
+  // So does a namespace outside the closed catalog (fail closed).
+  let error = store
+    .prepare_transaction(
+      transaction_id(2),
+      base.clone(),
+      vec![put(foreign_namespace)],
+    )
+    .unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::PermissionDenied, "{error:?}");
+
+  // The multiwriter register and the node-local feed admit it, and the
+  // commits land.
+  for (index, namespace) in [
+    (3_u64, register_namespace.clone()),
+    (4, feed_namespace.clone()),
+  ] {
+    let revision = store.snapshot().await.unwrap().revision().clone();
+    let prepared = store
+      .prepare_transaction(transaction_id(index), revision, vec![put(namespace)])
+      .unwrap();
+    assert!(matches!(
+      store.commit(prepared).await.unwrap(),
+      CommitOutcome::Committed(_)
+    ));
+  }
+
+  // The core-verb entry keeps its authority over the same core family.
+  let prepared = store
+    .prepare_core_verb_transaction(
+      transaction_id(5),
+      store.snapshot().await.unwrap().revision().clone(),
+      vec![put(descriptor_namespace.clone())],
+    )
+    .unwrap();
+  assert!(matches!(
+    store.commit(prepared).await.unwrap(),
+    CommitOutcome::Committed(_)
+  ));
+  let stored = store
+    .snapshot()
+    .await
+    .unwrap()
+    .get(
+      &crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
+        .unwrap(),
+      &StoreKey::new(Arc::from(b"admission-probe".as_slice())),
+    )
+    .await
+    .unwrap();
+  assert!(stored.is_some(), "the core-verb write landed");
+
+  // Deletes and expectation checks gate exactly like puts: a check on a
+  // core family through the external shape refuses.
+  let error = store
+    .prepare_transaction(
+      transaction_id(6),
+      store.snapshot().await.unwrap().revision().clone(),
+      vec![StoreOperation::Check {
+        namespace: descriptor_namespace,
+        key: StoreKey::new(Arc::from(b"admission-probe".as_slice())),
+        expected: StoreExpectation::Absent,
+      }],
+    )
+    .unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::PermissionDenied, "{error:?}");
+}
+
+/// The catalog's admission declarations are the gate's source: exactly
+/// the two resource namespaces admit external-shape writers, and every
+/// other family is core-verb-gated.
+#[test]
+fn the_catalog_admits_external_writes_only_for_the_resource_namespaces() {
+  for family in crate::storage::families::metadata_families() {
+    let namespace = family.namespace().unwrap();
+    let admitted = crate::storage::families::external_write_admitted(&namespace).unwrap();
+    assert_eq!(
+      admitted,
+      matches!(
+        family.namespace_tag(),
+        crate::storage::families::RESOURCE_RECORD_NAMESPACE
+          | crate::storage::families::RESOURCE_CHANGE_FEED_NAMESPACE
+      ),
+      "family {}",
+      family.namespace_tag()
+    );
+  }
+  let unknown =
+    StoreNamespace::new(QualifiedTag::parse("radiata.woooo.tech/metadata/not-a-family").unwrap());
+  assert_eq!(
+    crate::storage::families::external_write_admitted(&unknown)
+      .unwrap_err()
+      .kind(),
+    ErrorKind::InvalidInput,
+    "an unknown namespace fails closed outside the catalog"
+  );
+}
+
+/// The public read seam's visibility gate: the resource register is
+/// declared publicly readable, so the gate admits the public read
+/// helpers; a core-only family keeps its own core read helpers.
+#[test]
+fn the_resource_register_is_declared_publicly_readable() {
+  crate::resource::store::require_public_read().unwrap();
+
+  // The declaration itself is pinned: exactly the resource register
+  // carries PublicRead visibility.
+  for family in crate::storage::families::metadata_families() {
+    let public_read =
+      family.policy().visibility() == crate::storage::families::FamilyVisibility::PublicRead;
+    assert_eq!(
+      public_read,
+      family.namespace_tag() == crate::storage::families::RESOURCE_RECORD_NAMESPACE,
+      "family {}",
+      family.namespace_tag()
+    );
+  }
+}

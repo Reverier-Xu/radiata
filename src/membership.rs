@@ -394,7 +394,7 @@ pub(crate) mod store {
       descriptor.labels(),
       Arc::from(descriptor.encode()?),
     )?;
-    let transaction = store.prepare_transaction(
+    let transaction = store.prepare_core_verb_transaction(
       TransactionId::generate(entropy)?,
       snapshot.revision().clone(),
       vec![StoreOperation::Put {
@@ -567,7 +567,7 @@ pub(crate) mod store {
       if operations.is_empty() {
         return Ok((applied, skipped));
       }
-      let transaction = store.prepare_transaction(
+      let transaction = store.prepare_core_verb_transaction(
         TransactionId::generate(entropy)?,
         snapshot.revision().clone(),
         operations,
@@ -859,7 +859,7 @@ mod tests {
     let key = crate::StoreKey::new(Arc::from(node(1).as_str().as_bytes().to_vec()));
     let snapshot = store.snapshot().await.unwrap();
     let transaction = store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         crate::TransactionId::generate(&crate::api::SystemEntropy).unwrap(),
         snapshot.revision().clone(),
         vec![crate::StoreOperation::Put {
@@ -915,7 +915,7 @@ mod tests {
     let key = crate::StoreKey::new(Arc::from(node(1).as_str().as_bytes().to_vec()));
     let snapshot = store.snapshot().await.unwrap();
     let transaction = store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         crate::TransactionId::generate(&crate::api::SystemEntropy).unwrap(),
         snapshot.revision().clone(),
         vec![crate::StoreOperation::Put {

@@ -117,6 +117,9 @@ impl Supervisor {
   pub(super) async fn select_resources(
     &mut self, selector: &crate::Selector, cursor: Option<crate::PageCursor>, limit: usize,
   ) -> Result<crate::ResourcePage> {
+    // The public read seam consults the family's declared visibility
+    // before reading (fail-closed; see `resource::store::require_public_read`).
+    crate::resource::store::require_public_read()?;
     crate::resource::select::select_page_ctx(
       self.context()?.store(),
       selector,
@@ -139,6 +142,9 @@ impl Supervisor {
   pub(super) async fn get_resource(
     &mut self, name: &crate::ResourceName,
   ) -> Result<Option<crate::ResourceView>> {
+    // The public read seam consults the family's declared visibility
+    // before reading (fail-closed; see `resource::store::require_public_read`).
+    crate::resource::store::require_public_read()?;
     let record = crate::resource::store::read_record_ctx(self.context()?.store(), name).await?;
     Ok(match record {
       Some(record) if !record.removed() => Some(crate::resource::select::resource_view(&record)),

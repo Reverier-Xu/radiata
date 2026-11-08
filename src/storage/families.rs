@@ -71,7 +71,8 @@ pub(crate) fn namespace(tag: &str) -> crate::Result<crate::StoreNamespace> {
 /// through the catalog itself (iterate [`metadata_families`]) instead of
 /// by copying namespace lists.
 pub(crate) use catalog::{
-  FamilyCleanup, FamilyContest, FamilyPolicy, MetadataDomain, MetadataFamily, metadata_families,
+  FamilyAdmission, FamilyCleanup, FamilyContest, FamilyPolicy, FamilyVisibility, MetadataDomain,
+  MetadataFamily, metadata_families,
 };
 
 /// The declared policy of one catalog family, resolved by namespace: the
@@ -83,6 +84,18 @@ pub(crate) fn family_policy(namespace: &crate::StoreNamespace) -> crate::Result<
     .find(|family| family.namespace_tag() == namespace.as_str())
     .map(MetadataFamily::policy)
     .ok_or_else(|| crate::Error::invalid_input("metadata family policy"))
+}
+
+/// Whether one namespace admits a write that does not originate from a
+/// core verb context: only the multiwriter and node-local families do.
+/// A core-verb-gated family refuses such writes (the store's plain
+/// prepare entry maps this to the typed denial), and an unknown
+/// namespace refuses with it — only catalog families carry rows.
+pub(crate) fn external_write_admitted(namespace: &crate::StoreNamespace) -> crate::Result<bool> {
+  Ok(!matches!(
+    family_policy(namespace)?.admission(),
+    FamilyAdmission::CoreVerbGated
+  ))
 }
 
 mod catalog {
@@ -183,18 +196,16 @@ mod catalog {
   }
 
   /// The declared policy of one metadata family: the four aspects the
-  /// storage contract and later phases consume. Declared per family at
-  /// the catalog rows, so a new family is correct by declaration instead
-  /// of by consumer edits. The admission and visibility aspects are read
-  /// by their consumer phases (node-local exclusion generalization,
-  /// public read scoping); the cleanup aspect drives the leave wipe scope
-  /// today.
+  /// storage contract and the enforcement seams consume. Declared per
+  /// family at the catalog rows, so a new family is correct by
+  /// declaration instead of by consumer edits. The admission aspect
+  /// gates the store's write seam (the plain prepare entry refuses
+  /// core-verb-gated families), the visibility aspect gates the public
+  /// read helpers, and the cleanup aspect drives the leave wipe scope.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   pub(crate) struct FamilyPolicy {
     contest: FamilyContest,
-    #[allow(dead_code)]
     admission: FamilyAdmission,
-    #[allow(dead_code)]
     visibility: FamilyVisibility,
     cleanup: FamilyCleanup,
   }
@@ -215,6 +226,14 @@ mod catalog {
 
     pub(crate) const fn contest(&self) -> FamilyContest {
       self.contest
+    }
+
+    pub(crate) const fn admission(&self) -> FamilyAdmission {
+      self.admission
+    }
+
+    pub(crate) const fn visibility(&self) -> FamilyVisibility {
+      self.visibility
     }
 
     pub(crate) const fn cleanup(&self) -> FamilyCleanup {

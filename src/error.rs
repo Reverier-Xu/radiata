@@ -174,6 +174,17 @@ impl Error {
     }
   }
 
+  /// The admission denial of a policy-gated seam: the caller's write does
+  /// not originate from a context the target's declared policy admits
+  /// (the storage catalog's core-verb-gated families refusing a
+  /// non-core-verb writer), and no retry by the same caller changes it.
+  pub(crate) fn permission_denied(context: impl Into<Cow<'static, str>>) -> Self {
+    Self {
+      kind: ErrorKind::PermissionDenied,
+      context: context.into(),
+    }
+  }
+
   pub(crate) fn not_trusted(context: impl Into<Cow<'static, str>>) -> Self {
     Self {
       kind: ErrorKind::NotTrusted,

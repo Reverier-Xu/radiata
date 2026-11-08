@@ -292,7 +292,7 @@ pub(crate) async fn put_trace(
   let key = key(&record.trace_id);
   let snapshot = store.snapshot().await?;
   let expected = crate::provider::snapshot_expectation(snapshot.as_ref(), &space, &key).await?;
-  let transaction = store.prepare_transaction(
+  let transaction = store.prepare_core_verb_transaction(
     crate::TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     vec![crate::StoreOperation::Put {
@@ -491,7 +491,7 @@ async fn commit_batch(
 ) -> Result<usize> {
   let count = operations.len();
   let snapshot = store.snapshot().await?;
-  let transaction = store.prepare_transaction(
+  let transaction = store.prepare_core_verb_transaction(
     crate::TransactionId::generate(entropy)?,
     snapshot.revision().clone(),
     operations,
@@ -699,7 +699,7 @@ mod tests {
     let encoded = record.encode().unwrap();
     let snapshot = store.snapshot().await.unwrap();
     let transaction = store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         crate::TransactionId::generate(&SystemEntropy).unwrap(),
         snapshot.revision().clone(),
         vec![crate::StoreOperation::Put {

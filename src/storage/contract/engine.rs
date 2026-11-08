@@ -29,7 +29,7 @@ async fn storage_contract_prepared_transactions_are_atomic_idempotent_and_perman
   let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
   let snapshot = store.snapshot().await.unwrap();
   let prepared = store
-    .prepare_transaction(
+    .prepare_core_verb_transaction(
       contract_transaction_id(1),
       snapshot.revision().clone(),
       vec![
@@ -132,7 +132,7 @@ async fn storage_contract_prepared_transactions_are_atomic_idempotent_and_perman
     FORGOTTEN_MARKER_VALUE,
   );
   let reused = store
-    .prepare_transaction(
+    .prepare_core_verb_transaction(
       target.transaction().clone(),
       forgotten_snapshot.revision().clone(),
       vec![StoreOperation::Put {
@@ -232,7 +232,7 @@ async fn storage_contract_retention_sweep_forgets_only_past_deadline_anchored_re
   let store = open_engine(&factory, Duration::from_secs(10), Arc::clone(&clock)).await;
   let snapshot = store.snapshot().await.unwrap();
   let prepared = store
-    .prepare_transaction(
+    .prepare_core_verb_transaction(
       contract_transaction_id(20),
       snapshot.revision().clone(),
       vec![StoreOperation::Put {
@@ -498,7 +498,7 @@ async fn storage_contract_reserved_injection_duplicates_corruption_and_overflow_
   let snapshot = store.snapshot().await.unwrap();
   assert_eq!(
     store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         contract_transaction_id(71),
         snapshot.revision().clone(),
         vec![StoreOperation::Put {
@@ -514,7 +514,7 @@ async fn storage_contract_reserved_injection_duplicates_corruption_and_overflow_
   );
   assert_eq!(
     store
-      .prepare_transaction(
+      .prepare_core_verb_transaction(
         contract_transaction_id(711),
         snapshot.revision().clone(),
         vec![StoreOperation::ForgetReceipt {

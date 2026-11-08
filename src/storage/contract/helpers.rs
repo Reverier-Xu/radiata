@@ -55,7 +55,7 @@ pub(crate) async fn prepare_contract_put(
 ) -> PreparedTransaction {
   let snapshot = store.snapshot().await.unwrap();
   store
-    .prepare_transaction(
+    .prepare_core_verb_transaction(
       contract_transaction_id(transaction),
       snapshot.revision().clone(),
       vec![StoreOperation::Put {
@@ -73,7 +73,7 @@ pub(crate) async fn commit_target(
 ) -> (PreparedTransaction, ReceiptIdentity) {
   let snapshot = store.snapshot().await.unwrap();
   let prepared = store
-    .prepare_transaction(
+    .prepare_core_verb_transaction(
       contract_transaction_id(transaction),
       snapshot.revision().clone(),
       vec![StoreOperation::Put {
