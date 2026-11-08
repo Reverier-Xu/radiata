@@ -62,6 +62,15 @@ W2-2 predicates for observers).
    gate, external writers cannot set or alter them; core verbs mutate
    them through encapsulated semantic operations. Users never write
    these labels directly.
+   **Scope decision (orchestrator, 2026-11-08):** envelope labels do not
+   ride the reconcile v1 wire (lanes carry payload record bytes; labels
+   stay local). Phase C therefore ships: label carrier + typed
+   vocabulary + seal validation + auto-stamp at seal from the
+   FamilyPolicy declaration; the engine consumes row labels with
+   declaration fallback (absent = declaration; unknown value = never
+   sweep). Per-row label propagation across nodes is DEFERRED to Phase
+   D (where trigger declarations and the unified change stream land);
+   declaration-driven policy converges at each node's re-seal.
 3. **One generic sweep engine.** Consumes the declared policy per row:
    `permanent` (never swept; revocation's rule becomes a policy
    behavior), `checkpoint-watermark` (swept after the adopted GC
@@ -97,8 +106,11 @@ W2-2 predicates for observers).
 2. Tombstone scenario tests: revoked-subject binding retention holds as
    declared-policy behavior; checkpoint watermark GC reclaims collected
    leaves; provider seed rows are swept only by the provider flow.
-3. Policy-label mutation through core verbs converges across a
-   multi-node scenario test; unknown vocabulary values never sweep.
+3. Policy-label mutation through core verbs works locally; the
+   multi-node scenario pins: reconcile converges the row, every node
+   re-derives the declared label at seal, unknown vocabulary values are
+   never swept on any node (per-row label carriage on the wire is the
+   documented Phase D deferral).
 4. The audit §5.1 duplicates (leave≈cleanup sweep bodies,
    revoked_key_ctx hardcode) are gone — reviewer greps for them.
 5. Fresh tester + fresh reviewer reports; reviewer walks each family's
