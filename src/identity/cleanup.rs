@@ -377,6 +377,7 @@ pub(crate) async fn issue_checkpoint_ctx(
         &namespace,
         &key,
         snapshot.revision(),
+        &crate::LabelSet::new(),
         Arc::from(checkpoint.encode()?),
       )?,
     }],
@@ -448,6 +449,7 @@ pub(crate) async fn persist_checkpoint_ctx(
     &namespace,
     &key,
     snapshot.revision(),
+    &crate::LabelSet::new(),
     Arc::from(checkpoint.encode()?),
   )?;
   let transaction = store.prepare_transaction(
@@ -581,6 +583,7 @@ mod tests {
             &namespace,
             &key,
             snapshot.revision(),
+            &crate::LabelSet::new(),
             Arc::from(checkpoint.encode().unwrap()),
           )
           .unwrap(),

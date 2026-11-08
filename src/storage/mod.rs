@@ -1022,7 +1022,7 @@ pub(crate) mod row;
 #[cfg(any(test, fuzzing))]
 #[cfg_attr(fuzzing, allow(dead_code))]
 pub(crate) mod test_util;
-pub(crate) use row::RowEnvelope;
+pub(crate) use row::{RegisterTuple, RowEnvelope, RowVersion};
 pub(crate) mod incumbent;
 #[cfg(feature = "json")]
 pub(crate) mod json;

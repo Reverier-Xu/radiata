@@ -274,6 +274,7 @@ pub(crate) mod store {
           &namespace,
           &store_key,
           snapshot.revision(),
+          &crate::LabelSet::new(),
           Arc::from(binding.encode()?),
         )?,
       }],

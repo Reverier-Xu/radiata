@@ -307,7 +307,7 @@ pub(crate) mod store {
     let Some(value) = value else {
       return Ok(None);
     };
-    Ok(Some(crate::membership::page::decode_descriptor(
+    Ok(Some(crate::membership::page::decode_stored_row(
       value.as_bytes(),
     )?))
   }
@@ -320,11 +320,11 @@ pub(crate) mod store {
   /// paths resolve their incumbent here, so they cannot disagree about a
   /// corrupt row, and the consequence warning lives here once.
   fn decode_stored_descriptor(value: &StoreValue, node: &NodeId) -> Option<NodeDescriptorV1> {
-    // `decode_descriptor` is total on success, so `None` means exactly
+    // `decode_stored_row` is total on success, so `None` means exactly
     // one thing: the stored row did not decode.
     let descriptor = crate::storage::incumbent::decode_or_absent(
       value.as_bytes(),
-      crate::membership::page::decode_descriptor,
+      crate::membership::page::decode_stored_row,
       node.as_str(),
     );
     if descriptor.is_none() {
@@ -382,6 +382,18 @@ pub(crate) mod store {
     // revision, so a concurrent writer cannot make them disagree.
     let expected =
       crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
+    // The persisted body is the row envelope: the record bytes ride as
+    // the payload element with the descriptor's own label vocabulary
+    // beside them. The envelope version is the descriptor's own record
+    // revision (the family's monotone-max ordering element), so a
+    // converged descriptor row is byte-identical on every replica.
+    let value = crate::storage::RowEnvelope::seal_versioned(
+      &namespace,
+      &key,
+      crate::storage::RowVersion::record_revision(descriptor.revision()),
+      descriptor.labels(),
+      Arc::from(descriptor.encode()?),
+    )?;
     let transaction = store.prepare_transaction(
       TransactionId::generate(entropy)?,
       snapshot.revision().clone(),
@@ -389,7 +401,7 @@ pub(crate) mod store {
         namespace,
         key,
         expected,
-        value: StoreValue::new(Arc::from(descriptor.encode()?)),
+        value,
       }],
     )?;
     // A discarded commit outcome would silently drop the descriptor: a
@@ -531,11 +543,24 @@ pub(crate) mod store {
         }
         let expected =
           crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
+        // The persisted body is the row envelope: the record bytes ride
+        // as the payload element with the descriptor's own label
+        // vocabulary beside them. The envelope version is the
+        // descriptor's own record revision (the family's monotone-max
+        // ordering element), so a converged descriptor row is
+        // byte-identical on every replica.
+        let value = crate::storage::RowEnvelope::seal_versioned(
+          &namespace,
+          &key,
+          crate::storage::RowVersion::record_revision(descriptor.revision()),
+          descriptor.labels(),
+          Arc::from(descriptor.encode()?),
+        )?;
         operations.push(StoreOperation::Put {
           namespace: namespace.clone(),
           key,
           expected,
-          value: StoreValue::new(Arc::from(descriptor.encode()?)),
+          value,
         });
         applied.push(descriptor.node().clone());
       }
@@ -857,10 +882,14 @@ mod tests {
     assert_eq!(applied, vec![node(1)]);
     assert!(skipped.is_empty(), "the corrupt incumbent is not a skip");
 
-    // The corrupt incumbent is replaced by the verified descriptor.
+    // The corrupt incumbent is replaced by the verified descriptor; the
+    // stored row is the envelope, so the assertion compares payloads.
     let snapshot = store.snapshot().await.unwrap();
     let stored = snapshot.get(&namespace, &key).await.unwrap().unwrap();
-    assert_eq!(stored.as_bytes(), incoming.encode().unwrap().as_slice());
+    assert_eq!(
+      crate::membership::page::decode_stored_row(stored.as_bytes()).unwrap(),
+      incoming
+    );
   }
 
   /// The single-record twin of the page-batch case: the same corrupt
@@ -906,11 +935,12 @@ mod tests {
       .unwrap();
 
     // The corrupt incumbent is replaced by the verified descriptor, and
-    // the read path now sees it.
+    // the read path now sees it. The stored row is the envelope; the
+    // assertion compares payloads.
     let snapshot = store.snapshot().await.unwrap();
     let stored = snapshot.get(&namespace, &key).await.unwrap().unwrap();
     assert_eq!(
-      crate::membership::page::decode_descriptor(stored.as_bytes()).unwrap(),
+      crate::membership::page::decode_stored_row(stored.as_bytes()).unwrap(),
       incoming
     );
     assert_eq!(

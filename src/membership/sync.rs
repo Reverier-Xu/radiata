@@ -700,7 +700,7 @@ mod tests {
     use crate::{
       identity::{
         lifecycle,
-        testing::{FaultingFactory, ScriptedKeys, SequenceEntropy, inject_entry},
+        testing::{FaultingFactory, ScriptedKeys, SequenceEntropy, inject_enveloped_entry},
       },
       storage::contract::{ReferenceFactory, required_capabilities},
     };
@@ -766,8 +766,17 @@ mod tests {
         .expect("the installed local descriptor row")
     };
     let encoded = concurrent.encode().unwrap();
+    let injected_namespace = descriptor_namespace.clone();
+    let injected_key = descriptor_key.clone();
     faulting.push_hook(Box::new(move || {
-      inject_entry(&reference, (descriptor_namespace, descriptor_key), encoded);
+      // The injected row is exactly what the production persist path
+      // stores: the sealed row envelope over the record bytes.
+      inject_enveloped_entry(
+        &reference,
+        &injected_namespace,
+        &injected_key,
+        encoded.clone(),
+      );
     }));
 
     // The endpoint rewrite conflicts at the same revision. The conflict

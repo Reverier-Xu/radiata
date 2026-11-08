@@ -17,8 +17,8 @@ use super::{ResourceName, ResourceRecordV1, ResourceVersion};
 /// The durable namespace holding one register per resource name.
 pub(crate) use crate::storage::families::RESOURCE_RECORD_NAMESPACE;
 use crate::{
-  CommitReceipt, Digest, Error, Result, StoreKey, StoreNamespace, StoreOperation, StoreValue,
-  TransactionId, api::Entropy, storage::MetadataStore,
+  CommitReceipt, Digest, Error, Result, StoreKey, StoreNamespace, StoreOperation, TransactionId,
+  api::Entropy, storage::MetadataStore,
 };
 
 pub(crate) fn namespace() -> Result<StoreNamespace> {
@@ -27,6 +27,27 @@ pub(crate) fn namespace() -> Result<StoreNamespace> {
 
 fn record_key(name: &ResourceName) -> StoreKey {
   StoreKey::new(Arc::from(name.as_str().as_bytes().to_vec()))
+}
+
+/// Decodes one stored register row: the row envelope's payload element
+/// is the canonical record bytes the record codec decodes. The single
+/// stored-row decoder, so every stored-row reader (the register read
+/// path, the corrupt-incumbent policy, the retention sweep, the public
+/// select page, and the reconcile lane's projection) opens the envelope
+/// the same one way.
+pub(crate) fn decode_stored_row(bytes: &[u8]) -> Result<ResourceRecordV1> {
+  ResourceRecordV1::decode(&crate::storage::RowEnvelope::open(bytes)?)
+}
+
+/// The register row's content-derived envelope version: the record's own
+/// writer-timestamp tuple (see [`crate::storage::RowVersion`]).
+fn register_row_version(record: &ResourceRecordV1) -> crate::storage::RowVersion {
+  crate::storage::RowVersion::register_tuple(crate::storage::RegisterTuple {
+    timestamp_millis: record.timestamp_millis(),
+    writer: record.writer().clone(),
+    removal_rank: record.removal_rank(),
+    digest: record.digest().clone(),
+  })
 }
 
 /// The outcome of one conditional resource commit.
@@ -78,7 +99,9 @@ pub(crate) async fn read_record_ctx(
   let Some(value) = value else {
     return Ok(None);
   };
-  Ok(Some(ResourceRecordV1::decode(value.as_bytes())?))
+  Ok(Some(ResourceRecordV1::decode(
+    &crate::storage::RowEnvelope::open(value.as_bytes())?,
+  )?))
 }
 
 /// Conditionally commits one resource record: the register accepts
@@ -132,7 +155,7 @@ pub(crate) async fn commit_expected_record_ctx(
   let incumbent = snapshot.get(&namespace, &key).await?.and_then(|value| {
     crate::storage::incumbent::decode_or_absent(
       value.as_bytes(),
-      ResourceRecordV1::decode,
+      decode_stored_row,
       record.name().as_str(),
     )
   });
@@ -225,7 +248,7 @@ pub(crate) async fn commit_page_batch_ctx(
         .and_then(|value| {
           crate::storage::incumbent::decode_or_absent(
             value.as_bytes(),
-            ResourceRecordV1::decode,
+            decode_stored_row,
             record.name().as_str(),
           )
         });
@@ -237,11 +260,23 @@ pub(crate) async fn commit_page_batch_ctx(
       }
       let expected =
         crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, key).await?;
+      // The persisted body is the row envelope: the record bytes ride as
+      // the payload element with the record's own label vocabulary beside
+      // them. The envelope version is the record's own writer-timestamp
+      // tuple (the register's ordering element), so a converged register
+      // row is byte-identical on every replica.
+      let value = crate::storage::RowEnvelope::seal_versioned(
+        &namespace,
+        key,
+        register_row_version(record),
+        record.labels(),
+        Arc::from(record.encode()?),
+      )?;
       operations.push(StoreOperation::Put {
         namespace: namespace.clone(),
         key: key.clone(),
         expected,
-        value: StoreValue::new(Arc::from(record.encode()?)),
+        value,
       });
       installed.push(record.clone());
     }
@@ -290,11 +325,23 @@ async fn commit_put_ctx(
   namespace: StoreNamespace, key: StoreKey, record: &ResourceRecordV1, conflict: &'static str,
 ) -> Result<ResourceCommitOutcome> {
   let expected = crate::provider::snapshot_expectation(snapshot, &namespace, &key).await?;
+  // The persisted body is the row envelope: the record bytes ride as the
+  // payload element with the record's own label vocabulary beside them.
+  // The envelope version is the record's own writer-timestamp tuple (the
+  // register's ordering element), so a converged register row is
+  // byte-identical on every replica.
+  let value = crate::storage::RowEnvelope::seal_versioned(
+    &namespace,
+    &key,
+    register_row_version(record),
+    record.labels(),
+    Arc::from(record.encode()?),
+  )?;
   let mut operations = vec![StoreOperation::Put {
     namespace,
     key,
     expected,
-    value: StoreValue::new(Arc::from(record.encode()?)),
+    value,
   }];
   // The feed entry and its counter bump join the record put in the same
   // transaction, built from the same snapshot: the record cannot commit
@@ -355,7 +402,9 @@ pub(crate) async fn commit_removal_ctx(
   let Some(existing) = snapshot.get(&namespace, &key).await? else {
     return Err(Error::not_found("resource record"));
   };
-  let existing = ResourceRecordV1::decode(existing.as_bytes())?;
+  // The stored row is the envelope; the record codec decodes its
+  // payload element.
+  let existing = decode_stored_row(existing.as_bytes())?;
   // The exact observed version must still occupy the register.
   if &existing != expected {
     return Ok(ResourceCommitOutcome::Superseded(existing));

@@ -98,7 +98,7 @@ pub(crate) async fn select_page_ctx(
     cursor.map(|cursor| cursor.as_bytes()),
     limit,
     |_key, bytes| {
-      let Ok(record) = ResourceRecordV1::decode(bytes) else {
+      let Ok(record) = super::store::decode_stored_row(bytes) else {
         return Ok(None);
       };
       if record.removed() || !record_matches(&record, selector) {

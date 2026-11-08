@@ -102,7 +102,7 @@ impl Supervisor {
       cursor.as_ref().map(|cursor| cursor.as_bytes()),
       limit,
       |_key, bytes| {
-        let descriptor = crate::membership::page::decode_descriptor(bytes)?;
+        let descriptor = crate::membership::page::decode_stored_row(bytes)?;
         let status = departed.status(descriptor.node());
         let connectivity =
           crate::membership::member_connectivity(connected.contains(descriptor.node()));

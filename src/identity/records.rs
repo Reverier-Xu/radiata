@@ -356,7 +356,7 @@ async fn install_terminal_record(
       expected,
       // The persisted body is the row envelope: the record bytes ride as
       // the payload element, versioned by the preparing CAS revision.
-      value: RowEnvelope::seal(namespace, &key, &revision, encoded)?,
+      value: RowEnvelope::seal(namespace, &key, &revision, &crate::LabelSet::new(), encoded)?,
     }],
   )?;
   // A discarded commit outcome would silently drop the tombstone: a

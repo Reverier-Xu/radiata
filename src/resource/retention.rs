@@ -142,7 +142,7 @@ pub(crate) async fn sweep_removed_ctx(
   let mut oldest: std::collections::BinaryHeap<RemovalCandidate> =
     std::collections::BinaryHeap::new();
   while let Some(entry) = scan.next().await? {
-    let record = match super::ResourceRecordV1::decode(entry.value().as_bytes()) {
+    let record = match super::store::decode_stored_row(entry.value().as_bytes()) {
       Ok(record) => record,
       // A stored row that no longer decodes must not fail the sweep:
       // that would permanently stall retention for the whole namespace.

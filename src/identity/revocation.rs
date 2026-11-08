@@ -326,6 +326,7 @@ pub(crate) async fn revoke_binding_ctx(
           &namespace,
           &store_key,
           snapshot.revision(),
+          &crate::LabelSet::new(),
           Arc::from(encoded),
         )?,
       },
@@ -541,6 +542,7 @@ mod tests {
             &namespace,
             &store_key,
             snapshot.revision(),
+            &crate::LabelSet::new(),
             Arc::from(
               IdentityBindingV1::new(node.clone(), key.clone())
                 .encode()
@@ -992,6 +994,7 @@ mod crash {
             &namespace,
             &store_key,
             snapshot.revision(),
+            &crate::LabelSet::new(),
             Arc::from(IdentityBindingV1::new(subject(), key()).encode().unwrap()),
           )
           .unwrap(),

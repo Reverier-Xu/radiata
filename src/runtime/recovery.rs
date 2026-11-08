@@ -162,7 +162,7 @@ pub(super) async fn known_online_member_endpoints(
   let mut known_members: std::collections::BTreeMap<NodeId, Vec<Endpoint>> =
     std::collections::BTreeMap::new();
   while let Some(entry) = scan.next().await? {
-    let decoded = crate::membership::page::decode_descriptor(entry.value().as_bytes());
+    let decoded = crate::membership::page::decode_stored_row(entry.value().as_bytes());
     let descriptor = match decoded {
       Ok(descriptor) => descriptor,
       // The table scan is best-effort over durable evidence; a corrupt
@@ -1065,9 +1065,12 @@ mod tests {
       crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
         .unwrap();
     let key = crate::StoreKey::new(Arc::from(node.as_str().as_bytes().to_vec()));
-    crate::identity::testing::inject_entry(
+    // The injected descriptor row is the sealed row envelope over the
+    // record bytes: exactly what the production persist path stores.
+    crate::identity::testing::inject_enveloped_entry(
       reference,
-      (namespace, key),
+      &namespace,
+      &key,
       descriptor.encode().unwrap(),
     );
     let (binding_namespace, binding_key) =

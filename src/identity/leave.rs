@@ -577,6 +577,7 @@ async fn swap_identity(
     &local_namespace,
     &local_key,
     snapshot.revision(),
+    &crate::LabelSet::new(),
     Arc::from(replacement.encode()?),
   )?;
   let prepared = store.prepare_transaction(
@@ -720,6 +721,7 @@ async fn begin_intent(
       &leave_namespace()?,
       &leave_key(),
       snapshot.revision(),
+      &crate::LabelSet::new(),
       payload.clone(),
     )?;
     let prepared = store.prepare_transaction(
