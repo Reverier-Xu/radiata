@@ -142,6 +142,7 @@ impl Lane for ResourcesLane {
         for record in &outcome.installed {
           ctx.events.emit(crate::ResourceChanged::new(
             record.name().clone(),
+            crate::ResourceLabels::from_record(record),
             crate::ResourceOrigin::Remote,
             record.removed(),
           ));

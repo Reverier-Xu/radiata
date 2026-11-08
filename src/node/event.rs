@@ -9,9 +9,14 @@ use crate::{Error, Event, EventTag, Result, operation::TaggedEvent};
 
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventOptions {
   capacity: usize,
+  /// The optional subscription predicate. Only a
+  /// [`crate::ResourceChanged`] subscription accepts one: the handle
+  /// validates that at `watch` time, so a predicate attached to any
+  /// other event type (or to the tag-keyed channel) fails closed.
+  predicate: Option<crate::SubscriptionPredicate>,
 }
 
 impl EventOptions {
@@ -24,12 +29,29 @@ impl EventOptions {
     self.capacity = value;
     Ok(self)
   }
+
+  /// Attaches a [`crate::SubscriptionPredicate`]: the event hub
+  /// evaluates it emit-side, at the publication site where the
+  /// committed record's labels are already in hand, and a
+  /// non-matching event is never delivered to this subscriber. Absent
+  /// predicate: every event, exactly as before.
+  pub fn predicate(mut self, predicate: crate::SubscriptionPredicate) -> Self {
+    self.predicate = Some(predicate);
+    self
+  }
+
+  /// The attached predicate, when one is set (the handle's fail-closed
+  /// validation reads this).
+  pub(crate) const fn predicate_ref(&self) -> Option<&crate::SubscriptionPredicate> {
+    self.predicate.as_ref()
+  }
 }
 
 impl Default for EventOptions {
   fn default() -> Self {
     Self {
       capacity: DEFAULT_EVENT_CAPACITY,
+      predicate: None,
     }
   }
 }
@@ -180,6 +202,15 @@ impl<E: Event> futures_core::Stream for EventSubscription<E> {
   }
 }
 
+/// One typed subscriber's channel: the bounded broadcast sender plus
+/// the optional subscription predicate the emit path evaluates per
+/// subscriber, so filtering never costs the emitter an extra pass and a
+/// non-matching event is never delivered to this subscriber.
+struct TypedSender<E: Event> {
+  sender: broadcast::Sender<E>,
+  predicate: Option<crate::SubscriptionPredicate>,
+}
+
 /// The runtime event hub: one typed subscriber set per event type, plus
 /// one subscriber set per tag on the caller-facing tag-keyed channel.
 /// Events are transient — an emission with no live subscriber is
@@ -218,30 +249,43 @@ impl EventHub {
 
   /// Subscribes with an independent bounded channel per subscription, so
   /// one slow subscriber's lag never backpressures emitters or other
-  /// subscribers.
+  /// subscribers. The options' predicate, when present, rides the
+  /// subscription and filters its deliveries at emit time.
   pub(crate) fn subscribe<E: Event>(&self, options: EventOptions) -> EventSubscription<E> {
     let (sender, receiver) = broadcast::channel(options.capacity);
     let mut subscribers = Self::lock(&self.subscribers);
     let entries = subscribers.entry(std::any::TypeId::of::<E>()).or_default();
     Self::prune::<E>(entries);
-    entries.push(Box::new(std::sync::Arc::new(sender)));
+    entries.push(Box::new(std::sync::Arc::new(TypedSender {
+      sender,
+      predicate: options.predicate,
+    })));
     EventSubscription {
       state: SubscriptionState::Idle(receiver),
     }
   }
 
   /// Emits one event to every live subscriber of its type; a subscriber
-  /// whose channel is full lags instead of blocking the emitter.
+  /// whose channel is full lags instead of blocking the emitter, and a
+  /// subscriber whose predicate does not admit the event is not
+  /// delivered it at all (evaluated here, at the publication site —
+  /// zero extra I/O).
   pub(crate) fn emit<E: Event>(&self, event: E) {
     let mut subscribers = Self::lock(&self.subscribers);
     let Some(entries) = subscribers.get_mut(&std::any::TypeId::of::<E>()) else {
       return;
     };
     for entry in entries.iter() {
-      if let Some(sender) = entry.downcast_ref::<std::sync::Arc<broadcast::Sender<E>>>() {
-        // A send error means this channel has no active receivers; the
-        // transient event is gone and the next retain prunes the sender.
-        let _ = sender.send(event.clone());
+      if let Some(subscriber) = entry.downcast_ref::<std::sync::Arc<TypedSender<E>>>() {
+        if subscriber
+          .predicate
+          .as_ref()
+          .is_none_or(|predicate| predicate.admits_event(&event))
+        {
+          // A send error means this channel has no active receivers; the
+          // transient event is gone and the next retain prunes the sender.
+          let _ = subscriber.sender.send(event.clone());
+        }
       }
     }
     Self::prune::<E>(entries);
@@ -251,8 +295,8 @@ impl EventHub {
   fn prune<E: Event>(entries: &mut Vec<Box<dyn std::any::Any + Send + Sync>>) {
     entries.retain(|entry| {
       entry
-        .downcast_ref::<std::sync::Arc<broadcast::Sender<E>>>()
-        .is_some_and(|sender| sender.receiver_count() > 0)
+        .downcast_ref::<std::sync::Arc<TypedSender<E>>>()
+        .is_some_and(|subscriber| subscriber.sender.receiver_count() > 0)
     });
   }
 
@@ -596,6 +640,74 @@ mod tests {
     hub.publish(&alpha, Arc::from([2_u8]));
     assert!(matches!(
       resubscribed.recv().await.unwrap(),
+      EventReceive::Item(_)
+    ));
+  }
+
+  fn change(name_text: &str, owner: &str) -> crate::ResourceChanged {
+    use crate::{LabelKey, LabelValue, ResourceLabels, ResourceName, ResourceUri};
+    crate::ResourceChanged::new(
+      ResourceName::parse(name_text).unwrap(),
+      ResourceLabels::new(
+        LabelValue::parse("document").unwrap(),
+        ResourceUri::parse("file:///hub").unwrap(),
+      )
+      .custom(
+        LabelKey::parse("example.org/labels/owner").unwrap(),
+        LabelValue::parse(owner).unwrap(),
+      )
+      .unwrap(),
+      crate::ResourceOrigin::Local,
+      false,
+    )
+  }
+
+  /// The live-watch contract, at the hub: a subscriber carrying a
+  /// predicate is evaluated emit-side and a non-matching event is never
+  /// delivered to it, while an unfiltered subscriber of the same event
+  /// type still receives everything. Matching events still reach the
+  /// filtered subscriber with their labels attached.
+  #[tokio::test]
+  async fn a_predicate_filters_only_its_own_subscriber_at_emit() {
+    use crate::SubscriptionPredicate;
+
+    let hub = EventHub::new();
+    let mut filtered = hub.subscribe::<crate::ResourceChanged>(
+      EventOptions::new().predicate(
+        SubscriptionPredicate::new()
+          .domain("example.net")
+          .unwrap(),
+      ),
+    );
+    let mut unfiltered = hub.subscribe::<crate::ResourceChanged>(EventOptions::new());
+
+    // A non-matching event reaches only the unfiltered subscriber.
+    hub.emit(change("radiata.woooo.tech/resources/miss", "team-a"));
+    assert!(matches!(
+      unfiltered.recv().await.unwrap(),
+      EventReceive::Item(_)
+    ));
+    assert!(matches!(
+      filtered.try_recv().unwrap(),
+      EventReceive::Empty
+    ));
+
+    // A matching event reaches both, and carries the committed labels.
+    hub.emit(change("example.net/resources/hit", "team-b"));
+    let EventReceive::Item(hit) = filtered.recv().await.unwrap() else {
+      panic!("the filtered subscriber must receive a matching event")
+    };
+    assert_eq!(hit.resource().domain(), "example.net");
+    assert_eq!(
+      hit
+        .labels()
+        .custom_labels()
+        .get(&crate::LabelKey::parse("example.org/labels/owner").unwrap())
+        .map(|value| value.as_str()),
+      Some("team-b")
+    );
+    assert!(matches!(
+      unfiltered.recv().await.unwrap(),
       EventReceive::Item(_)
     ));
   }

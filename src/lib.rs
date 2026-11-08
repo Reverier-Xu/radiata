@@ -73,7 +73,8 @@ pub use identity::{
 pub use label::{LabelKey, LabelSet, LabelValue};
 pub use node::{
   Credentials, EventOptions, EventReceive, EventSubscription, Listeners, MemberRevision, Members,
-  NodeBuilder, NodeHandle, Resources, Routes, Sessions, Tasks, Topology, Trust,
+  NodeBuilder, NodeHandle, Resources, Routes, Sessions, SubscriptionPredicate, Tasks, Topology,
+  Trust,
 };
 pub use operation::{
   Event, IdentityReplaced, MemberChanged, NodeRevoked, RecoveryChanged, ResourceChanged,
@@ -94,7 +95,7 @@ pub use provider::{
 };
 pub use resource::{
   ResourceLabels, ResourceName, ResourceUri, ResourceVersion,
-  feed::{ResourceChange, ResourceChangeKind, ResourceFeedError, ResourceWatch},
+  feed::{ResourceChange, ResourceChangeKind, ResourceFeedError, ResourceWatch, ResourceWatchOptions},
 };
 pub use routing::{
   CandidateNodeReader, DefaultLoadBalancer, DefaultNextHop, LoadBalancingPolicy, NextHopView,

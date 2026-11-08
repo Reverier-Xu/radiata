@@ -179,6 +179,12 @@ impl ResourceChangeV1 {
     self.version
   }
 
+  /// The committed record this entry carries: the replay push-down's
+  /// filtering input.
+  pub(crate) const fn record(&self) -> &ResourceRecordV1 {
+    &self.record
+  }
+
   /// Encodes the canonical entry bytes, reusing the record's own canonical
   /// encoding for the payload.
   pub(crate) fn encode(&self) -> Result<Vec<u8>> {
@@ -290,6 +296,51 @@ pub enum ResourceFeedError {
   Storage(#[from] Error),
 }
 
+/// Options for one [`ResourceWatch`]: the resume version and an
+/// optional [`crate::SubscriptionPredicate`] pushed down into the
+/// replay and the live follow.
+///
+/// The predicate filters deliveries, never the feed: skipped entries
+/// still consume their versions, and the resume position stays based on
+/// the record stream, not on matching. A consumer resumes by passing
+/// the last version it processed — the exact resume point — and
+/// observes every later matching change even when non-matching entries
+/// sit between the processed versions.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResourceWatchOptions {
+  from: Option<u64>,
+  predicate: Option<crate::SubscriptionPredicate>,
+}
+
+impl ResourceWatchOptions {
+  /// The default options: start at the feed's current head, no
+  /// predicate — every entry, exactly like a watch opened without
+  /// options.
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// Replays every entry with a version greater than `version` before
+  /// following live commits.
+  pub fn from(mut self, version: u64) -> Self {
+    self.from = Some(version);
+    self
+  }
+
+  /// Pushes `predicate` down into the replay: entries whose committed
+  /// record does not match are skipped during the replay scan and the
+  /// live follow instead of being delivered.
+  pub fn predicate(mut self, predicate: crate::SubscriptionPredicate) -> Self {
+    self.predicate = Some(predicate);
+    self
+  }
+
+  /// The resume version, when one was set.
+  pub(crate) const fn resume(&self) -> Option<u64> {
+    self.from
+  }
+}
+
 /// A resumable cursor over the durable resource change feed.
 ///
 /// A watch created with `from = None` starts at the feed's current head (it
@@ -310,6 +361,11 @@ pub enum ResourceFeedError {
 #[derive(Debug)]
 pub struct ResourceWatch {
   store: Arc<MetadataStore>,
+  /// The optional subscription predicate pushed down into the replay:
+  /// evaluated per scanned entry against the committed record, so a
+  /// non-matching entry is consumed (its version spent) but never
+  /// delivered.
+  predicate: Option<crate::SubscriptionPredicate>,
   /// The last version this watch delivered (or the initial resume point).
   /// It advances only when an entry is popped, so it always names the
   /// exact resume point a consumer re-listing after an error needs.
@@ -324,10 +380,13 @@ pub struct ResourceWatch {
 }
 
 impl ResourceWatch {
-  /// Creates one watch over `store`, resuming after `from` (or at the
-  /// current head for `None`).
-  pub(crate) async fn subscribe(store: Arc<MetadataStore>, from: Option<u64>) -> Result<Self> {
-    let cursor = match from {
+  /// Creates one watch over `store` from `options`: resuming after the
+  /// options' version (or at the current head for `None`), delivering
+  /// only the entries the options' predicate admits.
+  pub(crate) async fn subscribe(
+    store: Arc<MetadataStore>, options: ResourceWatchOptions,
+  ) -> Result<Self> {
+    let cursor = match options.resume() {
       Some(version) => version,
       None => {
         let snapshot = store.snapshot().await?;
@@ -336,6 +395,7 @@ impl ResourceWatch {
     };
     Ok(Self {
       store,
+      predicate: options.predicate,
       cursor,
       scan_cursor: cursor,
       buffered: VecDeque::new(),
@@ -411,7 +471,17 @@ impl ResourceWatch {
         )));
       }
       self.scan_cursor = change.version();
-      self.buffered.push_back(change.into_view());
+      // The push-down: a non-matching entry is consumed — its version is
+      // spent, exactly as if it had been delivered — but never buffered,
+      // so the delivered cursor (and the consumer's resume point) stays
+      // based on the record stream, not on matching.
+      if self
+        .predicate
+        .as_ref()
+        .is_none_or(|predicate| predicate.admits_record(change.record()))
+      {
+        self.buffered.push_back(change.into_view());
+      }
     }
     // Every version between the cursor and the head is in the feed by
     // construction, so a scan that stops short means the feed itself is
@@ -431,8 +501,8 @@ mod tests {
   use std::{sync::Arc, time::Duration};
 
   use super::{
-    ResourceChangeKind, ResourceChangeV1, ResourceFeedError, ResourceWatch, append_operations,
-    entry_key, namespace, read_head,
+    ResourceChangeKind, ResourceChangeV1, ResourceFeedError, ResourceWatch, ResourceWatchOptions,
+    append_operations, entry_key, namespace, read_head,
   };
   use crate::{
     LabelKey, LabelSet, LabelValue, NodeId,
@@ -442,10 +512,15 @@ mod tests {
       ResourceName, ResourceRecordV1,
       store::{ResourceCommitOutcome, commit_expected_record_ctx},
     },
+    storage::MetadataStore,
   };
 
   fn name(seed: u8) -> ResourceName {
     ResourceName::parse(&format!("radiata.woooo.tech/resources/feed-{seed:03}")).unwrap()
+  }
+
+  fn other_name(seed: u8) -> ResourceName {
+    ResourceName::parse(&format!("example.net/resources/feed-{seed:03}")).unwrap()
   }
 
   fn labels() -> LabelSet {
@@ -493,6 +568,40 @@ mod tests {
     commit_expected_record_ctx(store, &SystemEntropy, record, None)
       .await
       .unwrap()
+  }
+
+  /// Subscribes one unfiltered watch with the optional resume version.
+  async fn subscribe(store: &Arc<MetadataStore>, from: Option<u64>) -> ResourceWatch {
+    let mut options = ResourceWatchOptions::new();
+    if let Some(version) = from {
+      options = options.from(version);
+    }
+    ResourceWatch::subscribe(Arc::clone(store), options).await.unwrap()
+  }
+
+  /// Subscribes one watch carrying a predicate pushed down into the
+  /// replay and the live follow.
+  async fn subscribe_filtered(
+    store: &Arc<MetadataStore>, from: Option<u64>, predicate: crate::SubscriptionPredicate,
+  ) -> ResourceWatch {
+    let mut options = ResourceWatchOptions::new().predicate(predicate);
+    if let Some(version) = from {
+      options = options.from(version);
+    }
+    ResourceWatch::subscribe(Arc::clone(store), options).await.unwrap()
+  }
+
+  /// Installs `records` in order and returns the versions they got.
+  async fn install_all(
+    store: &crate::storage::MetadataStore, records: &[ResourceRecordV1],
+  ) -> Vec<u64> {
+    let mut versions = Vec::with_capacity(records.len());
+    for record in records {
+      install(store, record).await;
+      let snapshot = store.snapshot().await.unwrap();
+      versions.push(read_head(snapshot.as_ref()).await.unwrap());
+    }
+    versions
   }
 
   /// Overwrites one stored feed entry with `bytes` through a conditional
@@ -547,9 +656,7 @@ mod tests {
       ResourceCommitOutcome::Installed(_)
     ));
 
-    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), Some(0))
-      .await
-      .unwrap();
+    let mut watch = subscribe(&store, Some(0)).await;
     let first = next(&mut watch).await.unwrap();
     assert_eq!(first.version(), 1);
     assert_eq!(first.name(), &name(1));
@@ -580,9 +687,7 @@ mod tests {
       install(&store, &record(&name(seed), timestamp, false)).await;
     }
 
-    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), Some(1))
-      .await
-      .unwrap();
+    let mut watch = subscribe(&store, Some(1)).await;
     let resumed: Vec<u64> = vec![
       next(&mut watch).await.unwrap().version(),
       next(&mut watch).await.unwrap().version(),
@@ -606,18 +711,14 @@ mod tests {
       .unwrap();
     assert_eq!(head, 2, "the persisted head is the last committed version");
     // A fresh watch on the reopened store starts at the persisted head.
-    let mut live = ResourceWatch::subscribe(Arc::clone(&reopened), None)
-      .await
-      .unwrap();
+    let mut live = subscribe(&reopened, None).await;
     assert!(matches!(
       install(&reopened, &record(&name(3), 3_000, false)).await,
       ResourceCommitOutcome::Installed(_)
     ));
     assert_eq!(next(&mut live).await.unwrap().version(), 3);
 
-    let mut replay = ResourceWatch::subscribe(Arc::clone(&reopened), Some(0))
-      .await
-      .unwrap();
+    let mut replay = subscribe(&reopened, Some(0)).await;
     let versions: Vec<u64> = vec![
       next(&mut replay).await.unwrap().version(),
       next(&mut replay).await.unwrap().version(),
@@ -657,9 +758,7 @@ mod tests {
     });
     let store = open(&fault).await;
 
-    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), None)
-      .await
-      .unwrap();
+    let mut watch = subscribe(&store, None).await;
     let parked = tokio::spawn(async move { watch.next().await });
     // Park the watch before the commit: the first fill reads the empty
     // feed, and the wait below starts well inside one re-check interval.
@@ -696,9 +795,7 @@ mod tests {
     let factory = factory();
     let store = open(&factory).await;
     install(&store, &record(&name(1), 1_000, false)).await;
-    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), Some(1))
-      .await
-      .unwrap();
+    let mut watch = subscribe(&store, Some(1)).await;
 
     // Wipe the feed the way a leave does: the head counter and its entries
     // leave together, so the head reads 0 under a cursor of 1.
@@ -754,9 +851,7 @@ mod tests {
     let key = entry_key(3);
     overwrite_entry(&store, &namespace, &key, vec![0xFF_u8, 0x00]).await;
 
-    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), Some(0))
-      .await
-      .unwrap();
+    let mut watch = subscribe(&store, Some(0)).await;
     // The scan buffers 1 and 2, then fails on the damaged 3.
     assert!(
       matches!(watch.next().await, Err(ResourceFeedError::Storage(_))),
@@ -780,9 +875,7 @@ mod tests {
 
     // The delivered cursor is the honest resume point: a consumer
     // re-listing from the last version it received replays nothing.
-    let mut resumed = ResourceWatch::subscribe(Arc::clone(&store), Some(3))
-      .await
-      .unwrap();
+    let mut resumed = subscribe(&store, Some(3)).await;
     assert!(
       tokio::time::timeout(Duration::from_millis(100), resumed.next())
         .await
@@ -798,9 +891,7 @@ mod tests {
     let store = open(&factory).await;
     install(&store, &record(&name(1), 1_000, false)).await;
 
-    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), None)
-      .await
-      .unwrap();
+    let mut watch = subscribe(&store, None).await;
     let parked = tokio::spawn(async move { watch.next().await });
     tokio::task::yield_now().await;
     install(&store, &record(&name(2), 2_000, false)).await;
@@ -827,9 +918,7 @@ mod tests {
       ResourceCommitOutcome::Installed(_)
     ));
 
-    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), Some(1))
-      .await
-      .unwrap();
+    let mut watch = subscribe(&store, Some(1)).await;
     let change = next(&mut watch).await.unwrap();
     assert_eq!(change.version(), 2);
     assert_eq!(change.name(), &name(1));
@@ -915,9 +1004,7 @@ mod tests {
       1,
       "the resolved commit appends exactly one entry"
     );
-    let mut watch = ResourceWatch::subscribe(Arc::clone(&store), Some(0))
-      .await
-      .unwrap();
+    let mut watch = subscribe(&store, Some(0)).await;
     let change = next(&mut watch).await.unwrap();
     assert_eq!(change.version(), 1);
     assert_eq!(change.name(), &name(1));
@@ -957,5 +1044,113 @@ mod tests {
     wire.version = 0;
     let forged = crate::protocol::encode_canonical(&wire, super::FEED_LIMITS).unwrap();
     assert!(ResourceChangeV1::decode(&forged).is_err());
+  }
+
+  // ---- Subscription-predicate push-down ----
+
+  /// The replay push-down delivers exactly the matching entries, in feed
+  /// order, with their original versions: a non-matching entry consumes
+  /// its version (it is spent, not delivered) but never appears on the
+  /// watch.
+  #[tokio::test]
+  async fn a_filtered_replay_delivers_only_matching_versions() {
+    let factory = factory();
+    let store = open(&factory).await;
+    let records = [
+      record(&name(1), 1_000, false),
+      record(&other_name(1), 2_000, false),
+      record(&name(2), 3_000, false),
+    ];
+    let versions = install_all(&store, &records).await;
+    assert_eq!(versions, vec![1, 2, 3]);
+
+    let mut watch = subscribe_filtered(
+      &store,
+      Some(0),
+      crate::SubscriptionPredicate::new().domain("example.net").unwrap(),
+    )
+    .await;
+    let delivered = next(&mut watch).await.unwrap();
+    assert_eq!(delivered.version(), 2);
+    assert_eq!(delivered.name(), &other_name(1));
+    // Nothing else matches: the watch parks.
+    assert!(
+      tokio::time::timeout(Duration::from_millis(100), watch.next())
+        .await
+        .is_err(),
+      "non-matching replay entries must not be delivered"
+    );
+  }
+
+  /// The resume position is based on the record stream, never on
+  /// matching: a consumer that stopped after the matching version 1
+  /// resumes from `Some(1)`, the non-matching version 2 is skipped
+  /// again, and the matching version 3 — plus every later matching
+  /// commit — still arrives. A filtered subscriber never misses a
+  /// post-resume matching change.
+  #[tokio::test]
+  async fn a_filtered_consumer_resumes_by_record_stream_and_misses_nothing() {
+    let factory = factory();
+    let store = open(&factory).await;
+    let records = [
+      record(&other_name(1), 1_000, false),
+      record(&name(1), 2_000, false),
+      record(&other_name(2), 3_000, false),
+    ];
+    assert_eq!(install_all(&store, &records).await, vec![1, 2, 3]);
+    let predicate = crate::SubscriptionPredicate::new().domain("example.net").unwrap();
+
+    // Full replay: 1 and 3, with 2 consumed but skipped.
+    let mut replay = subscribe_filtered(&store, Some(0), predicate.clone()).await;
+    assert_eq!(next(&mut replay).await.unwrap().version(), 1);
+    assert_eq!(next(&mut replay).await.unwrap().version(), 3);
+
+    // The same consumer that stopped after version 1 resumes correctly.
+    let mut resumed = subscribe_filtered(&store, Some(1), predicate.clone()).await;
+    assert_eq!(next(&mut resumed).await.unwrap().version(), 3);
+
+    // Live follow: a later matching commit arrives, a non-matching one
+    // in between does not stall or shadow it.
+    install(&store, &record(&name(2), 4_000, false)).await;
+    install(&store, &record(&other_name(3), 5_000, false)).await;
+    let live = next(&mut resumed).await.unwrap();
+    assert_eq!(live.version(), 5);
+    assert_eq!(live.name(), &other_name(3));
+  }
+
+  /// The push-down also evaluates the label selector against the
+  /// committed record's full label space, so a selector-only predicate
+  /// filters the replay the same way the register's own selection does.
+  #[tokio::test]
+  async fn a_selector_predicate_pushes_down_through_the_replay() {
+    let factory = factory();
+    let store = open(&factory).await;
+    let z1 = record(&name(1), 1_000, false);
+    let z2 = ResourceRecordV1::new(
+      name(2),
+      LabelValue::parse("document").unwrap(),
+      crate::ResourceUri::parse("file:///feed").unwrap(),
+      LabelSet::new().insert(
+        LabelKey::parse("example.org/labels/zone").unwrap(),
+        LabelValue::parse("z2").unwrap(),
+      ).unwrap(),
+      2_000,
+      NodeId::parse("node-000000000000000000001").unwrap(),
+      0,
+      false,
+    )
+    .unwrap();
+    assert_eq!(install_all(&store, &[z1, z2]).await, vec![1, 2]);
+
+    let mut watch = subscribe_filtered(
+      &store,
+      Some(0),
+      crate::SubscriptionPredicate::new()
+        .selector("example.org/labels/zone=z2")
+        .unwrap(),
+    )
+    .await;
+    let delivered = next(&mut watch).await.unwrap();
+    assert_eq!(delivered.version(), 2);
   }
 }

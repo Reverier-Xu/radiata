@@ -510,10 +510,17 @@ impl NodeHandle {
   /// Subscribes to node events. Subscriptions are bounded and
   /// transient: a lagging subscriber observes `EventReceive::Lagged`
   /// and must re-read through the paged accessors.
+  ///
+  /// An [`EventOptions::predicate`] is accepted only on a
+  /// [`crate::ResourceChanged`] subscription — it is the only event type
+  /// with a resource identity and label space to filter on — and any
+  /// other event type fails closed here instead of silently ignoring
+  /// the predicate.
   pub fn watch<E: Event>(&self, options: EventOptions) -> Result<EventSubscription<E>> {
     if self.runtime.status() != NodeStatus::Running {
       return Err(Error::shutting_down("node events"));
     }
+    validate_typed_watch_options::<E>(&options)?;
     Ok(self.events.subscribe::<E>(options))
   }
 
@@ -558,6 +565,11 @@ impl NodeHandle {
     if self.runtime.status() != NodeStatus::Running {
       return Err(Error::shutting_down("tag-keyed event channel"));
     }
+    if options.predicate_ref().is_some() {
+      // A tagged payload is opaque bytes: there is no label space for a
+      // subscription predicate to evaluate, so it fails closed.
+      return Err(Error::invalid_input("event subscription predicate"));
+    }
     crate::protocol::tag::require_caller_domain(tag.domain(), "tag-keyed event channel")?;
     Ok(self.events.subscribe_tagged(tag, options))
   }
@@ -583,9 +595,28 @@ impl NodeHandle {
   /// read failures surface from [`crate::ResourceWatch::next`]. The watch
   /// holds the store open, so drop it before reopening the same storage.
   pub async fn watch_resources(&self, from: Option<u64>) -> Result<crate::ResourceWatch> {
+    let options = match from {
+      Some(version) => crate::ResourceWatchOptions::new().from(version),
+      None => crate::ResourceWatchOptions::new(),
+    };
+    self.watch_resources_with(options).await
+  }
+
+  /// [`NodeHandle::watch_resources`] with options: a resume version and
+  /// an optional [`crate::SubscriptionPredicate`] pushed down into the
+  /// replay, so non-matching records are skipped during the replay scan
+  /// and while following live commits. The resume position stays based
+  /// on the record stream, never on matching: the last version a
+  /// consumer processed is the exact resume point, and a filtered
+  /// consumer resuming from it observes every later matching change.
+  ///
+  /// The only failure is the command channel's own (a stopped node).
+  pub async fn watch_resources_with(
+    &self, options: crate::ResourceWatchOptions,
+  ) -> Result<crate::ResourceWatch> {
     self
       .runtime
-      .send_command(move |reply| Control::WatchResources { from, reply })
+      .send_command(move |reply| Control::WatchResources { options, reply })
       .await
   }
 
@@ -607,5 +638,42 @@ impl NodeHandle {
       Ok(stream) => stream.send_sync(body),
       Err(error) => Box::pin(async move { Err(error) }),
     }
+  }
+}
+
+/// Validates the typed watch's options against the subscribed event
+/// type: a subscription predicate is only meaningful on a
+/// [`crate::ResourceChanged`] subscription, and any other event type
+/// fails closed instead of silently ignoring the predicate.
+fn validate_typed_watch_options<E: Event>(options: &EventOptions) -> Result<()> {
+  if options.predicate_ref().is_some()
+    && std::any::TypeId::of::<E>() != std::any::TypeId::of::<crate::ResourceChanged>()
+  {
+    return Err(Error::invalid_input("event subscription predicate"));
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::validate_typed_watch_options;
+  use crate::{ErrorKind, EventOptions, MemberChanged, ResourceChanged, SubscriptionPredicate};
+
+  /// A predicate is only meaningful on a `ResourceChanged` subscription:
+  /// any other event type fails closed instead of silently filtering
+  /// nothing, and the `ResourceChanged` subscription itself accepts it.
+  #[test]
+  fn a_predicate_is_accepted_only_on_a_resource_changed_watch() {
+    let predicate = SubscriptionPredicate::new().domain("example.net").unwrap();
+    let options = EventOptions::new().predicate(predicate);
+    assert!(validate_typed_watch_options::<ResourceChanged>(&options).is_ok());
+    assert_eq!(
+      validate_typed_watch_options::<MemberChanged>(&options)
+        .unwrap_err()
+        .kind(),
+      ErrorKind::InvalidInput
+    );
+    // Absent predicate: every typed watch, exactly as before.
+    assert!(validate_typed_watch_options::<MemberChanged>(&EventOptions::new()).is_ok());
   }
 }

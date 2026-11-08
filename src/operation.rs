@@ -181,10 +181,13 @@ impl Event for NodeRevoked {}
 /// the write's [`crate::ResourceMutationView`] reports whether a local
 /// candidate is the current winner. Aborted and indeterminate local
 /// candidates emit nothing, and restart or maintenance never replays the
-/// event.
+/// event. The event carries the committed record's full label space, so
+/// a subscriber (or a [`crate::SubscriptionPredicate`]) filters and
+/// reacts on labels with no register re-read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceChanged {
   resource: crate::ResourceName,
+  labels: crate::ResourceLabels,
   origin: ResourceOrigin,
   removal: bool,
 }
@@ -192,6 +195,12 @@ pub struct ResourceChanged {
 impl ResourceChanged {
   pub fn resource(&self) -> &crate::ResourceName {
     &self.resource
+  }
+
+  /// The committed record's full label space: the reserved type and URI
+  /// labels plus the custom labels.
+  pub const fn labels(&self) -> &crate::ResourceLabels {
+    &self.labels
   }
 
   /// Whether this node wrote the candidate or applied it from a peer.
@@ -205,10 +214,12 @@ impl ResourceChanged {
   }
 
   pub(crate) const fn new(
-    resource: crate::ResourceName, origin: ResourceOrigin, removal: bool,
+    resource: crate::ResourceName, labels: crate::ResourceLabels, origin: ResourceOrigin,
+    removal: bool,
   ) -> Self {
     Self {
       resource,
+      labels,
       origin,
       removal,
     }

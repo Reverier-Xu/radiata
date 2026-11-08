@@ -51,6 +51,28 @@ pub(crate) fn record_matches(record: &ResourceRecordV1, selector: &Selector) -> 
   selector.matches_with(lookup(record))
 }
 
+/// Whether one record's public label view satisfies `selector`: the
+/// same reserved-aware resolution as [`record_matches`] — the reserved
+/// type/URI labels resolve to their fields, every other key to the
+/// custom labels — over a [`ResourceLabels`] projection already in hand
+/// (the resource-change event's labels).
+pub(crate) fn labels_match(labels: &ResourceLabels, selector: &Selector) -> bool {
+  fn lookup<'a>(labels: &'a ResourceLabels) -> impl Fn(&QualifiedTag) -> Option<&'a str> {
+    move |tag| {
+      if tag.as_str() == RESERVED_TYPE_LABEL_KEY {
+        Some(labels.resource_type().as_str())
+      } else if tag.as_str() == RESERVED_URI_LABEL_KEY {
+        Some(labels.uri().as_str())
+      } else {
+        crate::LabelKey::from_label_tag(tag)
+          .and_then(|key| labels.custom_labels().get(&key))
+          .map(|value| value.as_str())
+      }
+    }
+  }
+  selector.matches_with(lookup(labels))
+}
+
 /// The public view of one live winner record.
 pub(crate) fn resource_view(record: &ResourceRecordV1) -> crate::ResourceView {
   crate::ResourceView::new(
