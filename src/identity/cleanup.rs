@@ -155,7 +155,9 @@ impl records::IssuerSignedTombstone for CleanupRecordV1 {
   }
 }
 
-fn cleanup_key(subject: &NodeId) -> StoreKey {
+/// The store key of one cleanup tombstone: the subject's node text. The
+/// sweep engine's adapter shares the family's own key discipline.
+pub(crate) fn cleanup_key(subject: &NodeId) -> StoreKey {
   StoreKey::new(Arc::from(subject.as_str().as_bytes().to_vec()))
 }
 
@@ -473,71 +475,15 @@ pub(crate) async fn persist_checkpoint_ctx(
   Ok(())
 }
 
-/// The checkpoint GC pass: delete the collected leave and cleanup
-/// tombstones stamped at or before the latest local checkpoint watermark,
-/// retiring each record's pinned subject binding
-/// in the same transaction (a re-bound subject keeps its new binding,
-/// and a revoked subject keeps the binding its permanent revocation
-/// constrains — see [`records::collect_tombstones_before`]). Bounded
-/// per pass; a raced delete conflicts and stays for the next pass.
-/// Revocation records are never collected here (permanent), and live
-/// entries are never touched (the filter is removal-only). The runtime
-/// cadence owner is the recovery worker's retention sweeps
-/// (`runtime/retention.rs`), gated on the checkpoint existing.
-pub(crate) async fn collect_collected_tombstones_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy,
-) -> Result<usize> {
-  let Some(watermark) = latest_checkpoint_millis_ctx(store).await? else {
-    return Ok(0);
-  };
-  let mut collected = crate::identity::leave::collect_before_ctx(store, entropy, watermark).await?;
-  collected += collect_cleanup_before_ctx(store, entropy, watermark).await?;
-  Ok(collected)
-}
-
-/// The cleanup-side sweep: conditional exact-digest deletes of collected
-/// cleanup tombstones, bounded by
-/// [`TOMBSTONE_GC_BATCH`](crate::identity::records::TOMBSTONE_GC_BATCH)
-/// watermark-eligible records and coupled with each record's pinned
-/// binding retirement (see
-/// [`records::collect_tombstones_before`]) — a tombstone stamped after
-/// the watermark never consumes the batch, so a fresh head cannot hide
-/// the collectible tail behind it.
-async fn collect_cleanup_before_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy, watermark: i64,
-) -> Result<usize> {
-  let namespace = metadata_namespace(CLEANUP_NAMESPACE)?;
-  let collectible = records::scan_collectible_records(
-    store,
-    namespace.clone(),
-    watermark,
-    records::TOMBSTONE_GC_BATCH,
-    records::skip_none,
-    CleanupRecordV1::decode,
-    CleanupRecordV1::timestamp_millis,
-  )
-  .await?;
-  let entries: Vec<_> = collectible
-    .iter()
-    .map(|record| records::CollectibleTombstone {
-      key: cleanup_key(record.subject()),
-      stamp_millis: record.timestamp_millis(),
-      subject: record.subject().clone(),
-      pinned_key: record.subject_key().clone(),
-    })
-    .collect();
-  records::collect_tombstones_before(store, entropy, namespace, watermark, &entries).await
-}
-
 #[cfg(test)]
 mod tests {
   use std::sync::Arc;
 
   use super::{
     CHECKPOINT_NAMESPACE, CLEANUP_RECORD_DOMAIN, CleanupCheckpointV1, CleanupRecordV1,
-    checkpoint_key, cleaned_nodes_ctx, collect_collected_tombstones_ctx, is_cleaned_ctx,
-    issue_checkpoint_ctx, known_cleanup_records_ctx, latest_checkpoint_millis_ctx,
-    metadata_namespace, persist_cleanup_record_ctx, sign_cleanup_record,
+    checkpoint_key, cleaned_nodes_ctx, is_cleaned_ctx, issue_checkpoint_ctx,
+    known_cleanup_records_ctx, latest_checkpoint_millis_ctx, metadata_namespace,
+    persist_cleanup_record_ctx, sign_cleanup_record,
   };
   use crate::{
     ErrorKind, NodeId, PublicKey, Signature,
@@ -553,6 +499,18 @@ mod tests {
 
   fn reference_factory() -> Arc<dyn StorageFactory> {
     Arc::new(ReferenceFactory::new(required_capabilities()))
+  }
+
+  /// The generic sweep engine's pass at the context's adopted checkpoint
+  /// watermark (the engine takes the watermark; the test installs the
+  /// checkpoint that declares it).
+  async fn collect_checkpoint_watermark(
+    store: &crate::storage::MetadataStore, entropy: &dyn crate::api::Entropy,
+  ) -> usize {
+    let watermark = latest_checkpoint_millis_ctx(store).await.unwrap().unwrap();
+    crate::identity::sweep::collect_checkpoint_watermark_ctx(store, entropy, watermark)
+      .await
+      .unwrap()
   }
 
   /// Installs the checkpoint (written directly: unsigned hygiene
@@ -1093,9 +1051,7 @@ mod tests {
     // retirement retires the collected subject's pinned binding, while
     // the revoked subject keeps its binding — permanent exclusion
     // outranks collection, so a fresh-key merge for it still conflicts.
-    let collected = collect_collected_tombstones_ctx(context.store(), entropy.as_ref())
-      .await
-      .unwrap();
+    let collected = collect_checkpoint_watermark(context.store(), entropy.as_ref()).await;
     assert_eq!(collected, 2);
     assert!(
       !is_cleaned_ctx(context.store(), &stale_subject)
@@ -1174,7 +1130,7 @@ mod tests {
     // order). Subjects stay unbound: persistence only rejects a
     // divergent subject binding, never a missing one, and the GC tail
     // behavior under test is independent of bindings.
-    let batch = crate::identity::records::TOMBSTONE_GC_BATCH;
+    let batch = crate::identity::sweep::TOMBSTONE_GC_BATCH;
     let head_subject = node(7_500);
     for index in 0..batch as u128 {
       let subject = node(7_500 + index);
@@ -1213,9 +1169,7 @@ mod tests {
 
     // The sweep walks past the entire fresh head (an over-window
     // tombstone consumes no batch budget) and collects the stale tail.
-    let collected = collect_collected_tombstones_ctx(context.store(), entropy.as_ref())
-      .await
-      .unwrap();
+    let collected = collect_checkpoint_watermark(context.store(), entropy.as_ref()).await;
     assert_eq!(collected, 1);
     assert!(
       !is_cleaned_ctx(context.store(), &stale_subject)
@@ -1285,9 +1239,7 @@ mod tests {
     // terminal evidence nor a resolvable binding.
     install_checkpoint(&context, entropy.as_ref(), 5_000).await;
     assert_eq!(
-      collect_collected_tombstones_ctx(context.store(), entropy.as_ref())
-        .await
-        .unwrap(),
+      collect_checkpoint_watermark(context.store(), entropy.as_ref()).await,
       1
     );
     assert!(!is_cleaned_ctx(context.store(), &subject).await.unwrap());
@@ -1417,8 +1369,8 @@ mod tests {
     let mut resolved = Vec::new();
     let mut kinds = Vec::new();
     for _ in 0..16 {
-      let (collected, observed) = tokio::join!(
-        collect_collected_tombstones_ctx(store, entropy.as_ref()),
+      let (_collected, observed) = tokio::join!(
+        collect_checkpoint_watermark(store, entropy.as_ref()),
         async {
           let mut resolved = Vec::new();
           let mut kinds = Vec::new();
@@ -1433,7 +1385,6 @@ mod tests {
           (resolved, kinds)
         },
       );
-      collected.unwrap();
       resolved.extend(observed.0);
       kinds.extend(observed.1);
     }

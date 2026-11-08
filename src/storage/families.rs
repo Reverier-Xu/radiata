@@ -67,12 +67,33 @@ pub(crate) fn namespace(tag: &str) -> crate::Result<crate::StoreNamespace> {
   Ok(crate::StoreNamespace::new(tag))
 }
 
+/// The reserved row label key carrying one row's cleanup policy. The
+/// value is a [`FamilyCleanup`] vocabulary spelling, validated against
+/// the typed vocabulary at seal and fail-closed on unknown values. The
+/// label is core-verb-writable only: on the swept families the admission
+/// declaration already refuses external writes, so users never set it —
+/// core verbs mutate it through encapsulated semantic operations. The
+/// key lives in the closed `labels` category, so it is an ordinary label
+/// key to the selector grammar: a row that does not carry it simply
+/// never matches a selector term naming it, and no reserved-key
+/// special-casing enters the selector evaluation.
+pub(crate) const CLEANUP_POLICY_LABEL_KEY: &str = "radiata.woooo.tech/labels/cleanup-policy";
+
+/// Validates one caller-supplied cleanup-policy label value against the
+/// typed vocabulary: seal fails closed on an unknown value, so a policy
+/// spelling this binary does not know can never persist through it.
+pub(crate) fn validate_cleanup_policy_label(value: &str) -> crate::Result<()> {
+  catalog::FamilyCleanup::from_label_value(value)
+    .map(|_| ())
+    .ok_or_else(|| crate::Error::invalid_input("cleanup policy label"))
+}
+
 /// The owning domain of every catalog family; consumers classify families
 /// through the catalog itself (iterate [`metadata_families`]) instead of
 /// by copying namespace lists.
 pub(crate) use catalog::{
-  FamilyAdmission, FamilyCleanup, FamilyContest, FamilyPolicy, FamilyVisibility, MetadataDomain,
-  MetadataFamily, metadata_families,
+  FamilyAdmission, FamilyCleanup, FamilyContest, FamilyPin, FamilyPolicy, FamilyRetirement,
+  FamilyVisibility, MetadataDomain, MetadataFamily, metadata_families,
 };
 
 /// The declared policy of one catalog family, resolved by namespace: the
@@ -167,13 +188,12 @@ mod catalog {
   }
 
   /// The cleanup vocabulary of one family: the sweep class its rows
-  /// belong to. This is the typed placeholder mirroring today's hardcoded
-  /// sweep classes (the leave wipe scope, the checkpoint GC collection,
-  /// the provider deletion flow, and the storage-internal families); the
-  /// sweep implementations still consume their own scoped logic, and a
-  /// later phase replaces those hardcoded classes with these
-  /// declarations. One class per family; per-row refinement is that
-  /// phase's work.
+  /// belong to. The generic sweep engine (identity `sweep`) consumes the
+  /// declared class per row: rows of the checkpoint-collected families
+  /// carry the class as their reserved [`CLEANUP_POLICY_LABEL_KEY`]
+  /// label, and every family's class is declared here at registration.
+  /// One class per family; per-row refinement is the retirement
+  /// declaration on [`FamilyPolicy`].
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   pub(crate) enum FamilyCleanup {
     /// Wiped whole by a leave's domain wipe (the member-visible families
@@ -195,23 +215,89 @@ mod catalog {
     StorageInternal,
   }
 
-  /// The declared policy of one metadata family: the four aspects the
-  /// storage contract and the enforcement seams consume. Declared per
-  /// family at the catalog rows, so a new family is correct by
-  /// declaration instead of by consumer edits. The admission aspect
+  impl FamilyCleanup {
+    /// The durable label value spelling of the class: the one text a
+    /// [`CLEANUP_POLICY_LABEL_KEY`] label may carry for it, and the one
+    /// text the sweep engine maps back to the class.
+    pub(crate) const fn label_value(self) -> &'static str {
+      match self {
+        Self::LeaveWipe => "leave-wipe",
+        Self::CheckpointCollected => "checkpoint-collected",
+        Self::StoreHygiene => "store-hygiene",
+        Self::ProviderDeletionFlow => "provider-deletion-flow",
+        Self::StorageInternal => "storage-internal",
+      }
+    }
+
+    /// Parses one policy-label value back to its class. `None` is an
+    /// unknown vocabulary value: a node whose binary predates the value
+    /// never sweeps the row carrying it (bounded-degrading, fail-closed
+    /// on the retention side — the row is retained, never dropped).
+    pub(crate) fn from_label_value(value: &str) -> Option<Self> {
+      let class = match value {
+        "leave-wipe" => Self::LeaveWipe,
+        "checkpoint-collected" => Self::CheckpointCollected,
+        "store-hygiene" => Self::StoreHygiene,
+        "provider-deletion-flow" => Self::ProviderDeletionFlow,
+        "storage-internal" => Self::StorageInternal,
+        _ => return None,
+      };
+      debug_assert_eq!(class.label_value(), value);
+      Some(class)
+    }
+  }
+
+  /// Whether the family's rows permanently pin their subject node while
+  /// they live: the sweep engine keeps such a subject's identity binding
+  /// even when a collected tombstone pins it too. This is the declared
+  /// cross-family rule (revocation's permanent exclusion) — declared at
+  /// the catalog row instead of hardcoded into the sweep.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(crate) enum FamilyPin {
+    /// A live row of this family permanently pins its subject.
+    PermanentSubject,
+    /// The family's rows pin no subject (the default).
+    Unpinned,
+  }
+
+  /// Whether collecting a checkpoint-collected row of this family
+  /// retires the subject binding the row pins, in the collection's own
+  /// transaction. The per-family declaration parameter of the
+  /// checkpoint-watermark class: the retirement semantics are a
+  /// refinement one boolean wide, so they ride the class instead of
+  /// forking a separate sweep class for it.
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  pub(crate) enum FamilyRetirement {
+    /// Collection retires the pinned subject binding.
+    RetirePinnedBinding,
+    /// Collection leaves bindings alone (the default).
+    KeepPinnedBinding,
+  }
+
+  /// The declared policy of one metadata family: the aspects the storage
+  /// contract, the enforcement seams, and the sweep engine consume.
+  /// Declared per family at the catalog rows, so a new family is correct
+  /// by declaration instead of by consumer edits. The admission aspect
   /// gates the store's write seam (the plain prepare entry refuses
   /// core-verb-gated families), the visibility aspect gates the public
-  /// read helpers, and the cleanup aspect drives the leave wipe scope.
+  /// read helpers, the cleanup aspect names the family's sweep class,
+  /// and the pin and retirement aspects declare the sweep engine's
+  /// cross-family and per-family refinement semantics.
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   pub(crate) struct FamilyPolicy {
     contest: FamilyContest,
     admission: FamilyAdmission,
     visibility: FamilyVisibility,
     cleanup: FamilyCleanup,
+    pin: FamilyPin,
+    retirement: FamilyRetirement,
   }
 
   impl FamilyPolicy {
-    /// Declares the four aspects of one family.
+    /// Declares the family's aspects; the pin and retirement defaults
+    /// (unpinned, keep-pinned-binding) cover every family whose sweep
+    /// class needs no refinement — the catalog rows that need one
+    /// specialize through [`Self::with_pin`] and [`Self::with_retirement`].
     pub(crate) const fn new(
       contest: FamilyContest, admission: FamilyAdmission, visibility: FamilyVisibility,
       cleanup: FamilyCleanup,
@@ -221,7 +307,21 @@ mod catalog {
         admission,
         visibility,
         cleanup,
+        pin: FamilyPin::Unpinned,
+        retirement: FamilyRetirement::KeepPinnedBinding,
       }
+    }
+
+    /// Specializes the pin declaration (a const builder, so catalog
+    /// rows stay `const` expressions).
+    pub(crate) const fn with_pin(self, pin: FamilyPin) -> Self {
+      Self { pin, ..self }
+    }
+
+    /// Specializes the retirement declaration (a const builder, so
+    /// catalog rows stay `const` expressions).
+    pub(crate) const fn with_retirement(self, retirement: FamilyRetirement) -> Self {
+      Self { retirement, ..self }
     }
 
     pub(crate) const fn contest(&self) -> FamilyContest {
@@ -238,6 +338,14 @@ mod catalog {
 
     pub(crate) const fn cleanup(&self) -> FamilyCleanup {
       self.cleanup
+    }
+
+    pub(crate) const fn pin(&self) -> FamilyPin {
+      self.pin
+    }
+
+    pub(crate) const fn retirement(&self) -> FamilyRetirement {
+      self.retirement
     }
   }
 
@@ -351,7 +459,11 @@ mod catalog {
       MetadataFamily::new(
         MetadataDomain::Identity,
         REVOCATION_NAMESPACE,
-        core_policy(FamilyContest::CanonicalWinner, FamilyCleanup::LeaveWipe),
+        // The permanent-exclusion declaration: a live revocation row
+        // permanently pins its subject, so the sweep engine keeps the
+        // subject's binding even when a collected tombstone pins it too.
+        core_policy(FamilyContest::CanonicalWinner, FamilyCleanup::LeaveWipe)
+          .with_pin(FamilyPin::PermanentSubject),
       ),
       MetadataFamily::new(
         MetadataDomain::Identity,
@@ -359,7 +471,8 @@ mod catalog {
         core_policy(
           FamilyContest::GuardedSingleRecord,
           FamilyCleanup::CheckpointCollected,
-        ),
+        )
+        .with_retirement(FamilyRetirement::RetirePinnedBinding),
       ),
       MetadataFamily::new(
         MetadataDomain::Identity,
@@ -367,7 +480,8 @@ mod catalog {
         core_policy(
           FamilyContest::CanonicalWinner,
           FamilyCleanup::CheckpointCollected,
-        ),
+        )
+        .with_retirement(FamilyRetirement::RetirePinnedBinding),
       ),
       MetadataFamily::new(
         MetadataDomain::Identity,
@@ -583,6 +697,36 @@ mod catalog {
           REVOCATION_NAMESPACE,
         ]
       );
+    }
+
+    /// The label vocabulary is a bijection: every class's spelling
+    /// parses back to exactly that class, and no other text parses at
+    /// all — an unknown value is the fail-closed `None` the sweep engine
+    /// and the seal validation consume.
+    #[test]
+    fn the_cleanup_policy_label_vocabulary_is_a_bijection() {
+      for class in [
+        FamilyCleanup::LeaveWipe,
+        FamilyCleanup::CheckpointCollected,
+        FamilyCleanup::StoreHygiene,
+        FamilyCleanup::ProviderDeletionFlow,
+        FamilyCleanup::StorageInternal,
+      ] {
+        assert_eq!(
+          FamilyCleanup::from_label_value(class.label_value()),
+          Some(class),
+          "class spelling does not roundtrip: {}",
+          class.label_value()
+        );
+      }
+      assert_eq!(FamilyCleanup::from_label_value(""), None);
+      assert_eq!(FamilyCleanup::from_label_value("checkpoint"), None);
+      assert_eq!(
+        FamilyCleanup::from_label_value("CHECKPOINT-COLLECTED"),
+        None
+      );
+      assert_eq!(FamilyCleanup::from_label_value("leave-wipe "), None);
+      assert_eq!(FamilyCleanup::from_label_value("permanent"), None);
     }
 
     /// The registry lookup behind the classification guards.

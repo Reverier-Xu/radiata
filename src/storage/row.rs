@@ -3,12 +3,12 @@
 //! Every migrated family persists one envelope: name, labels, version,
 //! and payload. The name is the namespace-qualified row key (the family's
 //! existing key discipline, unchanged); the labels are the row's label
-//! vocabulary (identity families store the empty set — policy-as-row-data
-//! arrives in a later phase); the version is the family's monotonic
-//! ordering element typed once at the envelope; the payload is the opaque
-//! canonical record bytes — user-domain payloads stay opaque, core-domain
-//! payloads stay typed through their own record codecs at the domain
-//! boundary.
+//! vocabulary (identity families store the empty set, and the declared
+//! cleanup policy is stamped on the rows whose sweep consumes policy per
+//! row); the version is the family's monotonic ordering element typed
+//! once at the envelope; the payload is the opaque canonical record bytes
+//! — user-domain payloads stay opaque, core-domain payloads stay typed
+//! through their own record codecs at the domain boundary.
 //!
 //! The envelope is the stored `StoreValue` bytes; the reconcile plane's
 //! row content is the envelope's payload element. Byte stability is the
@@ -231,10 +231,53 @@ impl<'bytes, Ctx> Decode<'bytes, Ctx> for RowVersionWire {
 }
 
 impl RowEnvelope {
+  /// Validates the caller's label set against the reserved
+  /// cleanup-policy vocabulary and stamps the row's declared cleanup
+  /// policy when the family's rows carry row-level policy and the caller
+  /// did not supply the label itself.
+  ///
+  /// The row-level policy label rides exactly the rows the sweep engine
+  /// consumes policy per row (the checkpoint-collected families); every
+  /// other family's cleanup policy is fully declared at registration and
+  /// consulted through the catalog, so a per-row label there would have
+  /// no consumer while spending envelope bytes and the bounded label
+  /// budget. A caller-supplied policy label — a core verb's encapsulated
+  /// policy mutation — overrides the declaration stamp after passing the
+  /// same vocabulary validation: an unknown value fails closed at seal.
+  fn resolved_labels(namespace: &StoreNamespace, labels: &LabelSet) -> crate::Result<LabelSet> {
+    let mut resolved = LabelSet::new();
+    for (key, value) in labels.entries() {
+      if key.as_str() == super::families::CLEANUP_POLICY_LABEL_KEY {
+        super::families::validate_cleanup_policy_label(value.as_str())?;
+      }
+      // The source set is already canonical (unique keys, bounded), so
+      // the rebuild cannot collide or overflow; the typed error keeps
+      // the invariant local instead of an unreachable path.
+      resolved = resolved
+        .insert(key.clone(), value.clone())
+        .map_err(|_| crate::Error::invalid_input("row envelope labels"))?;
+    }
+    let policy_key = crate::LabelKey::parse(super::families::CLEANUP_POLICY_LABEL_KEY)?;
+    if !resolved.contains_key(&policy_key)
+      && let Ok(policy) = super::families::family_policy(namespace)
+      && policy.cleanup() == super::families::FamilyCleanup::CheckpointCollected
+    {
+      resolved = resolved
+        .insert(
+          policy_key,
+          crate::LabelValue::parse(policy.cleanup().label_value())?,
+        )
+        .map_err(|_| crate::Error::invalid_input("row envelope labels"))?;
+    }
+    Ok(resolved)
+  }
+
   /// Seals one row into its stored value: the canonical envelope bytes
   /// over `payload` under `labels` (the row's own label vocabulary;
-  /// the label-free families pass the empty set), versioned by
-  /// `revision` (the identity families' CAS-revision element).
+  /// the label-free families pass the empty set, and the declared
+  /// cleanup policy is stamped where rows carry row-level policy),
+  /// versioned by `revision` (the identity families' CAS-revision
+  /// element).
   pub(crate) fn seal(
     namespace: &StoreNamespace, key: &StoreKey, revision: &StoreRevision, labels: &LabelSet,
     payload: Arc<[u8]>,
@@ -259,9 +302,10 @@ impl RowEnvelope {
     if payload.is_empty() {
       return Err(crate::Error::invalid_input("row envelope payload"));
     }
+    let labels = Self::resolved_labels(namespace, labels)?;
     let envelope = Self {
       name: RowName::new(namespace.clone(), key.clone()),
-      labels: labels.clone(),
+      labels,
       version,
       payload,
     };
@@ -272,6 +316,17 @@ impl RowEnvelope {
   /// record bytes the family's own codec decodes.
   pub(crate) fn open(bytes: &[u8]) -> crate::Result<Vec<u8>> {
     Ok(Self::decode(bytes)?.payload.to_vec())
+  }
+
+  /// The row's label vocabulary (the sweep engine reads the declared
+  /// cleanup policy from it).
+  pub(crate) fn labels(&self) -> &LabelSet {
+    &self.labels
+  }
+
+  /// The row's payload element (the canonical record bytes).
+  pub(crate) fn payload(&self) -> &[u8] {
+    &self.payload
   }
 
   /// Decodes one canonical envelope, rejecting non-canonical encodings,
@@ -433,6 +488,91 @@ mod tests {
       .kind(),
       crate::ErrorKind::InvalidInput
     );
+  }
+
+  /// The declared cleanup policy is stamped on the rows whose sweep
+  /// consumes policy per row (the checkpoint-collected families), a
+  /// caller-supplied policy label overrides the stamp after passing the
+  /// vocabulary validation, an unknown policy value fails closed at
+  /// seal, and families without row-level policy keep the caller's
+  /// exact label set (the golden fixture above stays byte-stable).
+  #[test]
+  fn seal_stamps_the_declared_cleanup_policy_and_validates_the_vocabulary() {
+    let payload: std::sync::Arc<[u8]> = std::sync::Arc::from(&[1_u8, 2, 3][..]);
+    let policy_key = crate::LabelKey::parse(families::CLEANUP_POLICY_LABEL_KEY).unwrap();
+    let cleanup_namespace = families::namespace(families::CLEANUP_NAMESPACE).unwrap();
+
+    // The checkpoint-collected family stamps its declared class.
+    let sealed = RowEnvelope::seal(
+      &cleanup_namespace,
+      &key(),
+      &revision(),
+      &crate::LabelSet::new(),
+      payload.clone(),
+    )
+    .unwrap();
+    let decoded = RowEnvelope::decode(sealed.as_bytes()).unwrap();
+    assert_eq!(
+      decoded
+        .labels
+        .get(&policy_key)
+        .map(crate::LabelValue::as_str),
+      Some(families::FamilyCleanup::CheckpointCollected.label_value())
+    );
+
+    // A caller-supplied known value overrides the declaration stamp.
+    let relabeled = crate::LabelSet::new()
+      .insert(
+        policy_key.clone(),
+        crate::LabelValue::parse(families::FamilyCleanup::StorageInternal.label_value()).unwrap(),
+      )
+      .unwrap();
+    let sealed = RowEnvelope::seal(
+      &cleanup_namespace,
+      &key(),
+      &revision(),
+      &relabeled,
+      payload.clone(),
+    )
+    .unwrap();
+    let decoded = RowEnvelope::decode(sealed.as_bytes()).unwrap();
+    assert_eq!(
+      decoded
+        .labels
+        .get(&policy_key)
+        .map(crate::LabelValue::as_str),
+      Some(families::FamilyCleanup::StorageInternal.label_value())
+    );
+
+    // An unknown policy value fails closed at seal.
+    let unknown = crate::LabelSet::new()
+      .insert(policy_key, crate::LabelValue::parse("permanent").unwrap())
+      .unwrap();
+    assert_eq!(
+      RowEnvelope::seal(
+        &cleanup_namespace,
+        &key(),
+        &revision(),
+        &unknown,
+        payload.clone()
+      )
+      .unwrap_err()
+      .kind(),
+      crate::ErrorKind::InvalidInput
+    );
+
+    // A family without row-level policy keeps the caller's exact labels.
+    let revocation_namespace = families::namespace(families::REVOCATION_NAMESPACE).unwrap();
+    let sealed = RowEnvelope::seal(
+      &revocation_namespace,
+      &key(),
+      &revision(),
+      &crate::LabelSet::new(),
+      payload,
+    )
+    .unwrap();
+    let decoded = RowEnvelope::decode(sealed.as_bytes()).unwrap();
+    assert_eq!(decoded.labels.entries().count(), 0);
   }
 
   /// Every non-canonical or out-of-grammar mutation fails closed at

@@ -219,7 +219,9 @@ pub(crate) async fn sign_leave_record(
   ))
 }
 
-fn leave_record_key(node: &NodeId) -> StoreKey {
+/// The store key of one leave record: the subject's node text. The sweep
+/// engine's adapter shares the family's own key discipline.
+pub(crate) fn leave_record_key(node: &NodeId) -> StoreKey {
   StoreKey::new(Arc::from(node.as_str().as_bytes().to_vec()))
 }
 
@@ -293,8 +295,9 @@ pub(crate) async fn known_leave_records_ctx(
 }
 
 /// The leave family's namespace carries the leave-intent singleton under
-/// [`INTENT_KEY`]; the known-records scan must not decode it as a record.
-fn intent_key_skip(key: &StoreKey) -> bool {
+/// [`INTENT_KEY`]; the known-records scan and the sweep engine's
+/// checkpoint pass must not decode it as a record.
+pub(crate) fn intent_key_skip(key: &StoreKey) -> bool {
   key.as_bytes() == INTENT_KEY
 }
 
@@ -303,39 +306,6 @@ fn intent_key_skip(key: &StoreKey) -> bool {
 /// the known-records scan.
 pub(crate) fn is_intent_key(key: &[u8]) -> bool {
   key == INTENT_KEY
-}
-
-/// The leave-side checkpoint sweep: conditional exact-digest deletes of
-/// collected leave records stamped at or before `watermark`, each
-/// coupled with the retirement of the record's pinned subject binding
-/// (see [`records::collect_tombstones_before`]). The leave intent
-/// singleton is never touched, and the batch bound counts only
-/// watermark-eligible records, so a fresh head never hides the
-/// collectible tail behind it.
-pub(crate) async fn collect_before_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy, watermark: i64,
-) -> Result<usize> {
-  let namespace = leave_namespace()?;
-  let collectible = records::scan_collectible_records(
-    store,
-    namespace.clone(),
-    watermark,
-    records::TOMBSTONE_GC_BATCH,
-    intent_key_skip,
-    LeaveRecordV1::decode,
-    LeaveRecordV1::timestamp_millis,
-  )
-  .await?;
-  let entries: Vec<_> = collectible
-    .iter()
-    .map(|record| records::CollectibleTombstone {
-      key: leave_record_key(record.node()),
-      stamp_millis: record.timestamp_millis(),
-      subject: record.node().clone(),
-      pinned_key: record.public_key().clone(),
-    })
-    .collect();
-  records::collect_tombstones_before(store, entropy, namespace, watermark, &entries).await
 }
 
 /// One journaled leave drive: the signed terminal record plus the intent
@@ -794,7 +764,7 @@ mod tests {
   use std::{sync::Arc, time::Duration};
 
   use super::{
-    LeaveIntentV1, LeaveRecordV1, collect_before_ctx, discover_leave_intent, execute, is_left_ctx,
+    LeaveIntentV1, LeaveRecordV1, discover_leave_intent, execute, is_left_ctx,
     known_leave_records_ctx, left_nodes_ctx, persist_leave_record_ctx, resume_if_pending,
     sign_leave_record, wipe_namespaces,
   };
@@ -999,7 +969,7 @@ mod tests {
     // (zero-padded node ids keep store-key order equal to numeric
     // order), then the stale tail stamped before the watermark under the
     // next-larger key, behind the entire fresh head.
-    let batch = crate::identity::records::TOMBSTONE_GC_BATCH;
+    let batch = crate::identity::sweep::TOMBSTONE_GC_BATCH;
     let head_subject = node(8_000);
     for index in 0..batch as u128 {
       let subject = node(8_000 + index);
@@ -1017,9 +987,13 @@ mod tests {
 
     // The sweep walks past the entire fresh head (an over-window record
     // consumes no batch budget) and collects the stale tail.
-    let collected = collect_before_ctx(context.store(), entropy.as_ref(), 5_000)
-      .await
-      .unwrap();
+    let collected = crate::identity::sweep::collect_checkpoint_watermark_ctx(
+      context.store(),
+      entropy.as_ref(),
+      5_000,
+    )
+    .await
+    .unwrap();
     assert_eq!(collected, 1);
     assert!(!is_left_ctx(context.store(), &stale_subject).await.unwrap());
     assert!(is_left_ctx(context.store(), &head_subject).await.unwrap());
@@ -1091,9 +1065,13 @@ mod tests {
     // subject carries neither terminal evidence nor a resolvable
     // binding.
     assert_eq!(
-      collect_before_ctx(context.store(), entropy.as_ref(), 5_000)
-        .await
-        .unwrap(),
+      crate::identity::sweep::collect_checkpoint_watermark_ctx(
+        context.store(),
+        entropy.as_ref(),
+        5_000
+      )
+      .await
+      .unwrap(),
       1
     );
     assert!(!is_left_ctx(context.store(), &subject).await.unwrap());
@@ -1126,9 +1104,13 @@ mod tests {
         .contains_key(&subject)
     );
     assert_eq!(
-      collect_before_ctx(context.store(), entropy.as_ref(), 5_000)
-        .await
-        .unwrap(),
+      crate::identity::sweep::collect_checkpoint_watermark_ctx(
+        context.store(),
+        entropy.as_ref(),
+        5_000
+      )
+      .await
+      .unwrap(),
       1
     );
     assert!(!is_left_ctx(context.store(), &subject).await.unwrap());
