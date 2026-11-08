@@ -716,9 +716,10 @@ mod tests {
   /// Endpoint-level failover for the degree plane: a multi-homed member
   /// whose first endpoint is unreachable is dialed on its SECOND endpoint
   /// by the next maintenance tick —
-  /// the same per-member rotation the recovery plane applies, so maintenance dials never hammer a dead first endpoint forever. A
-  /// single-endpoint projection would dial the first endpoint again and
-  /// the second listener would never see a connection.
+  /// the same per-member rotation the recovery plane applies, so maintenance
+  /// dials never hammer a dead first endpoint forever. A single-endpoint
+  /// projection would dial the first endpoint again and the second listener
+  /// would never see a connection.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn maintenance_dials_rotate_to_the_second_endpoint_when_the_first_stalls() {
     let (reference, config) = test_support::reference_and_config();
