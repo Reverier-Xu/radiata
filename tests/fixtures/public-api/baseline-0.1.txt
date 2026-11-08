@@ -3,7 +3,10 @@ pub mod radiata::adapters
 pub fn radiata::adapters::ephemeral_key_store() -> alloc::rcs::arc::Arc<dyn radiata::extension::KeyProvider>
 pub fn radiata::adapters::file_key_store(std::path::PathBuf) -> alloc::rcs::arc::Arc<dyn radiata::extension::KeyProvider>
 pub fn radiata::adapters::json_store(std::path::PathBuf) -> alloc::rcs::arc::Arc<dyn radiata::extension::StorageFactory>
+pub fn radiata::adapters::memory_store() -> alloc::rcs::arc::Arc<dyn radiata::extension::StorageFactory>
 pub fn radiata::adapters::redb_store(std::path::PathBuf) -> alloc::rcs::arc::Arc<dyn radiata::extension::StorageFactory>
+pub mod radiata::contract
+pub async fn radiata::contract::run_storage_contract<F>(F) where F: core::ops::function::Fn() -> alloc::rcs::arc::Arc<dyn radiata::extension::StorageFactory>
 pub mod radiata::extension
 pub trait radiata::extension::Entropy: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::extension::Entropy::fill(&self, &mut [u8]) -> radiata::Result<()>
@@ -289,6 +292,7 @@ pub struct radiata::EventOptions
 impl radiata::EventOptions
 pub fn radiata::EventOptions::capacity(self, usize) -> radiata::Result<Self>
 pub fn radiata::EventOptions::new() -> Self
+pub fn radiata::EventOptions::predicate(self, radiata::SubscriptionPredicate) -> Self
 impl core::default::Default for radiata::EventOptions
 pub fn radiata::EventOptions::default() -> Self
 pub struct radiata::EventSubscription<E: radiata::Event>
@@ -569,6 +573,7 @@ pub fn radiata::NodeHandle::trust(&self) -> radiata::Trust
 pub async fn radiata::NodeHandle::wait_for_shutdown(&self) -> radiata::Result<radiata::ShutdownReason>
 pub fn radiata::NodeHandle::watch<E: radiata::Event>(&self, radiata::EventOptions) -> radiata::Result<radiata::EventSubscription<E>>
 pub async fn radiata::NodeHandle::watch_resources(&self, core::option::Option<u64>) -> radiata::Result<radiata::ResourceWatch>
+pub async fn radiata::NodeHandle::watch_resources_with(&self, radiata::ResourceWatchOptions) -> radiata::Result<radiata::ResourceWatch>
 impl radiata::NodeHandle
 pub fn radiata::NodeHandle::member_revision(&self) -> radiata::MemberRevision
 pub fn radiata::NodeHandle::open_stream(&self, radiata::StreamTarget, radiata::ProtocolTag, radiata::StreamPolicy, radiata::StreamMetadata) -> radiata::Result<radiata::OutboundStream>
@@ -705,6 +710,7 @@ pub const fn radiata::ResourceChange::name(&self) -> &radiata::ResourceName
 pub const fn radiata::ResourceChange::version(&self) -> u64
 pub struct radiata::ResourceChanged
 impl radiata::ResourceChanged
+pub const fn radiata::ResourceChanged::labels(&self) -> &radiata::ResourceLabels
 pub const fn radiata::ResourceChanged::origin(&self) -> radiata::ResourceOrigin
 pub const fn radiata::ResourceChanged::removal(&self) -> bool
 pub fn radiata::ResourceChanged::resource(&self) -> &radiata::ResourceName
@@ -725,6 +731,7 @@ pub fn radiata::ResourceMutationView::is_current_winner(&self) -> bool
 pub struct radiata::ResourceName(_)
 impl radiata::ResourceName
 pub fn radiata::ResourceName::as_str(&self) -> &str
+pub fn radiata::ResourceName::domain(&self) -> &str
 pub fn radiata::ResourceName::parse(&str) -> radiata::Result<Self>
 impl core::fmt::Debug for radiata::ResourceName
 pub fn radiata::ResourceName::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -765,6 +772,11 @@ pub fn radiata::ResourceView::version(&self) -> &radiata::ResourceVersion
 pub struct radiata::ResourceWatch
 impl radiata::ResourceWatch
 pub async fn radiata::ResourceWatch::next(&mut self) -> core::result::Result<radiata::ResourceChange, radiata::ResourceFeedError>
+pub struct radiata::ResourceWatchOptions
+impl radiata::ResourceWatchOptions
+pub fn radiata::ResourceWatchOptions::from(self, u64) -> Self
+pub fn radiata::ResourceWatchOptions::new() -> Self
+pub fn radiata::ResourceWatchOptions::predicate(self, radiata::SubscriptionPredicate) -> Self
 pub struct radiata::ResourceWrite
 impl radiata::ResourceWrite
 pub const fn radiata::ResourceWrite::labels(&self) -> &radiata::ResourceLabels
@@ -932,6 +944,13 @@ pub fn radiata::StreamPolicy::load_balancing_policy(&self) -> core::option::Opti
 pub fn radiata::StreamPolicy::max_hops(&self) -> u32
 pub fn radiata::StreamPolicy::new(radiata::RoutingPolicy, u32) -> radiata::Result<Self>
 pub fn radiata::StreamPolicy::routing_policy(&self) -> &radiata::RoutingPolicy
+pub struct radiata::SubscriptionPredicate
+impl radiata::SubscriptionPredicate
+pub fn radiata::SubscriptionPredicate::domain(self, &str) -> radiata::Result<Self>
+pub fn radiata::SubscriptionPredicate::domains(&self) -> impl core::iter::traits::iterator::Iterator<Item = &str> + '_
+pub const fn radiata::SubscriptionPredicate::label_selector(&self) -> core::option::Option<&radiata::Selector>
+pub fn radiata::SubscriptionPredicate::new() -> Self
+pub fn radiata::SubscriptionPredicate::selector(self, &str) -> radiata::Result<Self>
 pub struct radiata::TaggedEvent
 impl radiata::TaggedEvent
 pub const fn radiata::TaggedEvent::payload(&self) -> &alloc::rcs::arc::Arc<[u8]>
@@ -1146,6 +1165,8 @@ pub fn radiata::TransportProvider::admission(&self) -> radiata::TransportAdmissi
 pub fn radiata::TransportProvider::bind(&self, radiata::Endpoint) -> radiata::BoxFuture<'static, radiata::Result<alloc::boxed::Box<dyn radiata::ProviderListener>>>
 pub fn radiata::TransportProvider::connect(&self, radiata::Endpoint) -> radiata::BoxFuture<'static, radiata::Result<alloc::boxed::Box<dyn radiata::TransportStream>>>
 pub trait radiata::TransportStream: tokio::io::async_read::AsyncRead + tokio::io::async_write::AsyncWrite + core::fmt::Debug + core::marker::Unpin + core::marker::Send + 'static
+pub fn radiata::commit_precheck(&radiata::StoreTransaction, impl core::ops::function::FnMut(&radiata::TransactionId) -> radiata::Result<core::option::Option<radiata::CommitReceipt>>, impl core::ops::function::FnOnce() -> radiata::Result<radiata::StoreRevision>, impl core::ops::function::FnMut(&radiata::StoreNamespace, &radiata::StoreKey) -> radiata::Result<core::option::Option<radiata::Digest>>) -> radiata::Result<core::option::Option<radiata::CommitOutcome>>
+pub fn radiata::condition_matches(impl core::ops::function::FnMut(&radiata::StoreNamespace, &radiata::StoreKey) -> radiata::Result<core::option::Option<radiata::Digest>>, impl core::ops::function::FnMut(&radiata::TransactionId) -> radiata::Result<core::option::Option<radiata::Digest>>, &radiata::StoreOperation) -> radiata::Result<bool>
 pub fn radiata::store_scan_stream(alloc::boxed::Box<(dyn radiata::extension::StoreScan + '_)>) -> futures_core::stream::BoxStream<'_, radiata::Result<radiata::StoreEntry>>
 pub type radiata::BoxFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = T> + core::marker::Send + 'a)>>
 pub type radiata::Result<T, E> = core::result::Result<T, E>
