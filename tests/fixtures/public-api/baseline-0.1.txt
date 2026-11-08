@@ -48,6 +48,9 @@ pub radiata::ConnectionDegreeState::Unhealthy
 pub radiata::ConnectivityStatus::Connected
 pub radiata::ConnectivityStatus::Reachable
 pub radiata::ConnectivityStatus::Unknown
+pub enum radiata::DialObservation
+pub radiata::DialObservation::Delivered(core::time::Duration)
+pub radiata::DialObservation::Failed
 #[non_exhaustive] pub enum radiata::DurabilityLevel
 pub radiata::DurabilityLevel::OsCrashDurable
 pub radiata::DurabilityLevel::ProcessCrashAtomic
@@ -210,6 +213,9 @@ pub const fn radiata::TransportScheme::builtin_tag(self) -> &'static str
 pub const fn radiata::TransportScheme::canonical(self) -> &'static str
 impl core::fmt::Display for radiata::TransportScheme
 pub fn radiata::TransportScheme::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum radiata::TriggerSourceKind
+pub radiata::TriggerSourceKind::Event
+pub radiata::TriggerSourceKind::Time
 #[non_exhaustive] pub enum radiata::TrustStatus
 pub radiata::TrustStatus::Revoked
 pub radiata::TrustStatus::Trusted
@@ -282,6 +288,13 @@ pub fn radiata::Endpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt
 impl core::str::traits::FromStr for radiata::Endpoint
 pub type radiata::Endpoint::Err = radiata::Error
 pub fn radiata::Endpoint::from_str(&str) -> radiata::Result<Self>
+pub struct radiata::EndpointSelector
+impl radiata::EndpointSelector
+pub fn radiata::EndpointSelector::new(alloc::rcs::arc::Arc<dyn radiata::EndpointSelectionPolicy>) -> Self
+pub fn radiata::EndpointSelector::next_endpoint(&self, &radiata::NodeId, &[radiata::Endpoint]) -> core::option::Option<radiata::Endpoint>
+pub fn radiata::EndpointSelector::observe_outcome(&self, &radiata::Endpoint, radiata::DialObservation)
+impl core::fmt::Debug for radiata::EndpointSelector
+pub fn radiata::EndpointSelector::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct radiata::Error
 impl radiata::Error
 pub fn radiata::Error::caller(impl core::convert::Into<alloc::borrow::Cow<'static, str>>) -> Self
@@ -319,6 +332,7 @@ impl radiata::ExtensionRegistry
 pub fn radiata::ExtensionRegistry::new() -> Self
 pub fn radiata::ExtensionRegistry::register_action_hook(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::ActionHook>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_default(&mut self) -> radiata::Result<&mut Self>
+pub fn radiata::ExtensionRegistry::register_endpoint_policy(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::EndpointSelectionPolicy>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_feature(&mut self, radiata::FeatureDefinition) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_load_balancer(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::LoadBalancingPolicy>) -> radiata::Result<&mut Self>
 pub fn radiata::ExtensionRegistry::register_next_hop(&mut self, radiata::QualifiedTag, alloc::rcs::arc::Arc<dyn radiata::RouteNextHop>) -> radiata::Result<&mut Self>
@@ -524,6 +538,8 @@ pub fn radiata::NodeConfig::with_anti_entropy_interval(self, core::time::Duratio
 pub fn radiata::NodeConfig::with_authentication_deadline(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_connection_degree(self, usize) -> Self
 pub fn radiata::NodeConfig::with_dial_deadline(self, core::time::Duration) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_endpoint_policy(self, radiata::QualifiedTag) -> Self
+pub fn radiata::NodeConfig::with_endpoint_preference(self, alloc::vec::Vec<radiata::TransportName>) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_merge_admission(self, radiata::MergeAdmissionLimits) -> Self
 pub fn radiata::NodeConfig::with_receipt_retention(self, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_recovery_policy(self, radiata::RecoveryConfig) -> radiata::Result<Self>
@@ -532,6 +548,7 @@ pub fn radiata::NodeConfig::with_resource_removal_retention(self, core::time::Du
 pub fn radiata::NodeConfig::with_route_policy(self, radiata::QualifiedTag) -> Self
 pub fn radiata::NodeConfig::with_session_liveness(self, core::time::Duration, core::time::Duration, core::time::Duration) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_session_queue_limits(self, usize, usize) -> radiata::Result<Self>
+pub fn radiata::NodeConfig::with_task_reconcile_controller_slots(self, usize) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_task_reconcile_extension_slots(self, usize) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_task_reconcile_slots(self, usize, usize) -> radiata::Result<Self>
 pub fn radiata::NodeConfig::with_trace_metadata_limits(self, radiata::TraceMetadataLimits) -> radiata::Result<Self>
@@ -569,6 +586,7 @@ pub fn radiata::NodeHandle::subscribe(&self, radiata::EventTag, radiata::EventOp
 pub fn radiata::NodeHandle::sync(&self) -> impl core::future::future::Future<Output = radiata::Result<()>> + core::marker::Send
 pub fn radiata::NodeHandle::tasks(&self) -> radiata::Tasks
 pub fn radiata::NodeHandle::topology(&self) -> radiata::Topology
+pub fn radiata::NodeHandle::triggers(&self) -> radiata::Triggers
 pub fn radiata::NodeHandle::trust(&self) -> radiata::Trust
 pub async fn radiata::NodeHandle::wait_for_shutdown(&self) -> radiata::Result<radiata::ShutdownReason>
 pub fn radiata::NodeHandle::watch<E: radiata::Event>(&self, radiata::EventOptions) -> radiata::Result<radiata::EventSubscription<E>>
@@ -626,6 +644,13 @@ pub fn radiata::OutboundStream::send_sync<S>(self, S) -> radiata::BoxFuture<'sta
 pub fn radiata::OutboundStream::trace_id(&self) -> &radiata::TraceId
 impl core::fmt::Debug for radiata::OutboundStream
 pub fn radiata::OutboundStream::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::OutcomeWeightedPolicy
+impl radiata::OutcomeWeightedPolicy
+pub const radiata::OutcomeWeightedPolicy::TAG: &'static str
+pub fn radiata::OutcomeWeightedPolicy::tag() -> radiata::Result<radiata::QualifiedTag>
+impl radiata::EndpointSelectionPolicy for radiata::OutcomeWeightedPolicy
+pub fn radiata::OutcomeWeightedPolicy::observe_outcome(&self, &radiata::TransportName, radiata::DialObservation)
+pub fn radiata::OutcomeWeightedPolicy::rank_candidates(&self, &radiata::NodeId, &[radiata::Endpoint]) -> alloc::vec::Vec<usize>
 pub struct radiata::PageCursor(_)
 impl radiata::PageCursor
 pub fn radiata::PageCursor::as_bytes(&self) -> &[u8]
@@ -634,6 +659,14 @@ pub struct radiata::PageSpec
 impl radiata::PageSpec
 pub fn radiata::PageSpec::after(radiata::PageCursor, usize) -> radiata::Result<Self>
 pub fn radiata::PageSpec::first(usize) -> radiata::Result<Self>
+pub struct radiata::PreferenceOrderPolicy
+impl radiata::PreferenceOrderPolicy
+pub const radiata::PreferenceOrderPolicy::TAG: &'static str
+pub fn radiata::PreferenceOrderPolicy::new(alloc::vec::Vec<radiata::TransportName>) -> Self
+pub fn radiata::PreferenceOrderPolicy::tag() -> radiata::Result<radiata::QualifiedTag>
+impl radiata::EndpointSelectionPolicy for radiata::PreferenceOrderPolicy
+pub fn radiata::PreferenceOrderPolicy::observe_outcome(&self, &radiata::TransportName, radiata::DialObservation)
+pub fn radiata::PreferenceOrderPolicy::rank_candidates(&self, &radiata::NodeId, &[radiata::Endpoint]) -> alloc::vec::Vec<usize>
 pub struct radiata::ProtocolDefinition
 impl radiata::ProtocolDefinition
 pub fn radiata::ProtocolDefinition::new(radiata::ProtocolTag, radiata::FeatureTag) -> Self
@@ -655,6 +688,13 @@ pub const fn radiata::PublicKey::as_bytes(&self) -> &[u8; 32]
 pub const fn radiata::PublicKey::from_bytes([u8; 32]) -> Self
 impl core::fmt::Debug for radiata::PublicKey
 pub fn radiata::PublicKey::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct radiata::PublishedOrderPolicy
+impl radiata::PublishedOrderPolicy
+pub const radiata::PublishedOrderPolicy::TAG: &'static str
+pub fn radiata::PublishedOrderPolicy::tag() -> radiata::Result<radiata::QualifiedTag>
+impl radiata::EndpointSelectionPolicy for radiata::PublishedOrderPolicy
+pub fn radiata::PublishedOrderPolicy::observe_outcome(&self, &radiata::TransportName, radiata::DialObservation)
+pub fn radiata::PublishedOrderPolicy::rank_candidates(&self, &radiata::NodeId, &[radiata::Endpoint]) -> alloc::vec::Vec<usize>
 pub struct radiata::QualifiedTag
 impl radiata::QualifiedTag
 pub fn radiata::QualifiedTag::as_str(&self) -> &str
@@ -999,12 +1039,19 @@ pub const radiata::TaskKind::LISTEN: Self
 pub const radiata::TaskKind::PATCH_NODE_METADATA: Self
 pub const radiata::TaskKind::PURGE_REVOCATION: Self
 pub const radiata::TaskKind::PUT_RESOURCE: Self
+pub const radiata::TaskKind::RECEIPT_RETENTION: Self
+pub const radiata::TaskKind::REGISTER_TRIGGER: Self
+pub const radiata::TaskKind::REMOVE_TRIGGER: Self
 pub const radiata::TaskKind::RESOLVE_FROZEN_JOURNAL: Self
+pub const radiata::TaskKind::RESOURCE_REMOVAL_RETENTION: Self
 pub const radiata::TaskKind::REVOKE: Self
 pub const radiata::TaskKind::ROTATE_CREDENTIAL: Self
 pub const radiata::TaskKind::START_RECOVERY: Self
 pub const radiata::TaskKind::STOP_LISTENER: Self
 pub const radiata::TaskKind::SYNC_ROUND: Self
+pub const radiata::TaskKind::TOMBSTONE_COLLECTION: Self
+pub const radiata::TaskKind::TRACE_RETENTION: Self
+pub const radiata::TaskKind::TRIGGER_EVALUATION: Self
 pub fn radiata::TaskKind::as_str(&self) -> &str
 pub fn radiata::TaskKind::parse(&str) -> radiata::Result<Self>
 pub const fn radiata::TaskKind::tag(&self) -> &radiata::QualifiedTag
@@ -1114,6 +1161,16 @@ pub fn radiata::TransportTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core:
 impl core::str::traits::FromStr for radiata::TransportTag
 pub type radiata::TransportTag::Err = radiata::Error
 pub fn radiata::TransportTag::from_str(&str) -> radiata::Result<Self>
+pub struct radiata::TriggerFired
+impl radiata::TriggerFired
+pub const fn radiata::TriggerFired::source(&self) -> radiata::TriggerSourceKind
+pub fn radiata::TriggerFired::trigger(&self) -> &str
+impl radiata::Event for radiata::TriggerFired
+pub struct radiata::Triggers
+impl radiata::Triggers
+pub async fn radiata::Triggers::register_event(self, &str, radiata::SubscriptionPredicate, radiata::QualifiedTag) -> radiata::Result<radiata::Task<()>>
+pub async fn radiata::Triggers::register_time(self, &str, &str, radiata::QualifiedTag) -> radiata::Result<radiata::Task<()>>
+pub async fn radiata::Triggers::remove(self, &str) -> radiata::Result<radiata::Task<()>>
 pub struct radiata::Trust
 impl radiata::Trust
 pub async fn radiata::Trust::list(self, radiata::PageSpec) -> radiata::Result<radiata::TrustPage>
@@ -1130,6 +1187,18 @@ pub trait radiata::ActionHook: core::fmt::Debug + core::marker::Send + core::mar
 pub fn radiata::ActionHook::on_transition<'a>(&'a self, &'a radiata::TaskTransition) -> radiata::BoxFuture<'a, radiata::Result<()>>
 pub trait radiata::CandidateNodeReader: radiata::routing::private::Sealed + core::fmt::Debug + core::marker::Send + core::marker::Sync
 pub fn radiata::CandidateNodeReader::next_matching_nodes<'a>(&'a self, &'a radiata::Selector, core::option::Option<radiata::PageCursor>, usize) -> radiata::BoxFuture<'a, radiata::Result<radiata::MemberPage>>
+pub trait radiata::EndpointSelectionPolicy: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
+pub fn radiata::EndpointSelectionPolicy::observe_outcome(&self, &radiata::TransportName, radiata::DialObservation)
+pub fn radiata::EndpointSelectionPolicy::rank_candidates(&self, &radiata::NodeId, &[radiata::Endpoint]) -> alloc::vec::Vec<usize>
+impl radiata::EndpointSelectionPolicy for radiata::OutcomeWeightedPolicy
+pub fn radiata::OutcomeWeightedPolicy::observe_outcome(&self, &radiata::TransportName, radiata::DialObservation)
+pub fn radiata::OutcomeWeightedPolicy::rank_candidates(&self, &radiata::NodeId, &[radiata::Endpoint]) -> alloc::vec::Vec<usize>
+impl radiata::EndpointSelectionPolicy for radiata::PreferenceOrderPolicy
+pub fn radiata::PreferenceOrderPolicy::observe_outcome(&self, &radiata::TransportName, radiata::DialObservation)
+pub fn radiata::PreferenceOrderPolicy::rank_candidates(&self, &radiata::NodeId, &[radiata::Endpoint]) -> alloc::vec::Vec<usize>
+impl radiata::EndpointSelectionPolicy for radiata::PublishedOrderPolicy
+pub fn radiata::PublishedOrderPolicy::observe_outcome(&self, &radiata::TransportName, radiata::DialObservation)
+pub fn radiata::PublishedOrderPolicy::rank_candidates(&self, &radiata::NodeId, &[radiata::Endpoint]) -> alloc::vec::Vec<usize>
 pub trait radiata::Event: radiata::operation::private::Sealed + core::clone::Clone + core::marker::Send + core::marker::Sync + 'static
 impl radiata::Event for radiata::IdentityReplaced
 impl radiata::Event for radiata::MemberChanged
@@ -1140,6 +1209,7 @@ impl radiata::Event for radiata::RouteChanged
 impl radiata::Event for radiata::SessionChanged
 impl radiata::Event for radiata::TaggedEvent
 impl radiata::Event for radiata::TaskChanged
+impl radiata::Event for radiata::TriggerFired
 pub trait radiata::LoadBalancingPolicy: core::fmt::Debug + core::marker::Send + core::marker::Sync + 'static
 pub fn radiata::LoadBalancingPolicy::select<'a>(&'a self, &'a radiata::Selector, &'a dyn radiata::CandidateNodeReader) -> radiata::BoxFuture<'a, radiata::Result<radiata::NodeId>>
 impl radiata::LoadBalancingPolicy for radiata::DefaultLoadBalancer

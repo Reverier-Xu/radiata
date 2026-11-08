@@ -9,6 +9,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The endpoint-selection policy seam: `EndpointSelectionPolicy` — one
+  pull-shaped interface that ranks a member's validated candidate set
+  for each dial, with `EndpointSelector` owning the per-member rotation
+  serials every dial plane shares and dropping any ordering outside the
+  validated set fail-closed (a policy can never make the node dial an
+  endpoint the member's descriptor did not publish). Three built-ins
+  register through the extension registry's default pass under reserved
+  tags: `PublishedOrderPolicy` (the default — today's per-member
+  rotation, byte-identical dial outcomes), `PreferenceOrderPolicy`
+  (orders by the configured scheme preference list, per-candidate
+  published fallback), and `OutcomeWeightedPolicy` (EWMA over observed
+  dial outcomes per scheme via `DialObservation`, cold start =
+  published order). `NodeConfig::with_endpoint_policy` selects a
+  registered policy; `NodeConfig::with_endpoint_preference` declares
+  the scheme preference list and selects preference-order; the
+  effective policy resolves once in the registration channel (the
+  `effective_route_policy` discipline, fail-closed on a missing
+  default).
 - Subscription predicates for resource-change watchers:
   `SubscriptionPredicate` — a self-contained filter over resource
   changes (an optional resource-domain set plus an optional label

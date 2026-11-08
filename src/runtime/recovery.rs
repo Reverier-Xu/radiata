@@ -1434,6 +1434,87 @@ mod tests {
     .expect("recovery must keep dialing after a panicking transport");
   }
 
+  /// The outcome-weighted policy's observation wiring, through the real
+  /// dial path: a member whose first published endpoint (wss) refuses
+  /// connections marks that scheme failed when the dial settles, and the
+  /// member's next dial lands on its second, unobserved endpoint
+  /// (panicwire) instead of hammering the failing scheme — the selector
+  /// reordered the validated candidate set from observed outcomes.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn an_observed_dial_failure_reorders_the_member_s_next_dial() {
+    let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
+      crate::storage::contract::required_capabilities(),
+    ));
+    let config = NodeConfig::new()
+      .with_dial_deadline(std::time::Duration::from_secs(5))
+      .unwrap()
+      .with_endpoint_policy(crate::OutcomeWeightedPolicy::tag().unwrap())
+      .with_recovery_policy(
+        crate::RecoveryConfig::new(
+          1,
+          std::time::Duration::from_secs(1),
+          std::time::Duration::from_secs(2),
+        )
+        .unwrap(),
+      )
+      .unwrap();
+    // The member's published order: the refusing wss endpoint first, the
+    // never-observed panicwire endpoint second.
+    let (refused_port, refused_holder) = refusing_peer().await;
+    let descriptor = crate::membership::NodeDescriptorV1::new(
+      member_id(101),
+      member_key(101),
+      vec![
+        Endpoint::parse(&format!("wss://127.0.0.1:{refused_port}")).unwrap(),
+        Endpoint::parse("panicwire://unreachable").unwrap(),
+      ],
+      1,
+      1,
+    );
+    let namespace =
+      crate::storage::families::namespace(crate::storage::families::NODE_DESCRIPTOR_NAMESPACE)
+        .unwrap();
+    let key = crate::StoreKey::new(Arc::from(member_id(101).as_str().as_bytes().to_vec()));
+    crate::identity::testing::inject_enveloped_entry(
+      &reference,
+      &namespace,
+      &key,
+      descriptor.encode().unwrap(),
+    );
+    let (binding_namespace, binding_key) =
+      crate::identity::records::identity_binding_key(&member_id(101)).unwrap();
+    let binding = crate::identity::records::IdentityBindingV1::new(member_id(101), member_key(101));
+    crate::identity::testing::inject_enveloped_entry(
+      &reference,
+      &binding_namespace,
+      &binding_key,
+      binding.encode().unwrap(),
+    );
+
+    let (_client, _connection_tasks, attempts) = supervised_runtime(reference, config).await;
+
+    // Attempt 1 lands on the member's first published endpoint (wss,
+    // serial 1) and observes the refusal into the policy's scheme table;
+    // attempt 2 walks the rotation to panicwire, whose future panics
+    // mid-dial (observing nothing). The discriminator is attempt 3:
+    // published-order rotation would return to the wss endpoint, but the
+    // outcome-weighted policy has wss marked failed and panicwire still
+    // unobserved, so the member's candidate set reordered and attempt 3
+    // dials panicwire again — the panicking transport's attempt counter
+    // only reaches 2 when the observation path drove the reorder.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+      loop {
+        if attempts.load(Ordering::Relaxed) >= 2 {
+          break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .expect("attempt 3 must dial the unobserved scheme after the observed refusal");
+    refused_holder.abort();
+  }
+
   /// A poisoned recovery controller reports the controller's named
   /// internal error instead of a generic one: the lock-poison diagnostic
   /// stays uniform with the other shared tables.
