@@ -80,9 +80,6 @@ struct CollectibleRow {
 /// record's collectible projection). The registry below is pinned by test
 /// against the catalog: every family declared checkpoint-collected has an
 /// adapter, and no adapter exists for a family declared otherwise.
-/// One family's checkpoint-watermark adapter: the codec facts the
-/// declared policy cannot carry (the family's key discipline and its
-/// record's collectible projection).
 #[derive(Clone, Copy)]
 struct Adapter {
   /// Keys the scan skips (a family's non-record singleton rows).
@@ -418,6 +415,11 @@ async fn subject_permanently_pinned(
       // A declared pinning family without a probe fails safe: the
       // subject counts as pinned, so the engine never retires a binding
       // the declaration says is permanently retained.
+      // Corrupt pinning rows (present, undecodable) read as present:
+      // the binding stays retained as with any live row, while the
+      // tombstone is still collected — unlike the pre-engine guard,
+      // which failed the whole pass and starved the gc every tick.
+      // Today's declarations only produce valid rows.
       None => return Ok(true),
     }
   }
