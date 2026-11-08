@@ -497,6 +497,12 @@ pub(super) type DialFailureReport = fn(&NodeId, &Error);
 /// counter the permit bounds, the edge class the session entry carries,
 /// and the failure diagnostics; the helper owns only the execution and
 /// tracking mechanics both planes repeated.
+///
+/// Outcomes feed the selection policy only after the transport resolves:
+/// an endpoint whose scheme has no registered transport fails before
+/// any observation exists, so it stays "unobserved" to an
+/// outcome-weighted policy (the per-member serial still advances, so
+/// rotation moves on regardless).
 pub(super) fn spawn_member_dial(
   state: &TickState, pending: Arc<std::sync::atomic::AtomicUsize>, peer: NodeId,
   receiver: Endpoint, class: crate::session::stream::DialClass, report: DialFailureReport,

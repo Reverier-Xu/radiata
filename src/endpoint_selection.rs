@@ -64,12 +64,15 @@ pub enum DialObservation {
 /// effective instance resolves once in the registration channel — the
 /// same discipline as the next-hop route policy.
 ///
-/// The returned ordering is a permutation (possibly a filtered subset) of
-/// indices into `candidates`, in dial-preference order; the selector
-/// drops out-of-range indices fail-closed. Stateful policies (the
-/// outcome-weighted built-in, a caller's own learner) keep their
-/// observation tables inside themselves; the trait methods take `&self`
-/// so one instance serves the node's lifetime.
+/// The returned ordering is an index sequence over `candidates` in
+/// dial-preference order — typically a permutation (possibly a filtered
+/// subset); the selector drops out-of-range indices fail-closed and
+/// does not deduplicate, so a policy that repeats an index pins that
+/// member's dial to one endpoint (reordering is the maximum damage a
+/// policy can do, and repetition is its own risk to own). Stateful
+/// policies (the outcome-weighted built-in, a caller's own learner)
+/// keep their observation tables inside themselves; the trait methods
+/// take `&self` so one instance serves the node's lifetime.
 pub trait EndpointSelectionPolicy: fmt::Debug + Send + Sync + 'static {
   /// Orders one member's validated candidate set for its next dial.
   fn rank_candidates(&self, member: &NodeId, candidates: &[Endpoint]) -> Vec<usize>;
