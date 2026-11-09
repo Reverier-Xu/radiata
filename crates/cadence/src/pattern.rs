@@ -175,7 +175,7 @@ impl Pattern {
     })
   }
 
-  /// The [`FieldValues`]-taking form of [`Pattern::r#match`].
+  /// The [`FieldValues`]-taking form of `Pattern::r#match`.
   pub fn matches(&self, values: FieldValues) -> bool {
     self.year.contains(values.year)
       && self.month.contains(u16::from(values.month))

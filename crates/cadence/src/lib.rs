@@ -82,7 +82,7 @@
 //! bridge caller-side time libraries (all off by default):
 //!
 //! - `std-time`: `SystemTime` conversions for the `Utc` and fixed-offset frames
-//!   (see [`field_values_to_system_time`], [`system_time_to_field_values`]).
+//!   (see `field_values_to_system_time` / `system_time_to_field_values`).
 //! - `chrono`: [`TryFrom`] any `chrono::DateTime<Tz>` into [`FieldValues`],
 //!   plus `to_chrono_fixed` back.
 //! - `jiff`: [`TryFrom`] for `jiff::Timestamp` and `jiff::Zoned`, plus
