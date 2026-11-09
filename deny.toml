@@ -37,6 +37,10 @@ skip = [
   { crate = "syn@2.0.119", reason = "minicbor-derive 0.19.5 (latest) uses syn 2 while tokio-macros uses syn 3; drop when minicbor-derive upgrades" },
 ]
 wildcards = "deny"
+# The intra-workspace path dependencies: the workspace publishes every
+# crate in lockstep from one version, so the published manifest's
+# version requirements are inferred by cargo at publish time.
+wildcards.allow = ["radiata-cadence", "radiata-test-support"]
 
 [sources]
 allow-git        = []
