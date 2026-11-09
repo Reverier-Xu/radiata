@@ -1,6 +1,9 @@
 [package]
+description  = "Shared test-support harness for the radiata workspace suites."
 edition      = { workspace = true }
+license      = { workspace = true }
 name         = "radiata-test-support"
+publish      = { workspace = true }
 rust-version = { workspace = true }
 version      = { workspace = true }
 
