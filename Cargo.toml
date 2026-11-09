@@ -15,5 +15,7 @@ rust-version = "1.98.0"
 version      = "0.0.3"
 
 [workspace.dependencies]
-radiata-cadence      = { path = "crates/cadence", features = ["std-time"] }
+radiata-cadence = { version = "0.0.3", path = "crates/cadence", features = [
+  "std-time",
+] }
 radiata-test-support = { path = "crates/test-support" }
