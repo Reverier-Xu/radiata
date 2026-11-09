@@ -157,8 +157,7 @@ pub mod adapters {
 
   use std::{path::PathBuf, sync::Arc};
 
-  use crate::extension::KeyProvider;
-  use crate::extension::StorageFactory;
+  use crate::extension::{KeyProvider, StorageFactory};
 
   /// Creates a test-only immutable JSON generation store factory rooted at
   /// `path`.

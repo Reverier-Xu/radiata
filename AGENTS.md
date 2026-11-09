@@ -6,8 +6,13 @@
 
 ## Repository Structure
 
-- `src/lib.rs`: library entry point and public API.
-- `Cargo.toml`: package metadata and dependencies.
+- `crates/radiata/`: the library crate (`src/lib.rs` entry point and
+  public API, `tests/` integration suites).
+- `crates/cadence/`: the schedule-pattern grammar crate
+  (`radiata-cadence`).
+- `crates/test-support/`: shared test-support crate.
+- `Cargo.toml`: virtual workspace manifest (all packages under
+  `crates/`).
 - `rustfmt.toml`: nightly Rust formatting rules.
 - `taplo.toml`: TOML formatting rules.
 - `.github/workflows/quality_check.yml`: required CI quality gates.

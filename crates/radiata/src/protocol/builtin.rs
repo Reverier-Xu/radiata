@@ -321,7 +321,7 @@ mod tests {
     "src/task/mod.rs",
     "src/transport/endpoint.rs",
     "src/view.rs",
-    "test-support/src/lib.rs",
+    "../test-support/src/lib.rs",
   ];
 
   /// The unversioned literals a versioned category may still carry in a

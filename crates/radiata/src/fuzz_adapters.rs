@@ -557,7 +557,7 @@ mod replay_tests {
   /// fails the suite.
   fn corpus_files(target: &str) -> Vec<(String, PathBuf, Vec<u8>)> {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-      .join("fuzz")
+      .join("../../fuzz")
       .join("corpus")
       .join(target);
     let manifest = std::fs::read_to_string(directory.join("manifest.toml"))

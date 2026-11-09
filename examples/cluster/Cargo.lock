@@ -788,6 +788,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "minicbor",
+ "radiata-cadence",
  "rand",
  "rcgen",
  "redb",
@@ -803,6 +804,10 @@ dependencies = [
  "tracing",
  "zeroize",
 ]
+
+[[package]]
+name = "radiata-cadence"
+version = "0.0.1"
 
 [[package]]
 name = "radiata-cluster-node"

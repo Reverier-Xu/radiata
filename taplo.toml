@@ -1,7 +1,9 @@
 include = [
   "Cargo.toml",
   "deny.toml",
-  "test-support/Cargo.toml",
+  "crates/radiata/Cargo.toml",
+  "crates/test-support/Cargo.toml",
+  "crates/cadence/Cargo.toml",
   "taplo.toml",
   "rustfmt.toml",
 ]

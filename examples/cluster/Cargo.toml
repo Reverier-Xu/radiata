@@ -13,7 +13,7 @@ publish = false
 # depends on the published/path library and brings its own web stack.
 
 [dependencies]
-radiata = { path = "../..", features = ["redb"] }
+radiata = { path = "../../crates/radiata", features = ["redb"] }
 tokio = { version = "1.53", features = [
   "rt-multi-thread",
   "macros",

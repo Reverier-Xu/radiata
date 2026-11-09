@@ -1,11 +1,11 @@
 [package]
-description = "Cron-replacement schedule-pattern grammar: RFC 3339 shapes with set-valued fields."
-edition     = "2024"
-license     = "GPL-2.0-only"
-name        = "radiata-cadence"
-publish     = false
-rust-version = "1.98.0"
-version     = "0.0.1"
+description  = "Cron-replacement schedule-pattern grammar: RFC 3339 shapes with set-valued fields."
+edition      = { workspace = true }
+license      = { workspace = true }
+name         = "radiata-cadence"
+publish      = false
+rust-version = { workspace = true }
+version      = "0.0.1"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -13,8 +13,8 @@ unsafe_code = "forbid"
 [features]
 # Optional time-library interop, all off by default: the core stays
 # dependency-free and clock-blind. See the crate docs for the trade-offs.
-chrono = ["dep:chrono"]
-jiff = ["dep:jiff"]
+chrono   = ["dep:chrono"]
+jiff     = ["dep:jiff"]
 std-time = []
 
 [dependencies]

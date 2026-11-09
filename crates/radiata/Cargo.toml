@@ -1,0 +1,108 @@
+[package]
+authors      = { workspace = true }
+description  = "Deterministic relay node runtime with identity, membership, storage, and TLS transport primitives."
+edition      = { workspace = true }
+license      = { workspace = true }
+name         = "radiata"
+publish      = { workspace = true }
+repository   = { workspace = true }
+rust-version = { workspace = true }
+version      = "0.0.2"
+
+[features]
+audit   = []
+default = ["redb"]
+json    = ["dep:fs4", "dep:rustix", "dep:serde", "dep:serde_json"]
+redb    = ["dep:redb"]
+
+[dependencies]
+# Feature plumbing only: enables aws-lc-sys's prebuilt NASM objects so
+# Windows x86-64 source builds do not require an installed NASM assembler.
+aws-lc-rs = { version = "1.18", default-features = false, features = [
+  "prebuilt-nasm",
+] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "3.0", default-features = false, features = [
+  "fast",
+  "rand_core",
+  "zeroize",
+] }
+fs4 = { version = "1.1", optional = true }
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = [
+  "std",
+  "async-await",
+  "sink",
+] }
+hkdf = "0.13"
+hmac = "0.13"
+minicbor = { version = "2.3", features = ["derive", "std"] }
+rand = { version = "0.10", default-features = false, features = [
+  "std",
+  "sys_rng",
+] }
+# The cadence pattern grammar drives the time triggers (the
+# `std-time` feature provides the UNIX-second conversion the core's
+# wall-clock seam needs without a time-library dependency).
+radiata-cadence = { workspace = true }
+rcgen = { version = "0.14", default-features = false, features = [
+  "crypto",
+  "aws_lc_rs",
+] }
+redb = { version = "4.4", optional = true }
+rustls = { version = "0.23", default-features = false, features = [
+  "std",
+  "aws_lc_rs",
+] }
+secrecy = { version = "0.10", default-features = false }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+sha2 = "0.11"
+# Already in the dependency graph through tokio; used to clear
+# IPV6_V6ONLY explicitly on the named-host wildcard listener.
+socket2 = "0.6"
+thiserror = { version = "2.0", default-features = false }
+tokio = { version = "1.54", features = [
+  "rt",
+  "sync",
+  "time",
+  "net",
+  "io-util",
+  "macros",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "aws_lc_rs",
+] }
+tokio-stream = { version = "0.1", default-features = false, features = [
+  "sync",
+] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+  "handshake",
+] }
+tracing = { version = "0.1", default-features = false, features = [
+  "std",
+  "attributes",
+] }
+zeroize = "1.9"
+
+[target."cfg(unix)".dependencies]
+rustix = { version = "1.1", features = ["fs", "process"], optional = true }
+
+[dev-dependencies]
+proptest = "1.12"
+radiata-test-support = { workspace = true }
+tempfile = "3.27"
+tokio = { version = "1.54", features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "test-util",
+  "time",
+] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wait-timeout = "0.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+unsafe_code     = "forbid"

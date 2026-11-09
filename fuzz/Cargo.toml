@@ -9,8 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-radiata = { path = ".." }
-radiata-cadence = { path = "../cadence" }
+radiata = { path = "../crates/radiata" }
+radiata-cadence = { path = "../crates/cadence" }
 
 [[bin]]
 name = "cadence_parse"
