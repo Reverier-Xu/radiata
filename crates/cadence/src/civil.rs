@@ -19,7 +19,8 @@ use crate::{
 /// Civil values are produced by the crate —
 /// [`Ticker::next_fire`](crate::Ticker::next_fire) returns them, and the civil
 /// shape `YYYY-MM-DDThh:mm:ss` parses into them (see [`FromStr`]) — and read
-/// back through the accessors or [`Display`]. There is deliberately no public
+/// back through the accessors or [`Display`](fmt::Display). There is
+/// deliberately no public
 /// constructor: callers hand the crate their own reading through the
 /// [`Cadence`](crate::Cadence) trait instead of assembling fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
