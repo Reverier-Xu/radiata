@@ -3,13 +3,19 @@ members  = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-authors      = ["Reverier-Xu <reverier.xu@woooo.tech>"]
+authors = ["Reverier-Xu <reverier.xu@woooo.tech>"]
+# The release version: every workspace crate publishes in lockstep with
+# this number, and the intra-workspace dependency requirements in
+# [workspace.dependencies] must be bumped alongside it.
 edition      = "2024"
 license      = "GPL-2.0-only"
-publish      = false
+publish      = true
 repository   = "https://github.com/Reverier-Xu/radiata"
 rust-version = "1.98.0"
+version      = "0.0.3"
 
 [workspace.dependencies]
-radiata-cadence      = { path = "crates/cadence", features = ["std-time"] }
-radiata-test-support = { path = "crates/test-support" }
+radiata-cadence = { version = "0.0.3", path = "crates/cadence", features = [
+  "std-time",
+] }
+radiata-test-support = { version = "0.0.3", path = "crates/test-support" }

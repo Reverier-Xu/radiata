@@ -3,9 +3,8 @@ description  = "Cron-replacement schedule-pattern grammar: RFC 3339 shapes with 
 edition      = { workspace = true }
 license      = { workspace = true }
 name         = "radiata-cadence"
-publish      = false
 rust-version = { workspace = true }
-version      = "0.0.1"
+version      = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
