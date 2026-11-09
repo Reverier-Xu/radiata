@@ -896,23 +896,55 @@ impl TaskTable {
   /// entries encountered are the oldest; non-terminal entries are never
   /// evicted. Called by the manager's retention pass after each
   /// terminal transition.
-  pub(crate) fn retain_terminal_history(&self, keep: usize) {
+  pub(crate) fn retain_terminal_history(&self, keep: usize, controller_keep: usize) {
     let Ok(mut entries) = self.lock() else {
       return;
     };
-    let excess = entries
+    // Controller runs recur on the runtime cadence, so they get their
+    // own small history window: without the split, five terminal
+    // controller records per tick would evict the user-facing verb
+    // tasks from the observation surface within minutes.
+    let is_terminal_controller =
+      |entry: &TaskEntry| entry.policy.slot_class == SlotClass::Controller;
+    let verb_excess = entries
       .values()
-      .filter(|entry| entry.status.borrow().phase.is_terminal())
+      .filter(|entry| {
+        let terminal = entry.status.borrow().phase.is_terminal();
+        terminal && !is_terminal_controller(entry)
+      })
       .count()
       .saturating_sub(keep);
-    if excess == 0 {
+    let controller_excess = entries
+      .values()
+      .filter(|entry| {
+        let terminal = entry.status.borrow().phase.is_terminal();
+        terminal && is_terminal_controller(entry)
+      })
+      .count()
+      .saturating_sub(controller_keep);
+    if verb_excess == 0 && controller_excess == 0 {
       return;
     }
     let evicted: Vec<TaskId> = entries
       .iter()
-      .filter(|(_, entry)| entry.status.borrow().phase.is_terminal())
+      .filter(|(_, entry)| {
+        let terminal = entry.status.borrow().phase.is_terminal();
+        terminal && !is_terminal_controller(entry)
+      })
+      .take(verb_excess)
+      .chain(
+        // Separate pass: the controller window is independent, so a
+        // verb eviction can never consume a controller slot and vice
+        // versa. Id order keeps oldest-first within each class.
+        entries
+          .iter()
+          .filter(|(_, entry)| {
+            let terminal = entry.status.borrow().phase.is_terminal();
+            terminal && is_terminal_controller(entry)
+          })
+          .take(controller_excess),
+      )
       .map(|(id, _)| id.clone())
-      .take(excess)
       .collect();
     for id in evicted {
       entries.remove(&id);

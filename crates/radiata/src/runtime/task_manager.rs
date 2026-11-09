@@ -89,6 +89,12 @@ impl ReconcileChannels {
 /// (oldest-terminal first) and read as absent.
 pub(crate) const TASK_TERMINAL_HISTORY: usize = 256;
 
+/// The controller runs' own terminal history window: the recurring
+/// controllers terminate on every runtime tick, so their records live
+/// in a separate small window — without the split they would evict the
+/// user-facing verb tasks from the observation surface within minutes.
+pub(crate) const TASK_CONTROLLER_HISTORY: usize = 32;
+
 /// The per-class admission bound on non-terminal tasks: once one slot
 /// class holds this many live (admitted, unsettled) entries, further
 /// admissions of that class fail typed
@@ -842,7 +848,9 @@ async fn run_manager(
               // supervisor is already shutting down.
               let _ = shared.leave_signal.try_send(signal);
             }
-            shared.table.retain_terminal_history(TASK_TERMINAL_HISTORY);
+            shared
+              .table
+              .retain_terminal_history(TASK_TERMINAL_HISTORY, TASK_CONTROLLER_HISTORY);
           }
           WorkerReport::Retry {
             id,
