@@ -5,9 +5,7 @@ WORKDIR /workspace
 RUN rustup component add clippy
 
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY test-support ./test-support
-COPY tests ./tests
+COPY crates ./crates
 COPY fuzz ./fuzz
 COPY .github/docker/run-quality.sh /usr/local/bin/radiata-container-quality
 

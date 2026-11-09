@@ -35,7 +35,8 @@ grep -E "^\[b" /tmp/acceptance_boundary.log
 
 echo "=== acceptance: async-task scenarios ==="
 if ! python3 test_tasks.py > /tmp/acceptance_tasks.log 2>&1; then
-  echo "FAIL: async-task scenarios — see /tmp/acceptance_tasks.log"
+  echo "FAIL: async-task scenarios — full log follows"
+  cat /tmp/acceptance_tasks.log
   exit 1
 fi
 grep -E "^\[|===" /tmp/acceptance_tasks.log | tail -6
