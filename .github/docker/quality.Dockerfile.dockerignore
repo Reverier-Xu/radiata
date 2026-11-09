@@ -1,9 +1,7 @@
 **
 !Cargo.toml
 !Cargo.lock
-!src/**
-!test-support/**
-!tests/**
+!crates/**
 !fuzz/Cargo.toml
 !fuzz/Cargo.lock
 !fuzz/fuzz_targets/**
