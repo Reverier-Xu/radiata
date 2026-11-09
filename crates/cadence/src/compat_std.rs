@@ -9,92 +9,96 @@
 //! falls in, never the one after.
 //!
 //! ```
-//! use std::time::{Duration, SystemTime, UNIX_EPOCH};
+//! use std::time::{Duration, UNIX_EPOCH};
 //!
-//! use radiata_cadence::{field_values_to_system_time, system_time_to_field_values, FieldValues, Offset};
+//! use radiata_cadence::Ticker;
 //!
-//! let values = FieldValues::new(2026, 11, 8, 0, 0, 0).unwrap();
-//! let time = field_values_to_system_time(values, Offset::Utc).unwrap();
-//! assert_eq!(time, UNIX_EPOCH + Duration::from_secs(1_794_096_000));
-//! assert_eq!(system_time_to_field_values(time, Offset::Utc).unwrap(), values);
+//! let ticker = Ticker::parse("{*}-{*}-{*}T00:00:00Z").unwrap();
+//! assert!(ticker.fires_at(&UNIX_EPOCH));
+//! let next = ticker.next_fire(&(UNIX_EPOCH + Duration::from_secs(1))).unwrap();
+//! assert_eq!(next.to_string(), "1970-01-02T00:00:00");
 //! ```
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{
-  TimeInteropError,
-  epoch::{field_values_to_unix_seconds, unix_seconds_to_field_values},
-  pattern::{FieldValues, Offset},
+  Cadence, Civil, TimeInteropError,
+  epoch::{civil_to_unix_seconds, unix_seconds_to_civil},
+  ticker::Offset,
 };
 
-/// Converts field values in a `Utc` or fixed-offset frame into a
-/// `SystemTime` instant.
-///
-/// # Errors
-///
-/// [`TimeInteropError::LocalFrameUnsupported`] for the device-local
-/// frame; [`TimeInteropError::OutOfRange`] when the instant falls outside
-/// the representable range.
-pub fn field_values_to_system_time(
-  values: FieldValues, frame: Offset,
-) -> Result<SystemTime, TimeInteropError> {
-  let seconds = field_values_to_unix_seconds(values, frame)?;
-  if seconds >= 0 {
-    UNIX_EPOCH
-      .checked_add(Duration::from_secs(seconds as u64))
-      .ok_or(TimeInteropError::OutOfRange)
-  } else {
-    UNIX_EPOCH
-      .checked_sub(Duration::from_secs(seconds.unsigned_abs()))
-      .ok_or(TimeInteropError::OutOfRange)
+impl Cadence for SystemTime {
+  /// Reads the instant as one civil second in `frame` (`Utc` or a fixed
+  /// offset; the device-local frame needs a timezone-aware library).
+  ///
+  /// # Errors
+  ///
+  /// [`TimeInteropError::LocalFrameUnsupported`] for the device-local
+  /// frame; [`TimeInteropError::OutOfRange`] outside the crate's
+  /// 0000-9999 civil year domain.
+  fn to_civil(&self, frame: Offset) -> Result<Civil, TimeInteropError> {
+    // Floor toward negative infinity: a pre-epoch reading with a
+    // sub-second remainder belongs to the earlier schedule second.
+    let seconds = match self.duration_since(UNIX_EPOCH) {
+      Ok(past_epoch) => past_epoch.as_secs() as i64,
+      Err(before_epoch) => {
+        let whole = before_epoch.duration().as_secs() as i64;
+        if before_epoch.duration().subsec_nanos() > 0 {
+          -(whole + 1)
+        } else {
+          -whole
+        }
+      }
+    };
+    unix_seconds_to_civil(seconds, frame)
   }
 }
 
-/// Converts a `SystemTime` instant into field values in a `Utc` or
-/// fixed-offset frame.
-///
-/// # Errors
-///
-/// [`TimeInteropError::LocalFrameUnsupported`] for the device-local
-/// frame; [`TimeInteropError::OutOfRange`] when the instant falls outside
-/// the crate's 0000-9999 civil year domain.
-pub fn system_time_to_field_values(
-  time: SystemTime, frame: Offset,
-) -> Result<FieldValues, TimeInteropError> {
-  // Floor toward negative infinity: a pre-epoch reading with a
-  // sub-second remainder belongs to the earlier schedule second.
-  let seconds = match time.duration_since(UNIX_EPOCH) {
-    Ok(past_epoch) => past_epoch.as_secs() as i64,
-    Err(before_epoch) => {
-      let whole = before_epoch.duration().as_secs() as i64;
-      if before_epoch.duration().subsec_nanos() > 0 {
-        -(whole + 1)
-      } else {
-        -whole
-      }
+impl Civil {
+  /// Converts the civil second in a `Utc` or fixed-offset frame into a
+  /// `SystemTime` instant.
+  ///
+  /// ```
+  /// use std::time::{Duration, UNIX_EPOCH};
+  ///
+  /// use radiata_cadence::{Cadence, Civil, Offset};
+  ///
+  /// let civil: Civil = "2026-11-08T00:00:00".parse().unwrap();
+  /// let time = civil.to_system_time(Offset::Utc).unwrap();
+  /// assert_eq!(time, UNIX_EPOCH + Duration::from_secs(1_794_096_000));
+  /// assert_eq!(time.to_civil(Offset::Utc).unwrap(), civil);
+  /// ```
+  ///
+  /// # Errors
+  ///
+  /// [`TimeInteropError::LocalFrameUnsupported`] for the device-local
+  /// frame; [`TimeInteropError::OutOfRange`] when the instant falls
+  /// outside the representable range.
+  pub fn to_system_time(self, frame: Offset) -> Result<SystemTime, TimeInteropError> {
+    let seconds = civil_to_unix_seconds(self, frame)?;
+    if seconds >= 0 {
+      UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds as u64))
+        .ok_or(TimeInteropError::OutOfRange)
+    } else {
+      UNIX_EPOCH
+        .checked_sub(Duration::from_secs(seconds.unsigned_abs()))
+        .ok_or(TimeInteropError::OutOfRange)
     }
-  };
-  unix_seconds_to_field_values(seconds, frame)
+  }
 }
 
 #[cfg(test)]
 mod tests {
   use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-  use super::{field_values_to_system_time, system_time_to_field_values};
-  use crate::pattern::{FieldValues, Offset};
+  use super::{Cadence as _, Civil, Offset};
 
   #[test]
   fn epoch_second_maps_to_unix_zero() {
-    let values = FieldValues::new(1970, 1, 1, 0, 0, 0).unwrap();
-    assert_eq!(
-      field_values_to_system_time(values, Offset::Utc).unwrap(),
-      UNIX_EPOCH
-    );
-    assert_eq!(
-      system_time_to_field_values(UNIX_EPOCH, Offset::Utc).unwrap(),
-      values
-    );
+    let values: Civil = "1970-01-01T00:00:00".parse().unwrap();
+    assert_eq!(values.to_system_time(Offset::Utc).unwrap(), UNIX_EPOCH);
+    assert_eq!(UNIX_EPOCH.to_civil(Offset::Utc).unwrap(), values);
   }
 
   #[test]
@@ -103,45 +107,45 @@ mod tests {
       .checked_sub(Duration::from_nanos(500_000_000))
       .unwrap();
     assert_eq!(
-      system_time_to_field_values(half_before, Offset::Utc).unwrap(),
-      FieldValues::new(1969, 12, 31, 23, 59, 59).unwrap()
+      half_before.to_civil(Offset::Utc).unwrap().to_string(),
+      "1969-12-31T23:59:59"
     );
     let whole_before = UNIX_EPOCH.checked_sub(Duration::from_secs(1)).unwrap();
     assert_eq!(
-      system_time_to_field_values(whole_before, Offset::Utc).unwrap(),
-      FieldValues::new(1969, 12, 31, 23, 59, 59).unwrap()
+      whole_before.to_civil(Offset::Utc).unwrap().to_string(),
+      "1969-12-31T23:59:59"
     );
   }
 
   #[test]
   fn fixed_offset_frames_shift_the_instant_not_the_fields() {
-    let values = FieldValues::new(2026, 11, 8, 9, 0, 0).unwrap();
-    let utc_instant = field_values_to_system_time(values, Offset::Utc).unwrap();
-    let tokyo_instant = field_values_to_system_time(values, Offset::Fixed(9 * 3600)).unwrap();
+    let values: Civil = "2026-11-08T09:00:00".parse().unwrap();
+    let utc_instant = values.to_system_time(Offset::Utc).unwrap();
+    let tokyo_instant = values.to_system_time(Offset::Fixed(9 * 3600)).unwrap();
     assert_eq!(
       utc_instant.duration_since(tokyo_instant).unwrap(),
       Duration::from_secs(9 * 3600)
     );
     assert_eq!(
-      system_time_to_field_values(tokyo_instant, Offset::Fixed(9 * 3600)).unwrap(),
+      tokyo_instant.to_civil(Offset::Fixed(9 * 3600)).unwrap(),
       values
     );
   }
 
   #[test]
   fn local_frame_is_unsupported_and_year_domain_is_bounded() {
-    let values = FieldValues::new(2026, 11, 8, 0, 0, 0).unwrap();
+    let values: Civil = "2026-11-08T00:00:00".parse().unwrap();
     assert_eq!(
-      field_values_to_system_time(values, Offset::Local),
+      values.to_system_time(Offset::Local),
       Err(crate::TimeInteropError::LocalFrameUnsupported)
     );
     assert_eq!(
-      system_time_to_field_values(UNIX_EPOCH, Offset::Local),
+      UNIX_EPOCH.to_civil(Offset::Local),
       Err(crate::TimeInteropError::LocalFrameUnsupported)
     );
-    let year_10_000 = FieldValues::new(10_000, 1, 1, 0, 0, 0).unwrap();
+    let year_10_000 = crate::civil::Civil::new(10_000, 1, 1, 0, 0, 0).unwrap();
     assert_eq!(
-      field_values_to_system_time(year_10_000, Offset::Utc),
+      year_10_000.to_system_time(Offset::Utc),
       Err(crate::TimeInteropError::OutOfRange)
     );
   }
@@ -149,18 +153,18 @@ mod tests {
   #[test]
   fn samples_round_trip() {
     let samples = [
-      (1889, 6, 14, 0, 0, 1),
-      (1969, 12, 31, 23, 59, 59),
-      (1972, 2, 29, 12, 30, 30),
-      (2026, 11, 8, 13, 45, 1),
-      (2100, 3, 1, 0, 0, 0),
-      (9999, 12, 31, 23, 59, 59),
+      "1889-06-14T00:00:01",
+      "1969-12-31T23:59:59",
+      "1972-02-29T12:30:30",
+      "2026-11-08T13:45:01",
+      "2100-03-01T00:00:00",
+      "9999-12-31T23:59:59",
     ];
-    for (year, month, day, hour, minute, second) in samples {
-      let values = FieldValues::new(year, month, day, hour, minute, second).unwrap();
+    for text in samples {
+      let values: Civil = text.parse().unwrap();
       for frame in [Offset::Utc, Offset::Fixed(-18_000)] {
-        let time = field_values_to_system_time(values, frame).unwrap();
-        assert_eq!(system_time_to_field_values(time, frame).unwrap(), values);
+        let time = values.to_system_time(frame).unwrap();
+        assert_eq!(time.to_civil(frame).unwrap().to_string(), text);
       }
     }
   }
@@ -168,8 +172,8 @@ mod tests {
   #[test]
   fn system_time_helpers_read_the_seam_consistently() {
     let now = SystemTime::now();
-    let values = system_time_to_field_values(now, Offset::Utc).unwrap();
-    let round_tripped = field_values_to_system_time(values, Offset::Utc).unwrap();
+    let values = now.to_civil(Offset::Utc).unwrap();
+    let round_tripped = values.to_system_time(Offset::Utc).unwrap();
     assert!(round_tripped <= now);
     assert!(now.duration_since(round_tripped).unwrap() < Duration::from_secs(1));
   }

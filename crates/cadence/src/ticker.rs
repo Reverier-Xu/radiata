@@ -1,62 +1,23 @@
-//! The cadence pattern: strict parsing, canonical form, set-membership
-//! matching, and ordered next-fire search.
+//! The cadence ticker: strict parsing, canonical form, set-membership
+//! firing, and ordered next-fire search.
 //!
-//! Matching is one rule with no special cases: a wall-clock second fires iff
-//! each field's value is a member of its compiled set. The crate is
-//! clock-blind and timezone-blind — the caller resolves the reference frame
-//! (device-local or fixed-offset) and supplies field values in it.
+//! Firing is one rule with no special cases: a wall-clock second fires
+//! iff each field's value is a member of its compiled set. The crate is
+//! clock-blind and timezone-blind — the caller resolves the reference
+//! frame (device-local or fixed-offset) and supplies the reading in it
+//! through the [`Cadence`](crate::Cadence) trait.
 
 use core::fmt::{self, Write as _};
 
 use crate::{
+  Cadence,
   calendar::days_in_month,
+  civil::Civil,
   error::{ParseError, ParseErrorKind, Result},
   field::{FieldDomain, FieldSet},
 };
 
-/// One wall-clock second in a chosen reference frame: the six field values
-/// a pattern matches against.
-///
-/// Construct with [`FieldValues::new`] or struct literals; the fields are
-/// public so callers can bridge their own civil-time representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FieldValues {
-  /// Year, 0000-9999.
-  pub year: u16,
-  /// Month of year, 1-12.
-  pub month: u8,
-  /// Day of month, 1-31.
-  pub day: u8,
-  /// Hour of day, 0-23.
-  pub hour: u8,
-  /// Minute of hour, 0-59.
-  pub minute: u8,
-  /// Second of minute, 0-59.
-  pub second: u8,
-}
-
-impl FieldValues {
-  /// Creates field values, rejecting out-of-domain components.
-  ///
-  /// Civil validity (e.g. February 30th) is deliberately not required:
-  /// [`Pattern::next_fire`] rolls such starts forward, and matching is pure
-  /// set membership over the supplied values.
-  pub fn new(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Option<Self> {
-    if month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 59 {
-      return None;
-    }
-    Some(Self {
-      year,
-      month,
-      day,
-      hour,
-      minute,
-      second,
-    })
-  }
-}
-
-/// The declared reference frame of a pattern.
+/// The declared reference frame of a ticker.
 ///
 /// `Utc` is the `Z` sugar; `Fixed` carries the declared `+hh:mm`/`-hh:mm`
 /// offset in seconds east of UTC. The distinction is preserved so the
@@ -67,7 +28,8 @@ pub enum Offset {
   Local,
   /// Declared with `Z`: evaluate in the UTC frame.
   Utc,
-  /// Declared with an explicit offset: evaluate in that fixed civil frame.
+  /// Declared with an explicit offset: evaluate in that fixed civil
+  /// frame.
   Fixed(i32),
 }
 
@@ -90,13 +52,13 @@ impl fmt::Display for Offset {
   }
 }
 
-/// A compiled schedule pattern: six per-field selection sets plus the
+/// A compiled schedule ticker: six per-field selection sets plus the
 /// declared reference frame.
 ///
-/// Build with [`Pattern::parse`]; the canonical form round-trips through
+/// Build with [`Ticker::parse`]; the canonical form round-trips through
 /// [`Display`](fmt::Display).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pattern {
+pub struct Ticker {
   year: FieldSet,
   month: FieldSet,
   day: FieldSet,
@@ -106,8 +68,8 @@ pub struct Pattern {
   offset: Offset,
 }
 
-impl Pattern {
-  /// Parses and compiles a pattern string.
+impl Ticker {
+  /// Parses and compiles a ticker string.
   ///
   /// The grammar is the fixed six-field skeleton `year-month-dayThh:mm:ss`
   /// with an optional trailing offset (`Z` or `[+/-]hh:mm`), no whitespace.
@@ -117,10 +79,10 @@ impl Pattern {
   /// enumerations are syntax errors. Duplicate set elements are rejected.
   ///
   /// ```
-  /// use radiata_cadence::Pattern;
+  /// use radiata_cadence::Ticker;
   ///
-  /// let pattern = Pattern::parse("2026-{03,09-12}-01T00:00:00Z").unwrap();
-  /// assert_eq!(pattern.to_string(), "2026-{03,09-12}-01T00:00:00Z");
+  /// let ticker = Ticker::parse("2026-{03,09-12}-01T00:00:00Z").unwrap();
+  /// assert_eq!(ticker.to_string(), "2026-{03,09-12}-01T00:00:00Z");
   /// ```
   ///
   /// # Errors
@@ -128,7 +90,7 @@ impl Pattern {
   /// Returns a [`ParseError`] naming the offending text for every
   /// malformation: skeleton breaks, wrong digit counts, out-of-domain
   /// values, descending ranges, duplicate set elements, and bad offsets.
-  pub fn parse(text: &str) -> Result<Pattern> {
+  pub fn parse(text: &str) -> Result<Ticker> {
     let (year, rest) = FieldSet::parse(text, FieldDomain::YEAR)?;
     let rest = expect(rest, '-', "'-'")?;
     let (month, rest) = FieldSet::parse(rest, FieldDomain::MONTH)?;
@@ -141,7 +103,7 @@ impl Pattern {
     let rest = expect(rest, ':', "':'")?;
     let (second, rest) = FieldSet::parse(rest, FieldDomain::SECOND)?;
     let offset = parse_offset(rest)?;
-    Ok(Pattern {
+    Ok(Ticker {
       year,
       month,
       day,
@@ -157,26 +119,35 @@ impl Pattern {
     self.offset
   }
 
-  /// Returns `true` when the wall-clock second with these field values
-  /// fires.
+  /// Returns `true` when this wall-clock reading fires.
   ///
-  /// Pure set membership: every field must be a member of its set. Callers
-  /// supply values in the pattern's reference frame; nonexistent civil
-  /// dates (February 30th) simply never occur in a real frame, and
-  /// [`Pattern::next_fire`] never produces them.
-  pub fn r#match(&self, year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> bool {
-    self.matches(FieldValues {
-      year,
-      month,
-      day,
-      hour,
-      minute,
-      second,
-    })
+  /// The reading converts into the ticker's declared frame through the
+  /// [`Cadence`] trait, then firing is pure set membership: every field
+  /// must be a member of its set. A reading that cannot be resolved into
+  /// the frame — malformed, outside the crate's 0000-9999 civil domain,
+  /// or an instant needing the device-local frame — never fires
+  /// (fail-closed; resolve the reading into a zoned value first when it
+  /// must).
+  ///
+  /// ```
+  /// use radiata_cadence::Ticker;
+  ///
+  /// let daily = Ticker::parse("{*}-{*}-{*}T00:00:00").unwrap();
+  /// assert!(daily.fires_at("2026-11-08T00:00:00"));
+  /// assert!(!daily.fires_at("2026-11-08T00:00:01"));
+  /// ```
+  pub fn fires_at(&self, moment: &(impl Cadence + ?Sized)) -> bool {
+    match moment.to_civil(self.offset) {
+      Ok(civil) => self.contains(civil),
+      Err(_) => false,
+    }
   }
 
-  /// The [`FieldValues`]-taking form of `Pattern::r#match`.
-  pub fn matches(&self, values: FieldValues) -> bool {
+  /// Set membership over one civil second: every field must be a member
+  /// of its set. Nonexistent civil dates (February 30th) simply never
+  /// occur in a real frame, and [`Ticker::next_fire`] never produces
+  /// them.
+  pub(crate) fn contains(&self, values: Civil) -> bool {
     self.year.contains(values.year)
       && self.month.contains(u16::from(values.month))
       && self.day.contains(u16::from(values.day))
@@ -185,8 +156,9 @@ impl Pattern {
       && self.second.contains(u16::from(values.second))
   }
 
-  /// Returns the first matching wall-clock second at or after `start`
-  /// (inclusive), or `None` when no second can ever match.
+  /// Returns the first firing wall-clock second at or after `start`
+  /// (inclusive), or `None` when no second can ever match (including a
+  /// start that cannot be resolved into the frame).
   ///
   /// The search is an ordered walk over the compiled sets: each field is
   /// tested from the year down, and a failing field jumps to its next
@@ -194,19 +166,18 @@ impl Pattern {
   /// (month lengths, leap years) is implemented in-crate, so nonexistent
   /// dates — February 30th, non-leap February 29ths — are skipped, never
   /// produced. The search is bounded by the grammar's 0000-9999 year
-  /// domain: when the pattern's last set year is exhausted, `None` is
+  /// domain: when the ticker's last set year is exhausted, `None` is
   /// returned.
   ///
   /// ```
-  /// use radiata_cadence::{FieldValues, Pattern};
+  /// use radiata_cadence::Ticker;
   ///
-  /// let daily = Pattern::parse("{*}-{*}-{*}T00:00:00Z").unwrap();
-  /// let start = FieldValues::new(2026, 3, 15, 12, 30, 45).unwrap();
-  /// let next = daily.next_fire(start).unwrap();
-  /// assert_eq!(next, FieldValues::new(2026, 3, 16, 0, 0, 0).unwrap());
+  /// let daily = Ticker::parse("{*}-{*}-{*}T00:00:00Z").unwrap();
+  /// let next = daily.next_fire("2026-03-15T12:30:45").unwrap();
+  /// assert_eq!(next.to_string(), "2026-03-16T00:00:00");
   /// ```
-  pub fn next_fire(&self, start: FieldValues) -> Option<FieldValues> {
-    let mut cursor = start;
+  pub fn next_fire(&self, start: &(impl Cadence + ?Sized)) -> Option<Civil> {
+    let mut cursor = start.to_civil(self.offset).ok()?;
     loop {
       if !self.year.contains(cursor.year) {
         cursor.year = self.year.next_at(cursor.year)?;
@@ -245,7 +216,7 @@ impl Pattern {
   }
 }
 
-impl fmt::Display for Pattern {
+impl fmt::Display for Ticker {
   /// Renders the canonical form: zero-padded fields, sets as sorted and
   /// coalesced runs (or `{*}`), the offset as declared (`Z` stays `Z`).
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -277,7 +248,7 @@ fn expect<'a>(text: &'a str, expected: char, description: &'static str) -> Resul
 }
 
 /// Parses the optional trailing offset into the declared reference frame.
-fn parse_offset(text: &str) -> Result<Offset> {
+pub(crate) fn parse_offset(text: &str) -> Result<Offset> {
   if text.is_empty() {
     return Ok(Offset::Local);
   }
@@ -328,14 +299,14 @@ fn parse_offset_component(text: &str, name: &'static str, max: u8, whole: &str) 
 
 /// Resets the time-of-day after a month or day jump; the advanced field is
 /// left as the carry left it.
-fn reset_time(cursor: &mut FieldValues) {
+fn reset_time(cursor: &mut Civil) {
   cursor.hour = 0;
   cursor.minute = 0;
   cursor.second = 0;
 }
 
 /// Resets month, day, and time-of-day after a year jump.
-fn reset_date(cursor: &mut FieldValues) {
+fn reset_date(cursor: &mut Civil) {
   cursor.month = 1;
   cursor.day = 1;
   cursor.hour = 0;
@@ -344,7 +315,7 @@ fn reset_date(cursor: &mut FieldValues) {
 }
 
 /// Advances to the next month, rolling into the next set year past December.
-fn advance_month(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
+fn advance_month(cursor: &mut Civil, years: &FieldSet) -> Option<()> {
   if cursor.month >= 12 {
     cursor.year = years.next_at(cursor.year.checked_add(1)?)?;
     cursor.month = 1;
@@ -356,7 +327,7 @@ fn advance_month(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
 }
 
 /// Advances to the next day, rolling the month and year as needed.
-fn advance_day(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
+fn advance_day(cursor: &mut Civil, years: &FieldSet) -> Option<()> {
   cursor.day += 1;
   if cursor.day > days_in_month(cursor.year, cursor.month) {
     advance_month(cursor, years)?;
@@ -365,7 +336,7 @@ fn advance_day(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
 }
 
 /// Advances to the next hour, rolling the day past 23.
-fn advance_hour(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
+fn advance_hour(cursor: &mut Civil, years: &FieldSet) -> Option<()> {
   cursor.hour += 1;
   if cursor.hour > 23 {
     cursor.hour = 0;
@@ -375,7 +346,7 @@ fn advance_hour(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
 }
 
 /// Advances to the next minute, rolling the hour past 59.
-fn advance_minute(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
+fn advance_minute(cursor: &mut Civil, years: &FieldSet) -> Option<()> {
   cursor.minute += 1;
   if cursor.minute > 59 {
     cursor.minute = 0;
@@ -385,7 +356,7 @@ fn advance_minute(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
 }
 
 /// Advances to the next second, rolling the minute past 59.
-fn advance_second(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
+fn advance_second(cursor: &mut Civil, years: &FieldSet) -> Option<()> {
   cursor.second += 1;
   if cursor.second > 59 {
     cursor.second = 0;
@@ -396,21 +367,22 @@ fn advance_second(cursor: &mut FieldValues, years: &FieldSet) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-  use super::{FieldValues, Offset, ParseErrorKind, Pattern};
+  use super::{Offset, ParseErrorKind, Ticker};
+  use crate::civil::Civil;
 
   /// Parses an input that must be accepted.
-  fn parse_ok(text: &str) -> Pattern {
-    Pattern::parse(text).unwrap_or_else(|error| panic!("{text:?} should parse: {error}"))
+  fn parse_ok(text: &str) -> Ticker {
+    Ticker::parse(text).unwrap_or_else(|error| panic!("{text:?} should parse: {error}"))
   }
 
   /// Asserts an input is rejected and returns the failure category.
   fn rejected(text: &str) -> ParseErrorKind {
-    Pattern::parse(text).expect_err(text).kind()
+    Ticker::parse(text).expect_err(text).kind()
   }
 
   /// Builds field values that must be in-domain.
-  fn values(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> FieldValues {
-    FieldValues::new(year, month, day, hour, minute, second).expect("in-domain values")
+  fn values(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Civil {
+    Civil::new(year, month, day, hour, minute, second).expect("in-domain values")
   }
 
   /// The frozen canonical-form golden corpus: input, canonical rendering.
@@ -439,14 +411,10 @@ mod tests {
       ("9999-12-31T23:59:59", "9999-12-31T23:59:59"),
     ];
     for (input, canonical) in cases {
-      let pattern = parse_ok(input);
+      let ticker = parse_ok(input);
+      assert_eq!(ticker.to_string(), canonical, "canonical form of {input:?}");
       assert_eq!(
-        pattern.to_string(),
-        canonical,
-        "canonical form of {input:?}"
-      );
-      assert_eq!(
-        parse_ok(&pattern.to_string()).to_string(),
+        parse_ok(&ticker.to_string()).to_string(),
         canonical,
         "reparse of {input:?}"
       );
@@ -585,7 +553,7 @@ mod tests {
   /// spaces, including out-of-domain field values (both are pure set
   /// membership, so they agree everywhere).
   #[test]
-  fn membership_matches_oracle() {
+  fn firing_matches_oracle() {
     let patterns = [
       "2026-03-15T00:00:00",
       "2026-{03,07,09-12}-01T00:00:00Z",
@@ -593,7 +561,7 @@ mod tests {
       "{2025,2026}-{01-12}-{01,15,28-31}T{00,12,23}:{00,29,30,59}:{00,01,59}",
       "{*}-{*}-{30,31}T{23}:59:59",
     ];
-    let oracles: Vec<(Pattern, Oracle)> = patterns
+    let oracles: Vec<(Ticker, Oracle)> = patterns
       .iter()
       .map(|text| (parse_ok(text), Oracle::parse(text)))
       .collect();
@@ -604,11 +572,11 @@ mod tests {
             for minute in [0u8, 29, 30, 59] {
               for second in [0u8, 1, 59] {
                 let candidate = values(year, month, day, hour, minute, second);
-                for (pattern, oracle) in &oracles {
+                for (ticker, oracle) in &oracles {
                   assert_eq!(
-                    pattern.matches(candidate),
+                    ticker.contains(candidate),
                     oracle.matches(candidate),
-                    "{pattern:?} at {candidate:?}"
+                    "{ticker:?} at {candidate:?}"
                   );
                 }
               }
@@ -618,26 +586,47 @@ mod tests {
       }
     }
     // Dense time-of-day sweep on one day.
-    let (pattern, oracle) = (&oracles[3].0, &oracles[3].1);
+    let (ticker, oracle) = (&oracles[3].0, &oracles[3].1);
     for hour in 0..=23u8 {
       for minute in 0..=59u8 {
         for second in 0..=59u8 {
           let candidate = values(2026, 6, 15, hour, minute, second);
           assert_eq!(
-            pattern.matches(candidate),
+            ticker.contains(candidate),
             oracle.matches(candidate),
-            "{pattern:?} at {candidate:?}"
+            "{ticker:?} at {candidate:?}"
           );
         }
       }
     }
   }
 
+  /// `fires_at` agrees with `contains` for readable moments and never
+  /// fires for unreadable ones (fail-closed).
+  #[test]
+  fn fires_at_reads_moments_fail_closed() {
+    let daily = parse_ok("{*}-{*}-{*}T00:00:00Z");
+    assert!(daily.fires_at("2026-03-15T00:00:00"));
+    assert!(!daily.fires_at("2026-03-15T00:00:01"));
+    // An offset-carrying string is an instant: 00:00:00Z converts into
+    // the +09:00 frame as 09:00:00, which does not fire.
+    let tokyo = parse_ok("{*}-{*}-{*}T09:00:00+09:00");
+    assert!(tokyo.fires_at("2026-03-15T00:00:00Z"));
+    // Civil readings pass straight through every frame.
+    let civil: Civil = "2026-03-15T00:00:00".parse().unwrap();
+    assert!(daily.fires_at(&civil));
+    let tokyo_civil: Civil = "2026-03-15T09:00:00".parse().unwrap();
+    assert!(tokyo.fires_at(&tokyo_civil));
+    // Malformed and out-of-domain readings never fire.
+    assert!(!daily.fires_at("not a moment"));
+    assert!(!daily.fires_at("2026-13-15T00:00:00"));
+  }
+
   /// Next-fire agrees with exhaustive second-stepping over dense sample
   /// spaces, including year, month, day, and leap-day boundaries.
   #[test]
   fn next_fire_matches_step_oracle() {
-    let cases: &[(&str, FieldValues)] = &[
+    let cases: &[(&str, Civil)] = &[
       ("{*}-{*}-{*}T00:00:00Z", values(2026, 3, 15, 12, 30, 45)),
       ("2026-01-{01,15}T00:00:00", values(2026, 1, 2, 0, 0, 0)),
       (
@@ -653,10 +642,10 @@ mod tests {
       ),
     ];
     for (text, start) in cases {
-      let pattern = parse_ok(text);
+      let ticker = parse_ok(text);
       let oracle = Oracle::parse(text);
       assert_eq!(
-        pattern.next_fire(*start),
+        ticker.next_fire(start),
         oracle_next_fire(&oracle, *start, 12_000_000),
         "{text:?} from {start:?}"
       );
@@ -667,69 +656,72 @@ mod tests {
   #[test]
   fn next_fire_chain_matches_oracle() {
     let text = "{*}-{*}-{*}T{06,18}:{00,30}:00Z";
-    let pattern = parse_ok(text);
+    let ticker = parse_ok(text);
     let oracle = Oracle::parse(text);
     let mut cursor = values(2026, 2, 27, 12, 0, 0);
     for _ in 0..24 {
-      let next = pattern
-        .next_fire(cursor)
-        .expect("daily-ish pattern always fires");
+      let next = ticker
+        .next_fire(&cursor)
+        .expect("daily-ish ticker always fires");
       let stepped = oracle_next_fire(&oracle, cursor, 1_000_000).expect("oracle fires too");
       assert_eq!(next, stepped);
-      assert!(pattern.matches(next), "next_fire output matches");
+      assert!(ticker.contains(next), "next_fire output fires");
       cursor = step(next).expect("chain stays in range");
     }
   }
 
-  /// Calendar edges: inclusive start, leap days, never-matching patterns,
+  /// Calendar edges: inclusive start, leap days, never-matching tickers,
   /// and end-of-month rolls.
   #[test]
   fn next_fire_calendar_edges() {
     // Inclusive: a matching start fires itself.
     let daily = parse_ok("{*}-{*}-{*}T00:00:00");
     let midnight = values(2026, 3, 15, 0, 0, 0);
-    assert_eq!(daily.next_fire(midnight), Some(midnight));
+    assert_eq!(daily.next_fire(&midnight), Some(midnight));
 
     // Leap day: fires in leap years only, never between them.
     let leap_day = parse_ok("{*}-{02}-{29}T00:00:00Z");
     assert_eq!(
-      leap_day.next_fire(values(2024, 1, 1, 0, 0, 0)),
+      leap_day.next_fire(&values(2024, 1, 1, 0, 0, 0)),
       Some(values(2024, 2, 29, 0, 0, 0))
     );
     assert_eq!(
-      leap_day.next_fire(values(2024, 3, 1, 0, 0, 0)),
+      leap_day.next_fire(&values(2024, 3, 1, 0, 0, 0)),
       Some(values(2028, 2, 29, 0, 0, 0))
     );
     assert_eq!(
-      parse_ok("{2024}-{02}-{29}T00:00:00").next_fire(values(2024, 3, 1, 0, 0, 0)),
+      parse_ok("{2024}-{02}-{29}T00:00:00").next_fire(&values(2024, 3, 1, 0, 0, 0)),
       None
     );
 
     // February 30th can never fire; the bounded search returns None.
     let feb_30 = parse_ok("{*}-{02}-{30}T00:00:00");
-    assert_eq!(feb_30.next_fire(values(2026, 1, 1, 0, 0, 0)), None);
+    assert_eq!(feb_30.next_fire(&values(2026, 1, 1, 0, 0, 0)), None);
 
     // End-of-month rolls skip impossible set days.
     let month_ends = parse_ok("2026-{02,04}-{30,31}T00:00:00");
     assert_eq!(
-      month_ends.next_fire(values(2026, 1, 1, 0, 0, 0)),
+      month_ends.next_fire(&values(2026, 1, 1, 0, 0, 0)),
       Some(values(2026, 4, 30, 0, 0, 0))
     );
 
     // Year exhaustion bounds the search.
     let last = parse_ok("2026-12-31T23:59:59");
     assert_eq!(
-      last.next_fire(values(2026, 12, 31, 23, 59, 59)),
+      last.next_fire(&values(2026, 12, 31, 23, 59, 59)),
       Some(values(2026, 12, 31, 23, 59, 59))
     );
     assert_eq!(
-      last.next_fire(values(2026, 12, 31, 23, 59, 58)),
+      last.next_fire(&values(2026, 12, 31, 23, 59, 58)),
       Some(values(2026, 12, 31, 23, 59, 59))
     );
     assert_eq!(
-      parse_ok("9999-12-31T00:00:00").next_fire(values(9999, 12, 31, 0, 0, 1)),
+      parse_ok("9999-12-31T00:00:00").next_fire(&values(9999, 12, 31, 0, 0, 1)),
       None
     );
+
+    // An unreadable start is fail-closed None.
+    assert_eq!(daily.next_fire("not a moment"), None);
   }
 
   /// The offset accessor reports the declared frame, and Display renders
@@ -757,14 +749,14 @@ mod tests {
     assert_eq!(parse_ok("2026-03-15T00:00:00").offset().to_string(), "");
   }
 
-  /// Randomly generated valid patterns round-trip through the canonical
-  /// form with identical semantics. Hand-rolled xorshift with a fixed seed:
-  /// no test dependencies.
+  /// Randomly generated valid tickers round-trip through the canonical
+  /// form with identical semantics. Hand-rolled xorshift with a fixed
+  /// seed: no test dependencies.
   #[test]
-  fn random_patterns_round_trip() {
+  fn random_tickers_round_trip() {
     let mut rng = Rng::new(0x5EED_2026_1114_0808);
     for _ in 0..256 {
-      let text = random_pattern(&mut rng);
+      let text = random_ticker(&mut rng);
       let first = parse_ok(&text);
       let canonical = first.to_string();
       let second = parse_ok(&canonical);
@@ -776,8 +768,8 @@ mod tests {
         values(2024, 2, 29, 23, 59, 59),
       ] {
         assert_eq!(
-          first.matches(probe),
-          second.matches(probe),
+          first.contains(probe),
+          second.contains(probe),
           "{text:?} at {probe:?}"
         );
       }
@@ -806,9 +798,9 @@ mod tests {
     }
   }
 
-  /// Builds one random valid field: a bare literal or a small braced set of
-  /// disjoint literals and ranges (cut from the domain), zero-padded to the
-  /// field width.
+  /// Builds one random valid field: a bare literal or a small braced set
+  /// of disjoint literals and ranges (cut from the domain), zero-padded
+  /// to the field width.
   fn random_field(rng: &mut Rng, min: u16, max: u16, digits: usize) -> String {
     let render = |value: u16| format!("{value:0digits$}");
     let span = u64::from(max - min + 1);
@@ -839,8 +831,8 @@ mod tests {
     format!("{{{}}}", elements.join(","))
   }
 
-  /// Builds one random valid pattern string.
-  fn random_pattern(rng: &mut Rng) -> String {
+  /// Builds one random valid ticker string.
+  fn random_ticker(rng: &mut Rng) -> String {
     let year = random_field(rng, 0, 9999, 4);
     let month = random_field(rng, 1, 12, 2);
     let day = random_field(rng, 1, 31, 2);
@@ -852,8 +844,8 @@ mod tests {
   }
 
   /// An independent brute-force oracle: inclusive ranges per field with
-  /// linear scans and its own civil-calendar stepping. Deliberately shares
-  /// no code with the production parser, masks, or search.
+  /// linear scans and its own civil-calendar stepping. Deliberately
+  /// shares no code with the production parser, masks, or search.
   struct Oracle {
     year: Vec<(u16, u16)>,
     month: Vec<(u16, u16)>,
@@ -864,7 +856,7 @@ mod tests {
   }
 
   impl Oracle {
-    /// Parses a pattern with plain string splitting and `u16::from_str`.
+    /// Parses a ticker with plain string splitting and `u16::from_str`.
     /// The oracle ignores the offset: frames do not affect matching.
     fn parse(text: &str) -> Oracle {
       let (date, rest) = text.split_once('T').expect("oracle: T separator");
@@ -926,7 +918,7 @@ mod tests {
         .any(|&(low, high)| value >= low && value <= high)
     }
 
-    fn matches(&self, values: FieldValues) -> bool {
+    fn matches(&self, values: Civil) -> bool {
       Self::covered(&self.year, values.year)
         && Self::covered(&self.month, u16::from(values.month))
         && Self::covered(&self.day, u16::from(values.day))
@@ -949,7 +941,7 @@ mod tests {
 
   /// Advances one second with civil-calendar carries; `None` past
   /// 9999-12-31T23:59:59.
-  fn step(values: FieldValues) -> Option<FieldValues> {
+  fn step(values: Civil) -> Option<Civil> {
     let mut next = values;
     next.second += 1;
     if next.second == 60 {
@@ -978,8 +970,9 @@ mod tests {
     Some(next)
   }
 
-  /// Exhaustive second-stepping next-fire oracle, bounded by `limit` steps.
-  fn oracle_next_fire(oracle: &Oracle, start: FieldValues, limit: u64) -> Option<FieldValues> {
+  /// Exhaustive second-stepping next-fire oracle, bounded by `limit`
+  /// steps.
+  fn oracle_next_fire(oracle: &Oracle, start: Civil, limit: u64) -> Option<Civil> {
     let mut cursor = start;
     for _ in 0..=limit {
       if oracle.matches(cursor) {

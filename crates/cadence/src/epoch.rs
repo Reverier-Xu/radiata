@@ -1,11 +1,12 @@
-//! Unix-epoch plumbing shared by the time-library interop features.
+//! Unix-epoch plumbing for instant-style readings: the civil-string
+//! instant path and the `std-time`/`jiff` interop features.
 //!
 //! The civil calendar arithmetic (Hinnant's `days_from_civil` /
-//! `civil_from_days`) lives here once so the `std-time`, `chrono`, and
-//! `jiff` conversion surfaces cannot drift on epoch semantics. Compiled
-//! only when at least one epoch-based interop feature is enabled.
+//! `civil_from_days`) lives here once so every conversion surface —
+//! offset-carrying strings, `SystemTime`, `jiff::Timestamp` — cannot
+//! drift on epoch semantics.
 
-use crate::pattern::{FieldValues, Offset};
+use crate::{civil::Civil, ticker::Offset};
 
 const SECS_PER_DAY: i64 = 86_400;
 
@@ -61,21 +62,22 @@ pub(crate) fn frame_offset_seconds(frame: Offset) -> Option<i64> {
   }
 }
 
-/// Converts field values in a resolvable frame into unix-epoch seconds.
-pub(crate) fn field_values_to_unix_seconds(
-  values: FieldValues, frame: Offset,
+/// Converts a civil second in a resolvable frame into unix-epoch
+/// seconds.
+pub(crate) fn civil_to_unix_seconds(
+  civil: Civil, frame: Offset,
 ) -> Result<i64, crate::TimeInteropError> {
   let offset = frame_offset_seconds(frame).ok_or(crate::TimeInteropError::LocalFrameUnsupported)?;
-  if values.year > 9999 {
+  if civil.year > 9999 {
     return Err(crate::TimeInteropError::OutOfRange);
   }
   let days = days_from_civil(
-    i64::from(values.year),
-    u32::from(values.month),
-    u32::from(values.day),
+    i64::from(civil.year),
+    u32::from(civil.month),
+    u32::from(civil.day),
   );
   let time_of_day =
-    i64::from(values.hour) * 3600 + i64::from(values.minute) * 60 + i64::from(values.second);
+    i64::from(civil.hour) * 3600 + i64::from(civil.minute) * 60 + i64::from(civil.second);
   days
     .checked_mul(SECS_PER_DAY)
     .and_then(|day_secs| day_secs.checked_add(time_of_day))
@@ -83,11 +85,11 @@ pub(crate) fn field_values_to_unix_seconds(
     .ok_or(crate::TimeInteropError::OutOfRange)
 }
 
-/// Converts unix-epoch seconds plus a frame offset into field values,
+/// Converts unix-epoch seconds plus a frame offset into a civil second,
 /// rejecting instants outside the crate's 0000-9999 civil year domain.
-pub(crate) fn unix_seconds_to_field_values(
+pub(crate) fn unix_seconds_to_civil(
   seconds: i64, frame: Offset,
-) -> Result<FieldValues, crate::TimeInteropError> {
+) -> Result<Civil, crate::TimeInteropError> {
   let offset = frame_offset_seconds(frame).ok_or(crate::TimeInteropError::LocalFrameUnsupported)?;
   let shifted = seconds
     .checked_add(offset)
@@ -98,7 +100,7 @@ pub(crate) fn unix_seconds_to_field_values(
   if !(0..=9999).contains(&year) {
     return Err(crate::TimeInteropError::OutOfRange);
   }
-  FieldValues::new(
+  Civil::new(
     year as u16,
     month as u8,
     day as u8,

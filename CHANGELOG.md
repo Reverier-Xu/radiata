@@ -82,6 +82,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `radiata-cadence`'s public interface was reshaped around readings
+  instead of hand-built field tuples: `Pattern` is now `Ticker` and the
+  firing rule is `Ticker::fires_at` (replacing the `r#match`/`matches`
+  pair, whose names collided with the reserved keyword), while
+  `FieldValues` is gone — the new `Cadence` trait reads caller-side
+  moments (`str`, `SystemTime` via `std-time`, `chrono::DateTime` via
+  `chrono`, `jiff::Timestamp`/`Zoned`/`civil::DateTime` via `jiff`) as
+  civil seconds in the ticker's declared frame, and `Civil` is the
+  frame-free civil second that `next_fire` returns (produced by the
+  crate, never hand-constructed). The trigger engine, the cadence fuzz
+  target, and the cadence work-item documents follow the new names;
+  the grammar, canonical forms, and firing semantics are unchanged.
 - The Phase C deferral of per-row cleanup-policy labels on the
   reconcile wire is final for 0.1.0: the Phase D consumer turned out
   node-local — trigger rows live in a family no reconcile lane owns,

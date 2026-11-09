@@ -92,7 +92,7 @@ set masks, match evaluation, next-fire ordered search, golden + fuzz
 corpora. Estimated ~1-2k lines, pure `std`, zero dependencies.
 
 The crate does **not** own: wall-clock reading, timezone-database access
-(the caller resolves the reference frame and supplies field values —
+(the caller resolves the reference frame and supplies the reading —
 device-local resolution is radiata's job via its `WallClock` seam), timers,
 triggers, or task semantics.
 
@@ -123,21 +123,39 @@ triggers, or task semantics.
 Three optional features bridge caller-side time libraries; all default
 off, the core stays dependency-free and clock-blind:
 
-- `std-time`: `SystemTime` <-> `FieldValues` for the `Utc` and
-  fixed-offset frames. Sub-second readings floor toward negative
-  infinity. The device-local frame is rejected — `std` has no timezone
-  database.
-- `chrono` (dep `chrono` 0.4, no default features): `TryFrom` any
-  `DateTime<Tz>` into `FieldValues` (local civil reading), and
-  `FieldValues::to_chrono_fixed` back into `DateTime<FixedOffset>`.
-- `jiff` (dep `jiff` 0.2, no default features): `TryFrom` for
-  `jiff::Timestamp` / `&jiff::Zoned` / `jiff::civil::DateTime`, and
-  `FieldValues::to_jiff_timestamp` / `to_jiff_civil` back.
+- `std-time`: `Cadence` for `SystemTime` plus `Civil::to_system_time`
+  back, for the `Utc` and fixed-offset frames. Sub-second readings
+  floor toward negative infinity. The device-local frame is rejected —
+  `std` has no timezone database.
+- `chrono` (dep `chrono` 0.4, no default features): `Cadence` for any
+  `DateTime<Tz>` (its own wall clock for the local frame, its instant
+  converted for declared frames), and `Civil::to_chrono_fixed` back
+  into `DateTime<FixedOffset>`.
+- `jiff` (dep `jiff` 0.2, no default features): `Cadence` for
+  `jiff::Timestamp` / `jiff::Zoned` / `jiff::civil::DateTime`, and
+  `Civil::to_jiff_timestamp` / `to_jiff_civil` back.
 
 The device-local frame is resolvable only through `chrono`/`jiff` (their
 timezone types own the tz database); cadence deliberately never resolves
 local time itself. Errors surface as the shared `TimeInteropError`
-(`LocalFrameUnsupported` / `OutOfRange`).
+(`Malformed` / `LocalFrameUnsupported` / `OutOfRange`).
+
+### Interface refinement (2026-11-08, post-merge follow-up)
+
+After first use in radiata's trigger engine the public surface was
+reshaped around readings instead of hand-built field tuples:
+
+- `Pattern` is `Ticker`; the firing rule is `Ticker::fires_at`, one
+  method taking any `Cadence` reading in the ticker's declared frame
+  (replacing the raw-identifier `r#match`/`matches` pair).
+- `FieldValues` is removed. The `Cadence` trait reads caller-side
+  moments — `str` (built-in: the civil shape `YYYY-MM-DDThh:mm:ss`,
+  optionally carrying an offset, which then converts like an instant),
+  `SystemTime`, `chrono::DateTime`, jiff's `Timestamp`/`Zoned`/
+  `civil::DateTime` — as civil seconds in a frame; `Civil` is the
+  frame-free civil second `next_fire` returns, produced by the crate
+  and never hand-constructed. The grammar, canonical forms, and
+  firing semantics are unchanged.
 
 ### Project time-library survey (decision record)
 

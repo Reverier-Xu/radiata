@@ -597,7 +597,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radiata"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -607,6 +607,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "minicbor",
+ "radiata-cadence",
  "rand",
  "rcgen",
  "redb",
@@ -625,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "radiata-cadence"
-version = "0.0.1"
+version = "0.0.3"
 
 [[package]]
 name = "radiata-fuzz"

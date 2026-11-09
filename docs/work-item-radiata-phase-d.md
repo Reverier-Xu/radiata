@@ -55,9 +55,9 @@ replication (triggers are node policy, not cluster state).
    the catalog (`node_local`), never replicated. Durable across
    restarts.
 2. **Time triggers.** A core controller evaluates due triggers via
-   `Pattern::next_fire` against the wall-clock seam; missed windows
+   `Ticker::next_fire` against the wall-clock seam; missed windows
    coalesce to one run (catchup policy). Uses the `std-time` feature's
-   conversions or plain `FieldValues` construction — no new dependency,
+   `Cadence` conversions — no new dependency,
    no local-timezone resolution (operators express triggers in the
    frame the pattern declares).
 3. **Event triggers.** Predicate-driven: the unified change stream

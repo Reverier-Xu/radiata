@@ -5,7 +5,7 @@
 //! dedicated node-local trigger family (the reconcile plane owns no lane
 //! for its namespace, so the rows are never carried between nodes) and
 //! survives restarts. One row carries its source — a cadence
-//! [`radiata_cadence::Pattern`] text for a time trigger or a
+//! [`radiata_cadence::Ticker`] text for a time trigger or a
 //! [`SubscriptionPredicate`] for an event trigger — and its target: the
 //! qualified tag of a registered caller-owned task reconciler. The row
 //! is spec-only: the trigger *policy* (catchup = coalesce-to-one,
@@ -31,7 +31,7 @@ use std::{
 };
 
 use minicbor::{Decode, Encode};
-use radiata_cadence::{Offset, Pattern, field_values_to_system_time, system_time_to_field_values};
+use radiata_cadence::{Cadence, Civil, Offset, Ticker};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -349,18 +349,18 @@ pub(crate) fn validate_trigger_target(
 pub(crate) fn prepare_time_trigger(
   name: &str, pattern: &str, target: QualifiedTag,
 ) -> Result<TriggerRow> {
-  let pattern = Pattern::parse(pattern).map_err(|_| Error::invalid_input("trigger pattern"))?;
-  if pattern.offset() == Offset::Local {
+  let ticker = Ticker::parse(pattern).map_err(|_| Error::invalid_input("trigger pattern"))?;
+  if ticker.offset() == Offset::Local {
     // The core resolves no local timezone: the pattern's frame must
     // name its offset (`Z` or fixed), so the trigger's fire times never
     // depend on a timezone database the core does not carry.
     return Err(Error::invalid_input("trigger pattern frame"));
   }
-  let next_fire = next_fire_after(&pattern, crate::time::now_seconds())?;
+  let next_fire = next_fire_after(&ticker, crate::time::now_seconds())?;
   TriggerRow::new(
     name.to_owned(),
     TriggerSource::Time {
-      pattern: pattern.to_string(),
+      pattern: ticker.to_string(),
     },
     target,
     next_fire,
@@ -380,19 +380,18 @@ pub(crate) fn prepare_event_trigger(
   )
 }
 
-/// The next due fire of `pattern` at or after `start_seconds` (inclusive,
-/// UNIX seconds in the pattern's frame), or `u64::MAX` when the pattern
-/// can never fire again.
-fn next_fire_after(pattern: &Pattern, start_seconds: u64) -> Result<u64> {
-  let start = system_time_to_field_values(
-    UNIX_EPOCH + Duration::from_secs(start_seconds),
-    pattern.offset(),
-  )
-  .map_err(|_| Error::invalid_input("trigger frame conversion"))?;
+/// The next due fire of the ticker at or after `start_seconds`
+/// (inclusive, UNIX seconds in the ticker's frame), or `u64::MAX` when
+/// the ticker can never fire again.
+fn next_fire_after(ticker: &Ticker, start_seconds: u64) -> Result<u64> {
+  let start = UNIX_EPOCH + Duration::from_secs(start_seconds);
+  let start = start
+    .to_civil(ticker.offset())
+    .map_err(|_| Error::invalid_input("trigger frame conversion"))?;
   Ok(
-    pattern
-      .next_fire(start)
-      .map(|values| fire_seconds(&values, pattern.offset()))
+    ticker
+      .next_fire(&start)
+      .map(|values| fire_seconds(&values, ticker.offset()))
       .unwrap_or(u64::MAX),
   )
 }
@@ -401,8 +400,9 @@ fn next_fire_after(pattern: &Pattern, start_seconds: u64) -> Result<u64> {
 /// conversion saturates at the epoch for pre-epoch civil times (the
 /// crate's own second-scale contract: liveness arithmetic, never stored
 /// absolute instants).
-fn fire_seconds(values: &radiata_cadence::FieldValues, frame: Offset) -> u64 {
-  field_values_to_system_time(*values, frame)
+fn fire_seconds(values: &Civil, frame: Offset) -> u64 {
+  values
+    .to_system_time(frame)
     .map(crate::time::to_seconds)
     .unwrap_or(0)
 }
@@ -683,7 +683,7 @@ pub(crate) async fn evaluate_pass(
         if row.next_fire_seconds() > now {
           continue;
         }
-        let Ok(pattern) = Pattern::parse(pattern) else {
+        let Ok(ticker) = Ticker::parse(pattern) else {
           tracing::warn!(
             trigger = row.name(),
             "trigger row skipped: unparsable pattern"
@@ -698,7 +698,7 @@ pub(crate) async fn evaluate_pass(
           target: row.target().clone(),
         }) {
           let start = now.saturating_add(1);
-          let next_fire = next_fire_after(&pattern, start)?;
+          let next_fire = next_fire_after(&ticker, start)?;
           if next_fire != row.next_fire_seconds() {
             advanced.push((row.clone(), next_fire));
           }

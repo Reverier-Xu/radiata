@@ -1,47 +1,50 @@
 //! `chrono` interop.
 //!
-//! Any `chrono::DateTime<Tz>` converts into field values via [`TryFrom`]
-//! (its local civil reading; the frame stays known from the `Tz` you
-//! hold). The reverse direction targets `DateTime<FixedOffset>` for the
-//! `Utc` and fixed-offset frames; the device-local frame is rejected
-//! because choosing among a DST fold's ambiguous readings is a policy
-//! the caller must own.
+//! Any `chrono::DateTime<Tz>` is a [`Cadence`] reading: its own wall
+//! clock for the device-local frame (the zone it carries is the resolved
+//! frame), its UTC reading for `Utc`, and its instant shifted into the
+//! frame for a fixed offset. The reverse direction targets
+//! `DateTime<FixedOffset>` for the `Utc` and fixed-offset frames; the
+//! device-local frame is rejected because choosing among a DST fold's
+//! ambiguous readings is a policy the caller must own.
 //!
 //! ```
 //! use chrono::TimeZone;
 //!
-//! use radiata_cadence::{FieldValues, Pattern};
+//! use radiata_cadence::Ticker;
 //!
-//! let pattern = Pattern::parse("{*}-{*}-{*}T09:{00,30}:00Z").unwrap();
+//! let ticker = Ticker::parse("{*}-{*}-{*}T09:{00,30}:00Z").unwrap();
 //! let moment = chrono::Utc.with_ymd_and_hms(2026, 11, 8, 9, 30, 0).unwrap();
-//! let values = FieldValues::try_from(moment).unwrap();
-//! assert!(pattern.matches(values));
+//! assert!(ticker.fires_at(&moment));
 //! ```
 
 use chrono::{DateTime, Datelike, FixedOffset, TimeZone, Timelike};
 
-use crate::{
-  TimeInteropError,
-  pattern::{FieldValues, Offset},
-};
+use crate::{Cadence, Civil, TimeInteropError, ticker::Offset};
 
-impl<Tz: TimeZone> TryFrom<DateTime<Tz>> for FieldValues {
-  type Error = TimeInteropError;
-
-  /// Reads the civil fields of a `chrono` datetime in its local frame.
+impl<Tz: TimeZone> Cadence for DateTime<Tz> {
+  /// Reads the datetime as one civil second in `frame`.
   ///
   /// # Errors
   ///
-  /// [`TimeInteropError::OutOfRange`] when the year falls outside the
-  /// crate's 0000-9999 domain.
-  fn try_from(value: DateTime<Tz>) -> Result<Self, Self::Error> {
-    let naive = value.naive_local();
+  /// [`TimeInteropError::OutOfRange`] when the reading falls outside the
+  /// crate's 0000-9999 civil year domain.
+  fn to_civil(&self, frame: Offset) -> Result<Civil, TimeInteropError> {
+    let naive = match frame {
+      // The zone the datetime carries resolves the device-local frame.
+      Offset::Local => self.naive_local(),
+      Offset::Utc => self.naive_utc(),
+      Offset::Fixed(seconds) => {
+        let offset = FixedOffset::east_opt(seconds).ok_or(TimeInteropError::OutOfRange)?;
+        self.with_timezone(&offset).naive_local()
+      }
+    };
     let (year, month, day) = (naive.year(), naive.month(), naive.day());
     let (hour, minute, second) = (naive.hour(), naive.minute(), naive.second());
     if !(0..=9999).contains(&year) {
       return Err(TimeInteropError::OutOfRange);
     }
-    FieldValues::new(
+    Civil::new(
       year as u16,
       month as u8,
       day as u8,
@@ -53,14 +56,14 @@ impl<Tz: TimeZone> TryFrom<DateTime<Tz>> for FieldValues {
   }
 }
 
-impl FieldValues {
-  /// Converts field values into a `chrono::DateTime<FixedOffset>` in the
-  /// given `Utc` or fixed-offset frame.
+impl Civil {
+  /// Converts the civil second into a `chrono::DateTime<FixedOffset>` in
+  /// the given `Utc` or fixed-offset frame.
   ///
   /// # Errors
   ///
   /// [`TimeInteropError::LocalFrameUnsupported`] for the device-local
-  /// frame; [`TimeInteropError::OutOfRange`] when the field values are
+  /// frame; [`TimeInteropError::OutOfRange`] when the civil second is
   /// not a real civil datetime (e.g. February 30th).
   pub fn to_chrono_fixed(self, frame: Offset) -> Result<DateTime<FixedOffset>, TimeInteropError> {
     let offset_seconds = match frame {
@@ -93,26 +96,37 @@ impl FieldValues {
 mod tests {
   use chrono::{Datelike, TimeZone};
 
-  use crate::pattern::{FieldValues, Offset};
+  use super::{Cadence as _, Civil, Offset};
+
+  /// The civil shape of the readings under test, as a comparable value.
+  fn civil(text: &str) -> Civil {
+    text.parse().expect("in-domain reading")
+  }
 
   #[test]
-  fn utc_and_fixed_datetimes_convert_into_field_values() {
+  fn utc_and_fixed_datetimes_read_their_frames() {
     let moment = chrono::Utc.with_ymd_and_hms(2026, 11, 8, 9, 30, 0).unwrap();
     assert_eq!(
-      FieldValues::try_from(moment).unwrap(),
-      FieldValues::new(2026, 11, 8, 9, 30, 0).unwrap()
+      moment.to_civil(Offset::Utc).unwrap(),
+      civil("2026-11-08T09:30:00")
     );
+    // The instant 09:30Z reads as 18:30 at +09:00.
+    assert_eq!(
+      moment.to_civil(Offset::Fixed(9 * 3600)).unwrap(),
+      civil("2026-11-08T18:30:00")
+    );
+    // The device-local frame reads the zone the datetime carries.
     let offset = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
     let tokyo = offset.with_ymd_and_hms(2026, 11, 8, 18, 0, 5).unwrap();
     assert_eq!(
-      FieldValues::try_from(tokyo).unwrap(),
-      FieldValues::new(2026, 11, 8, 18, 0, 5).unwrap()
+      tokyo.to_civil(Offset::Local).unwrap(),
+      civil("2026-11-08T18:00:05")
     );
   }
 
   #[test]
-  fn field_values_convert_back_into_fixed_datetimes() {
-    let values = FieldValues::new(2026, 11, 8, 18, 0, 5).unwrap();
+  fn civil_seconds_convert_back_into_fixed_datetimes() {
+    let values = civil("2026-11-08T18:00:05");
     let tokyo = values.to_chrono_fixed(Offset::Fixed(9 * 3600)).unwrap();
     assert_eq!(tokyo.offset().local_minus_utc(), 9 * 3600);
     assert_eq!(
@@ -125,13 +139,13 @@ mod tests {
 
   #[test]
   fn local_frame_and_non_dates_are_rejected() {
-    let values = FieldValues::new(2026, 11, 8, 0, 0, 0).unwrap();
+    let values = civil("2026-11-08T00:00:00");
     assert_eq!(
       values.to_chrono_fixed(Offset::Local),
       Err(crate::TimeInteropError::LocalFrameUnsupported)
     );
     assert_eq!(
-      FieldValues::new(2026, 2, 30, 0, 0, 0)
+      crate::civil::Civil::new(2026, 2, 30, 0, 0, 0)
         .unwrap()
         .to_chrono_fixed(Offset::Utc),
       Err(crate::TimeInteropError::OutOfRange)
@@ -142,10 +156,10 @@ mod tests {
   fn year_domain_is_enforced_in_both_directions() {
     let future = chrono::Utc.with_ymd_and_hms(10_000, 1, 1, 0, 0, 0).unwrap();
     assert_eq!(
-      FieldValues::try_from(future),
+      future.to_civil(Offset::Utc),
       Err(crate::TimeInteropError::OutOfRange)
     );
-    let boundary = FieldValues::new(9999, 12, 31, 23, 59, 59).unwrap();
+    let boundary = civil("9999-12-31T23:59:59");
     assert_eq!(boundary.to_chrono_fixed(Offset::Utc).unwrap().year(), 9999);
   }
 }
