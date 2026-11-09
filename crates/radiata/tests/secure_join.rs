@@ -117,7 +117,7 @@ async fn merge_with_retry(
 /// a loaded runner expires the configured authentication deadline. The same
 /// credential is reused (a failed merge consumes no credential).
 async fn merge_ok(node: &NodeHandle, endpoint: &Endpoint, secret: &str) -> radiata::MergeView {
-  let deadline = std::time::Instant::now() + Duration::from_secs(120);
+  let deadline = std::time::Instant::now() + Duration::from_secs(300);
   loop {
     let joined = match node
       .join(endpoint.clone(), MergeCredential::parse(secret).unwrap())
@@ -1596,7 +1596,7 @@ async fn secure_join_peer_shutdown_interrupts_inflight_stream_explicitly() {
   // of seconds; the assertion is about reaching the terminal state, not
   // about when.
   let mut terminal: Option<RouteState> = None;
-  let deadline = std::time::Instant::now() + Duration::from_secs(120);
+  let deadline = std::time::Instant::now() + Duration::from_secs(300);
   while terminal.is_none() {
     let view = joiner_handle.routes().get(&route).unwrap();
     if matches!(view.state(), RouteState::Failed(_)) {

@@ -58,6 +58,10 @@ EXPECTED_KINDS = {
     "StopListener", "PutResource", "DeleteResource", "PatchNodeMetadata",
     "IssueCredential", "RotateCredential", "StartRecovery",
     "ApplyReceiptRetention", "SyncRound",
+    # Phase D core-owned controllers, visible as bounded task records:
+    "TraceRetention", "ResourceRemovalRetention", "ReceiptRetention",
+    "TombstoneCollection", "TriggerEvaluation", "RegisterTrigger",
+    "RemoveTrigger",
 }
 
 
