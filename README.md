@@ -45,7 +45,7 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
 
 The default feature set enables the production `redb` storage adapter. `json` (a test-only
 immutable-generation adapter) and `audit` (structured semantic-path events used by the scenario
-fuzz harness) are opt-in. Rust 1.98 or newer is required.
+fuzz harness) are opt-in. Rust 1.99 or newer is required.
 
 ## Quick start
 

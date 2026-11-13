@@ -1547,12 +1547,7 @@ async fn reconcile_core_controller(
       .await
     }
     Some(CoreTaskKind::TriggerEvaluation) => {
-      crate::trigger::evaluate_pass(
-        deps.planes().context.store(),
-        deps.planes().entropy.as_ref(),
-        deps.triggers(),
-      )
-      .await
+      crate::trigger::evaluate_pass(deps.planes().context.store(), deps.triggers()).await
     }
     _ => return Err(Error::internal("controller kind")),
   };

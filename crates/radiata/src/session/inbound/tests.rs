@@ -37,7 +37,7 @@ fn test_context(
       8,
       1 << 20,
       Duration::from_secs(30),
-      Duration::from_secs(5),
+      None,
       Duration::from_secs(15),
     ),
     crate::runtime::RuntimeClient::routing_only(

@@ -15,10 +15,34 @@
 //! predecessor. A fixture-built supervisor without a manager runs the
 //! same bodies inline.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+  Arc,
+  atomic::{AtomicUsize, Ordering},
+};
 
 use super::supervisor::TickState;
 use crate::{Error, Result, TaskKind, api::Entropy, storage::MetadataStore, task::TaskPhase};
+
+/// The trigger evaluation worker's sched cadence: every second. The pass
+/// is cheap (one bounded row scan plus the event-cache refresh), and the
+/// one-second cadence keeps trigger registration and event-trigger
+/// activation responsive while the coarser recovery tick runs the
+/// retention sweeps.
+pub(super) const TRIGGER_EVALUATION_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
+
+/// Runs the trigger evaluation worker: one `sched`-driven task that
+/// refreshes the event-trigger cache and synchronizes the time-trigger
+/// table every second. The controller-task routing is the same
+/// `trigger_evaluation_sweep` body the recovery tick used to run.
+pub(super) async fn run_trigger_evaluation_worker(state: Arc<TickState>) {
+  let shutdown = state.shutdown.clone();
+  let body_state = Arc::clone(&state);
+  super::cadence::run(TRIGGER_EVALUATION_SCHEDULE, shutdown, move || {
+    let state = Arc::clone(&body_state);
+    async move { state.trigger_evaluation_sweep().await }
+  })
+  .await;
+}
 
 /// Runs one controller pass through the task machinery: skip while the
 /// previous pass of the kind still holds a slot (the overlap policy —
@@ -154,12 +178,8 @@ impl TickState {
       run_controller_task(tasks, TaskKind::TRIGGER_EVALUATION).await;
       return;
     }
-    if let Err(error) = crate::trigger::evaluate_pass(
-      self.context().store(),
-      self.entropy().as_ref(),
-      &self.operations.triggers().clone(),
-    )
-    .await
+    if let Err(error) =
+      crate::trigger::evaluate_pass(self.context().store(), self.operations.triggers()).await
     {
       tracing::warn!(kind = ?error.kind(), "trigger evaluation pass failed");
     }

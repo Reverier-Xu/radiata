@@ -14,39 +14,38 @@ use super::{pending::PendingAdmissions, stream::clock_seconds};
 /// Enforces the session liveness policy on host wall time:
 /// a session with no authenticated traffic or owned in-flight work for the
 /// idle deadline closes; a peer that leaves the earliest outstanding
-/// keepalive probe unanswered for the keepalive deadline closes. Wall-clock
-/// rollback or freeze delays both deadlines and a forward jump makes them
-/// immediately due.
+/// keepalive probe unanswered for the keepalive deadline closes. The
+/// keepalive cadence is a bound `sched` schedule: a ping is due at each
+/// scheduled wall-clock instant. Wall-clock rollback or freeze delays
+/// both deadlines and a forward jump makes them immediately due.
 pub(super) async fn liveness_observer(
   last_activity: &Arc<std::sync::atomic::AtomicU64>, pending_acks: &PendingAdmissions,
-  clock: Arc<dyn crate::time::WallClock>, idle_timeout: Duration, keepalive_interval: Duration,
-  keepalive_timeout: Duration, ping_tx: &watch::Sender<()>,
+  clock: Arc<dyn crate::time::WallClock>, idle_timeout: Duration,
+  keepalive_schedule: Option<Arc<sched::BoundSchedule>>, keepalive_timeout: Duration,
+  ping_tx: &watch::Sender<()>,
 ) {
-  if idle_timeout.is_zero() && keepalive_interval.is_zero() {
+  if idle_timeout.is_zero() && keepalive_schedule.is_none() {
     // No liveness policy configured; never resolves.
     std::future::pending::<()>().await;
     return;
   }
-  let tick = std::cmp::min(
-    if idle_timeout.is_zero() {
-      Duration::MAX
-    } else {
-      idle_timeout
-    },
-    if keepalive_interval.is_zero() {
-      Duration::MAX
-    } else {
-      keepalive_interval
-    },
-  )
-  .min(Duration::from_secs(1))
+  let tick = if idle_timeout.is_zero() {
+    Duration::from_secs(1)
+  } else {
+    idle_timeout.min(Duration::from_secs(1))
+  }
   .max(Duration::from_millis(10));
-  let mut last_ping = 0_u64;
+  // The next scheduled ping instant, in UNIX seconds. A schedule that
+  // never fires again leaves this `None`: only the idle deadline can
+  // close the session.
+  let mut next_ping = keepalive_schedule
+    .as_ref()
+    .and_then(|schedule| schedule.next_after(timestamp_at(clock_seconds(clock.as_ref()))))
+    .map(|zoned| timestamp_seconds(zoned.timestamp()));
   // Stamp of the earliest keepalive ping still awaiting a result. It must
-  // stay separate from `last_ping`: the send cadence refreshes `last_ping`
-  // every interval, so keying the deadline on it can never leave a gap of
-  // `keepalive_timeout` between consecutive stamps (the send branch runs
-  // every tick once the interval elapses).
+  // stay separate from the send cadence: keying the deadline on the last
+  // send could never leave a gap of `keepalive_timeout` between
+  // consecutive stamps (the send branch runs at each scheduled instant).
   let mut probe_since: Option<u64> = None;
   loop {
     tokio::time::sleep(tick).await;
@@ -85,16 +84,29 @@ pub(super) async fn liveness_observer(
       // though pings keep being sent.
       return;
     }
-    if !keepalive_interval.is_zero()
-      && now.saturating_sub(last_ping) >= keepalive_interval.as_secs()
-    {
-      last_ping = now;
+    if next_ping.is_some_and(|due| now >= due) {
+      next_ping = keepalive_schedule
+        .as_ref()
+        .and_then(|schedule| schedule.next_after(timestamp_at(now)))
+        .map(|zoned| timestamp_seconds(zoned.timestamp()));
       // Only the first ping of an unanswered run opens a probe; later
       // pings keep the deadline anchored to that run's earliest stamp.
       probe_since.get_or_insert(now);
       let _ = ping_tx.send(());
     }
   }
+}
+
+/// The `sched` instant for one UNIX-second reading; the conversion
+/// saturates at the epoch for pre-epoch readings.
+fn timestamp_at(seconds: u64) -> sched::Timestamp {
+  sched::Timestamp::from_second(i64::try_from(seconds).unwrap_or(i64::MAX))
+    .unwrap_or(sched::Timestamp::UNIX_EPOCH)
+}
+
+/// The UNIX-second reading of a `sched` instant, saturating at the epoch.
+fn timestamp_seconds(at: sched::Timestamp) -> u64 {
+  u64::try_from(at.as_second()).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -114,6 +126,19 @@ mod liveness_tests {
 
   fn no_pending() -> PendingAdmissions {
     PendingAdmissions::new(crate::session::stream::MAX_PENDING_ADMISSIONS)
+  }
+
+  /// A bound keepalive schedule firing every `step` seconds at the
+  /// matching second values of every minute.
+  fn keepalive_every(step: u64) -> Option<Arc<sched::BoundSchedule>> {
+    let values = (0..60)
+      .step_by(step as usize)
+      .map(|second| format!("{second:02}"))
+      .collect::<Vec<_>>()
+      .join(",");
+    let expression = format!("{{*}}-{{*}}-{{*}}T{{*}}:{{*}}:{{{values}}}Z");
+    let schedule = sched::Schedule::parse(&expression).expect("schedule");
+    Some(Arc::new(schedule.bind().expect("bind")))
   }
 
   /// While host wall time advances normally, only sessions without
@@ -136,13 +161,14 @@ mod liveness_tests {
           &pending,
           clock,
           Duration::from_secs(10),
-          Duration::ZERO,
+          None,
           Duration::ZERO,
           &ping_tx,
         )
         .await
       }
     });
+    tokio::task::yield_now().await;
 
     // Before the deadline the observer stays alive.
     clock.set(UNIX_EPOCH + Duration::from_secs(109));
@@ -162,13 +188,14 @@ mod liveness_tests {
           &held,
           clock,
           Duration::from_secs(10),
-          Duration::ZERO,
+          None,
           Duration::ZERO,
           &ping_tx,
         )
         .await
       }
     });
+    tokio::task::yield_now().await;
     clock.set(UNIX_EPOCH + Duration::from_secs(200));
     tokio::time::advance(Duration::from_secs(2)).await;
     assert!(!held_handle.is_finished());
@@ -198,13 +225,14 @@ mod liveness_tests {
           &pending,
           clock,
           Duration::from_secs(10),
-          Duration::ZERO,
+          None,
           Duration::ZERO,
           &ping_tx,
         )
         .await
       }
     });
+    tokio::task::yield_now().await;
 
     // Rollback keeps the session alive (deadline recedes).
     clock.set(UNIX_EPOCH + Duration::from_secs(50));
@@ -236,13 +264,14 @@ mod liveness_tests {
           &pending,
           clock,
           Duration::ZERO,
-          Duration::from_secs(5),
+          keepalive_every(5),
           Duration::from_secs(10),
           &ping_tx,
         )
         .await
       }
     });
+    tokio::task::yield_now().await;
 
     // After the keepalive interval a ping fires.
     clock.set(UNIX_EPOCH + Duration::from_secs(1_005));
@@ -279,13 +308,14 @@ mod liveness_tests {
           &pending,
           clock,
           Duration::ZERO,
-          Duration::from_secs(5),
+          keepalive_every(5),
           Duration::from_secs(10),
           &ping_tx,
         )
         .await
       }
     });
+    tokio::task::yield_now().await;
 
     // One-second steps with no activity at all: several full keepalive
     // intervals and timeouts pass without a single clock jump.
@@ -334,13 +364,14 @@ mod liveness_tests {
           &pending,
           clock,
           Duration::ZERO,
-          Duration::from_secs(5),
+          keepalive_every(5),
           Duration::from_secs(10),
           &ping_tx,
         )
         .await
       }
     });
+    tokio::task::yield_now().await;
 
     // Answer only the first ping, then stay silent forever.
     let mut answered = false;
@@ -387,13 +418,14 @@ mod liveness_tests {
           &pending,
           clock,
           Duration::ZERO,
-          Duration::from_secs(5),
+          keepalive_every(5),
           Duration::from_secs(10),
           &ping_tx,
         )
         .await
       }
     });
+    tokio::task::yield_now().await;
 
     // Every ping is answered by traffic at the current stamp: four full
     // keepalive timeouts pass and the session stays open.
@@ -441,13 +473,14 @@ mod liveness_tests {
           &pending,
           clock,
           Duration::from_secs(10),
-          Duration::ZERO,
+          None,
           Duration::ZERO,
           &ping_tx,
         )
         .await
       }
     });
+    tokio::task::yield_now().await;
 
     // Fresh owned work still holds the session open.
     clock.set(UNIX_EPOCH + Duration::from_secs(109));

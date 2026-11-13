@@ -10,14 +10,6 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 radiata = { path = "../crates/radiata" }
-radiata-cadence = { path = "../crates/cadence" }
-
-[[bin]]
-name = "cadence_parse"
-path = "fuzz_targets/cadence_parse.rs"
-test = false
-doc = false
-bench = false
 
 [[bin]]
 name = "wire_decode"

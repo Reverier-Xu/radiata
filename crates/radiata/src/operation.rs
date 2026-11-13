@@ -287,7 +287,7 @@ impl Event for TaskChanged {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TriggerSourceKind {
-  /// The trigger's cadence pattern came due against the wall clock.
+  /// The trigger's `sched` schedule came due against the wall clock.
   Time,
   /// The trigger's subscription predicate matched a resource change on
   /// the live change stream.

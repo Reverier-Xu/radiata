@@ -71,11 +71,9 @@ use super::{
 };
 use crate::{Error, NodeId, Result};
 
-/// The maintenance cadence: nothing while healthy; while below target,
-/// one deficit-bounded batch of random dials per tick. Purely local
-/// behavior — peers observe dials, never the cadence — so unlike the
-/// peer-visible timing constants this period is not a cluster-wide
-/// contract.
+/// The nominal gap between maintenance ticks, for the bridge-probe
+/// arithmetic and tests that reason about the cadence.
+#[cfg(test)]
 pub(super) const DEGREE_MAINTENANCE_TICK_PERIOD: std::time::Duration =
   std::time::Duration::from_secs(30);
 
@@ -117,35 +115,29 @@ pub(super) struct ProbeLedger {
 /// batch never parks control-plane reads and
 /// packet admission behind it.
 ///
-/// Overlap policy — SKIP, never queue: the worker is a single task that
-/// runs each tick inline in its own loop, and the timer's
-/// `MissedTickBehavior::Skip` drops every deadline that fires while a
-/// tick is still running. A tick recomputes the dial plan from current
+/// The cadence is a `sched` expression (`{0,30}` seconds); the driver
+/// skips a stale tick and a tick whose previous body is still in flight,
+/// never queueing either. A tick recomputes the dial plan from current
 /// state (and its dials are already bounded by the in-flight counter),
 /// so a skipped tick only delays the next deficit batch — queueing
 /// would stack stale plans behind a slow store for no gain. Bounded
 /// accounting: exactly one task for the node's lifetime, aborted and
 /// awaited by the shutdown path.
-pub(super) async fn run_maintenance_worker(state: Arc<TickState>) {
-  let mut shutdown = state.shutdown.clone();
-  let mut timer = tokio::time::interval(DEGREE_MAINTENANCE_TICK_PERIOD);
-  timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-  loop {
-    tokio::select! {
-      changed = shutdown.changed() => {
-        let _ = changed;
-        break;
-      }
-      _ = timer.tick() => {
-        // Best-effort by contract: a failed tick (store outage) waits
-        // for the next one, but never silently — the same attribution
-        // rule as the recovery tick.
-        if let Err(error) = state.maintenance_tick().await {
-          tracing::warn!(kind = ?error.kind(), "degree maintenance tick failed");
-        }
+pub(super) async fn run_maintenance_worker_with_schedule(state: Arc<TickState>, schedule: &str) {
+  let shutdown = state.shutdown.clone();
+  let body_state = Arc::clone(&state);
+  super::cadence::run(schedule, shutdown, move || {
+    let state = Arc::clone(&body_state);
+    async move {
+      // Best-effort by contract: a failed tick (store outage) waits
+      // for the next one, but never silently — the same attribution
+      // rule as the recovery tick.
+      if let Err(error) = state.maintenance_tick().await {
+        tracing::warn!(kind = ?error.kind(), "degree maintenance tick failed");
       }
     }
-  }
+  })
+  .await;
 }
 
 impl TickState {

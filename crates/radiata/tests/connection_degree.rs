@@ -141,7 +141,7 @@ async fn an_unhealthy_node_dials_its_way_back_to_target() {
   // the member pages (the maintenance universe) converge quickly; the
   // 30-second maintenance cadence is the shipped contract under test.
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_millis(500))
+    .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
     .unwrap();
   let mut nodes = Vec::new();
   for seed in 0..5 {
@@ -262,7 +262,7 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
     0,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     NodeConfig::new()
-      .with_anti_entropy_interval(Duration::from_millis(200))
+      .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
       .unwrap(),
   )
   .await;
@@ -273,7 +273,7 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
     1,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     NodeConfig::new()
-      .with_anti_entropy_interval(Duration::from_millis(200))
+      .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
       .unwrap(),
   )
   .await;
@@ -299,7 +299,7 @@ async fn a_member_dial_racing_the_binding_spread_is_typed_retryable() {
     2,
     Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
     NodeConfig::new()
-      .with_anti_entropy_interval(Duration::from_secs(30))
+      .with_anti_entropy_schedule("{*}-{*}-{*}T{0}:{0}:{0}Z")
       .unwrap(),
   )
   .await;

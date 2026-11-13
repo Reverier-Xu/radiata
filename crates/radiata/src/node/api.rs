@@ -532,7 +532,7 @@ impl Tasks {
 }
 
 /// The node's trigger declarations: durable, node-local rows whose
-/// source is a cadence pattern (time triggers) or a
+/// source is a `sched` schedule expression (time triggers) or a
 /// [`crate::SubscriptionPredicate`] (event triggers), and whose target
 /// is a registered caller-owned task reconciler kind — the same rule
 /// the `tasks().submit` admission enforces.
@@ -540,15 +540,17 @@ impl Tasks {
 /// Registration is an admitted task (see the returned [`Task`]): the
 /// durable row write lands through the task machinery's own store
 /// entry, so `wait()` resolves after the declaration is durable. The
-/// evaluation pass runs on the node's own controller cadence: a time
-/// trigger's first fire is the first pattern window at or after
-/// registration, and an event trigger is matched against the live
-/// change stream once the next pass has loaded it (bounded by the
-/// controller tick period).
+/// trigger evaluation worker rebuilds the runtime `sched` table from the
+/// rows every second: a time trigger's first fire is the next schedule
+/// window after the pass that registered it, and an event trigger is
+/// matched against the live change stream once the next pass has loaded
+/// it (bounded by the one-second evaluation cadence). A window missed
+/// while the node was down is skipped, not replayed — the `sched`
+/// stale-tick policy.
 ///
-/// Patterns are expressed in the frame the pattern declares (`Z` or a
-/// fixed offset); a device-local pattern is refused — the core
-/// resolves no local timezone.
+/// Schedule expressions are forwarded to `sched` as written: `Z`, a
+/// fixed offset, an IANA zone, and the device-local frame all resolve
+/// through the library's timezone handling.
 pub struct Triggers {
   runtime: RuntimeClient,
   /// The node-local extension registry: the target reconciler lookup
@@ -566,25 +568,29 @@ impl Triggers {
     }
   }
 
-  /// Registers one time trigger: `pattern` is the cadence pattern text,
+  /// Registers one time trigger: `pattern` is the `sched` schedule text,
   /// `target` the qualified tag of a registered caller-owned task
   /// reconciler. Re-registering an existing name REPLACES its
-  /// declaration (a documented overwrite — the new pattern and target
-  /// take over; callers never need `remove` to change a declaration).
-  /// The row's watermark is monotone across replacements: a
-  /// time-over-time replacement keeps the LATER of the existing and the
-  /// new watermark, so a re-registration never moves the due window
-  /// earlier than progress the name already covered (a replacement
-  /// across source kinds carries no watermark and overwrites
-  /// outright). `wait()` resolves only after the durable write landed;
-  /// a registration that keeps losing commit races fails typed.
+  /// declaration outright (a documented overwrite — the new pattern and
+  /// target take over at the next evaluation pass; callers never need
+  /// `remove` to change a declaration). `wait()` resolves only after the
+  /// durable write landed; a registration that keeps losing commit races
+  /// fails typed.
   pub async fn register_time(
     self, name: &str, pattern: &str, target: crate::QualifiedTag,
   ) -> Result<Task<()>> {
-    let row = crate::trigger::prepare_time_trigger(name, pattern, target.clone())?;
     crate::trigger::validate_trigger_target(&self.extensions, &target)?;
+    // Parsing and zone binding are CPU work plus a possible first
+    // timezone-database read: keep them off the async worker.
+    let name = name.to_owned();
+    let pattern = pattern.to_owned();
+    let prepared = tokio::task::spawn_blocking(move || {
+      crate::trigger::prepare_time_trigger(&name, &pattern, target)
+    })
+    .await
+    .map_err(|_| crate::Error::internal("trigger preparation"))??;
     let client = self.admit_client().await?;
-    crate::runtime::register_trigger(&client, row).await
+    crate::runtime::register_trigger(&client, prepared).await
   }
 
   /// Registers one event trigger: `predicate` filters the live resource

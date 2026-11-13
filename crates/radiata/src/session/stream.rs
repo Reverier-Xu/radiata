@@ -55,7 +55,7 @@ pub(crate) type SessionTable = Arc<Mutex<BTreeMap<NodeId, SessionEntry>>>;
 /// The packet-handling context shared by every session of one node.
 /// The caller-selected session bounds: outbound queue count and
 /// encoded-byte budgets, plus the wall-clock liveness deadlines.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SessionPolicy {
   pub(crate) queue_messages: usize,
   pub(crate) queue_bytes: usize,
@@ -67,7 +67,7 @@ pub(crate) struct SessionPolicy {
   /// the caller-selected `queue_messages` budget (see `admit_open`).
   pub(crate) pending_admissions: usize,
   pub(crate) idle_timeout: Duration,
-  pub(crate) keepalive_interval: Duration,
+  pub(crate) keepalive_schedule: Option<Arc<sched::BoundSchedule>>,
   pub(crate) keepalive_timeout: Duration,
 }
 
@@ -79,14 +79,14 @@ pub(crate) const MAX_PENDING_ADMISSIONS: usize = 256;
 impl SessionPolicy {
   pub(crate) fn new(
     queue_messages: usize, queue_bytes: usize, idle_timeout: Duration,
-    keepalive_interval: Duration, keepalive_timeout: Duration,
+    keepalive_schedule: Option<Arc<sched::BoundSchedule>>, keepalive_timeout: Duration,
   ) -> Self {
     Self {
       queue_messages,
       queue_bytes,
       pending_admissions: MAX_PENDING_ADMISSIONS,
       idle_timeout,
-      keepalive_interval,
+      keepalive_schedule,
       keepalive_timeout,
     }
   }
@@ -98,7 +98,7 @@ impl SessionPolicy {
       config.session_queue_messages(),
       config.session_queue_bytes(),
       config.session_idle_timeout(),
-      config.keepalive_interval(),
+      config.keepalive_schedule(),
       config.keepalive_timeout(),
     )
   }
@@ -361,6 +361,7 @@ impl SessionPacketContext {
     task_drains: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     parser_limits: crate::protocol::CborLimits, authorization: AuthorizationBoundary,
   ) -> Self {
+    let pending_admissions = policy.pending_admissions;
     Self {
       local,
       registry,
@@ -374,9 +375,7 @@ impl SessionPacketContext {
       task_drains,
       live_consumers: ConsumerBudget::new(MAX_LIVE_CONSUMERS),
       parser_limits,
-      local_delivery: Arc::new(super::inbound::LocalDelivery::new(
-        policy.pending_admissions,
-      )),
+      local_delivery: Arc::new(super::inbound::LocalDelivery::new(pending_admissions)),
       authorization,
     }
   }
@@ -724,7 +723,7 @@ pub(crate) async fn run_session(
       &pending_acks,
       context.clock.clone(),
       context.policy.idle_timeout,
-      context.policy.keepalive_interval,
+      context.policy.keepalive_schedule.clone(),
       context.policy.keepalive_timeout,
       &ping_tx,
     ) => {

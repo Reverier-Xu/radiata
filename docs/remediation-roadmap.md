@@ -2,14 +2,14 @@
 
 Status: **COMPLETE (2026-11-08)** — Track 0 (eleven items + quick-fix
 pool), Wave 2 (route_policy completion, subscription predicates,
-redaction-stance sweep, cadence time-lib features), and Phases A-E all
-landed via the merge queue. Final main: `5e3a8d0` — 1235 tests, 0
-failures, clippy clean, ABI baseline current. Remaining out of scope by
-owner decision: the deferred specialist tracks below (docs/
+redaction-stance sweep, schedule-library timezone interop), and Phases
+A-E all landed via the merge queue. Final main: `5e3a8d0` — 1235 tests,
+0 failures, clippy clean, ABI baseline current. Remaining out of scope
+by owner decision: the deferred specialist tracks below (docs/
 extensibility, SLO strata) and the pre-0.1.0 release process.
 Companion documents: `docs/code-quality-audit.md` (findings),
-`docs/work-item-radiata-{cadence,phase-a..e}.md` (per-phase work items
-with embedded decision records).
+`docs/work-item-radiata-{phase-a..e}.md` (per-phase work items with
+embedded decision records).
 
 ## Test-philosophy ruling (owner decision, 2026-11-08)
 
@@ -111,12 +111,12 @@ report-only notes.
   changes). Old sweep scaffolding deleted; cross-family rules become
   policy-behavior tests.
 - **Phase D — triggers and task unification.** Trigger declarations as
-  node-local rows (durable, not replicated); `radiata-cadence` patterns
-  drive time triggers; resource-change predicates (from Track 0 item 9)
-  drive event triggers; core sweeps/checkpoints become core-owned
-  controller tasks (bounded retention of completed controller runs;
-  separate dial budget); operation events generated from the unified
-  change stream.
+  node-local rows (durable, not replicated); `sched` schedule
+  expressions drive time triggers; resource-change predicates (from
+  Track 0 item 9) drive event triggers; core sweeps/checkpoints become
+  core-owned controller tasks (bounded retention of completed
+  controller runs; separate dial budget); operation events generated
+  from the unified change stream.
 - **Phase E — channel selection.** `EndpointSelectionPolicy` seam
   (candidates validated against authoritative descriptors, fail-closed),
   official built-ins via `register_default`: `published-order` (default
@@ -128,8 +128,6 @@ report-only notes.
 
 ## Parallel work items
 
-- `radiata-cadence` syntax crate (`docs/work-item-radiata-cadence.md`) —
-  independent of all phases; dispatch anytime.
 - Deferred specialist tracks (owner-approved deferral): SLO strata
   (isolated redial, bridge-probe, frozen-journal recovery), docs/
   extensibility track (guide blind spots: custom transports, hooks,
@@ -140,7 +138,7 @@ report-only notes.
 ## Sequencing rules
 
 - One large surface at a time: Track 0 → Phase A → B → C → D → E;
-  quick-fix pool and cadence crate fill gaps between phases.
+  the quick-fix pool fills gaps between phases.
 - Every unit must pass the five gates; wire amendments follow the
   pre-release amendment precedent; ABI baseline regenerated at each phase
   boundary; no new core verbs during Phases A/B.

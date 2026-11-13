@@ -391,7 +391,11 @@ pub(crate) async fn spawn_runtime(
   // joins the tracked task set the shutdown path drains and awaits, so
   // the engine's captures (the operation planes, the store) release
   // before the shutdown reply resolves and never race a restart's
-  // storage reopen.
+  // storage reopen. The shutdown receiver is created here, before the
+  // task is spawned: a receiver created after the send starts with the
+  // new value already seen, so a shutdown signaled while the engine is
+  // still waiting for its first poll must not be missed.
+  let trigger_shutdown = operations.planes().shutdown.subscribe();
   let trigger_engine = runtime.spawn(super::trigger_engine::run_trigger_engine(
     operations,
     task_client,
@@ -408,6 +412,7 @@ pub(crate) async fn spawn_runtime(
       dependencies.member_revision.subscribe(),
     ),
     trigger_fires_rx,
+    trigger_shutdown,
   ));
   if let Ok(mut handles) = dependencies.connection_tasks.lock() {
     handles.push(trigger_engine);
@@ -582,19 +587,31 @@ async fn terminate_stale_traces(supervisor: &Supervisor) {
 }
 
 /// Spawns the periodic planes OFF the select loop:
-/// one long-lived recovery-observation worker (recovery tick plus the three
-/// retention sweeps) and one degree-maintenance worker, each owning its own
-/// timer, so slow storage or a slow policy never parks control-plane
-/// reads and packet admission behind a tick. Bounded accounting: exactly
-/// two tasks for the node's lifetime, aborted and
-/// awaited by the shutdown path — never one spawned task per tick.
+/// one long-lived recovery-observation worker (recovery tick plus the
+/// four retention sweeps), one degree-maintenance worker, and one
+/// trigger-evaluation worker, each owning its own `sched` cadence, so
+/// slow storage or a slow policy never parks control-plane reads and
+/// packet admission behind a tick. Bounded accounting: exactly three
+/// tasks for the node's lifetime, aborted and awaited by the shutdown
+/// path — never one spawned task per tick.
 fn spawn_tick_workers(supervisor: &Supervisor) -> Result<Vec<tokio::task::JoinHandle<()>>> {
   let ticks = std::sync::Arc::new(supervisor.tick_state()?);
+  let recovery_schedule = supervisor
+    .dependencies
+    .config
+    .recovery_schedule()
+    .to_owned();
+  let degree_schedule = supervisor.dependencies.config.degree_schedule().to_owned();
+  let recovery_ticks = std::sync::Arc::clone(&ticks);
+  let degree_ticks = std::sync::Arc::clone(&ticks);
   Ok(vec![
-    tokio::spawn(super::recovery::run_recovery_worker(std::sync::Arc::clone(
-      &ticks,
-    ))),
-    tokio::spawn(super::degree::run_maintenance_worker(ticks)),
+    tokio::spawn(async move {
+      super::recovery::run_recovery_worker_with_schedule(recovery_ticks, &recovery_schedule).await;
+    }),
+    tokio::spawn(async move {
+      super::degree::run_maintenance_worker_with_schedule(degree_ticks, &degree_schedule).await;
+    }),
+    tokio::spawn(super::retention::run_trigger_evaluation_worker(ticks)),
   ])
 }
 
@@ -1201,7 +1218,7 @@ impl Supervisor {
       dependencies.entropy.clone(),
       crate::runtime::RuntimeClient::routing_only(packet_tx.clone(), dependencies.routes.clone()),
       Arc::clone(&published_endpoints),
-      dependencies.config.anti_entropy_interval(),
+      dependencies.config.anti_entropy_schedule(),
       shutdown_tx.subscribe(),
       sync_rounds,
       dependencies.events.clone(),

@@ -273,7 +273,7 @@ async fn redb_runtime_shutdown_releases_the_file_lock_with_inflight_trace_persis
 
   fn quiet_config() -> NodeConfig {
     NodeConfig::new()
-      .with_anti_entropy_interval(std::time::Duration::from_secs(3_600))
+      .with_anti_entropy_schedule("{*}-{*}-{*}T{0}:{0}:{0}Z")
       .unwrap()
   }
 

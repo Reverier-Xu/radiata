@@ -36,7 +36,7 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys};
 
-const SYNC_INTERVAL: Duration = Duration::from_millis(50);
+const SYNC_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
 const CURRENT_FEATURE: &str = "testing.example/features/mixed-current";
 const PRIOR_FEATURE: &str = "testing.example/features/mixed-prior";
 const ECHO_PROTOCOL: &str = "example.org/protocols/mixed-echo";
@@ -121,7 +121,7 @@ async fn start_node(seed: u64, current: bool) -> Node {
     )
     .unwrap();
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(SYNC_INTERVAL)
+    .with_anti_entropy_schedule(SYNC_SCHEDULE)
     .unwrap();
   let handle = NodeBuilder::new(factory)
     .keys(keys)

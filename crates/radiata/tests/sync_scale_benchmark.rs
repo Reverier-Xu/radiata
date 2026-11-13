@@ -570,7 +570,7 @@ async fn sync_bindings_over_page_limit_converge_through_two_pages() {
 async fn sync_128_node_star_join_paces_at_the_default_join_pool() {
   let limits = radiata::MergeAdmissionLimits::for_cluster(128).unwrap();
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_secs(1))
+    .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
     .unwrap()
     .with_merge_admission(limits);
   run_128_node_star(config, Duration::from_secs(900)).await;
@@ -589,7 +589,7 @@ async fn sync_128_node_star_bootstrap_with_raised_join_pool() {
     .with_join_pool(256, Duration::from_secs(60), 2_048, Duration::from_secs(60))
     .unwrap();
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_secs(1))
+    .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
     .unwrap()
     .with_merge_admission(limits);
   run_128_node_star(config, Duration::from_secs(300)).await;

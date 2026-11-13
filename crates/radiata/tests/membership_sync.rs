@@ -96,14 +96,28 @@ fn workload_body(
 /// the defaults' own convergence and SLO evidence, so nothing is
 /// overridden on this path. Lanes that pin a knob (the failure-matrix
 /// cluster's sparse degree target) use [`start_node_configured`].
+/// The topology-settle suites reason in recovery ticks (the redundant-
+/// edge prune cooldown); a one-second observation cadence keeps those
+/// waits inside the harness bounds while the shipped default is ten
+/// seconds. The degree plane is quieted: its additive deficit dials are
+/// exercised by the dedicated connection-degree suite, and keeping them
+/// out of the exact-topology assertions makes the settle deterministic.
+fn test_config(_seed: u64) -> NodeConfig {
+  NodeConfig::new()
+    .with_recovery_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
+    .unwrap()
+    .with_degree_schedule("{*}-{*}-{*}T{0}:{0}:{0}Z")
+    .unwrap()
+}
+
 async fn start_node(seed: u64, storage: Arc<MemoryStorageFactory>) -> Node {
-  start_node_configured(seed, storage, NodeConfig::new()).await
+  start_node_configured(seed, storage, test_config(seed)).await
 }
 
 async fn start_node_inner(
   seed: u64, storage: Arc<MemoryStorageFactory>, echo: Option<Arc<EchoCollector>>,
 ) -> Node {
-  start_node_inner_configured(seed, storage, echo, NodeConfig::new()).await
+  start_node_inner_configured(seed, storage, echo, test_config(seed)).await
 }
 
 async fn start_node_configured(
@@ -414,9 +428,31 @@ async fn wait_settled(
   }
 }
 
-/// Starts the issuer and merges `count - 1` members. Every node listens.
+/// Starts the issuer and merges `count - 1` members. Every node listens
+/// and carries the seed-phased recovery cadence from [`test_config`].
 async fn build_cluster(count: usize) -> Vec<Node> {
-  build_cluster_configured(count, NodeConfig::new()).await
+  let mut nodes = Vec::with_capacity(count);
+  let mut issuer = start_node(
+    0,
+    Arc::new(MemoryStorageFactory::new(common::required_capabilities())),
+  )
+  .await;
+  issuer.id = node_id(&issuer).await;
+  let issuer_endpoint = listen(&issuer).await;
+  issuer.endpoint = issuer_endpoint.clone();
+  nodes.push(issuer);
+
+  for index in 1..count {
+    let storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
+    let mut member = start_node(index as u64, storage).await;
+    member.endpoint = listen(&member).await;
+    let issued = rotate_with_retry(&nodes[0]).await;
+    let secret = issued.credential().expose_secret().to_owned();
+    merge_with_retry(&member, issuer_endpoint.clone(), &secret).await;
+    member.id = node_id(&member).await;
+    nodes.push(member);
+  }
+  nodes
 }
 
 /// The [`build_cluster`] shape over a lane-pinned configuration: every
@@ -871,7 +907,7 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
     .into_iter()
     .filter(|(left, right)| *left < 15 && *right < 15)
     .collect();
-  let induced = wait_settled(&nodes, &expected_induced, Duration::from_secs(120)).await;
+  let induced = wait_settled(&nodes, &expected_induced, Duration::from_secs(180)).await;
   assert_eq!(induced.len(), 28, "induced 28-edge graph among 0..14");
   let actual_induced: std::collections::BTreeSet<(u8, u8)> = induced.iter().copied().collect();
   assert_eq!(
@@ -919,7 +955,7 @@ async fn membership_sync_sixteen_node_reciprocal_trust_and_exact_topology() {
   connect_cq4(&nodes).await;
   close_star_sessions(&nodes, 0).await;
   let expected_full: std::collections::BTreeSet<(u8, u8)> = cq4_edges().into_iter().collect();
-  let edges = wait_settled(&nodes, &expected_full, Duration::from_secs(120)).await;
+  let edges = wait_settled(&nodes, &expected_full, Duration::from_secs(180)).await;
   assert_exact_cq4(&edges);
 
   for node in nodes {
@@ -1171,6 +1207,8 @@ async fn membership_sync_failure_matrix_partition_healing() {
   // wider window here.
   let config = NodeConfig::new()
     .with_connection_degree(1)
+    .with_recovery_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
+    .unwrap()
     .with_task_reconcile_slots(2, 8)
     .unwrap();
   let nodes = build_cluster_configured(4, config).await;

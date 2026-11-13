@@ -17,7 +17,8 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys};
 
-const SYNC_INTERVAL: Duration = Duration::from_millis(50);
+const SYNC_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
+const SYNC_TICK: Duration = Duration::from_secs(1);
 
 struct Node {
   handle: NodeHandle,
@@ -29,7 +30,7 @@ async fn start_node(seed: u64) -> Node {
   let storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(800_000 + seed * 1_000));
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(SYNC_INTERVAL)
+    .with_anti_entropy_schedule(SYNC_SCHEDULE)
     .unwrap();
   let handle = NodeBuilder::new(storage)
     .keys(keys)
@@ -266,7 +267,7 @@ async fn revoke_closes_sessions_denies_reconnect_and_preserves_metadata() {
 
   // The session stays down: after several maintenance intervals the
   // member is still not connected.
-  tokio::time::sleep(SYNC_INTERVAL * 6).await;
+  tokio::time::sleep(SYNC_TICK * 6).await;
   let members = issuer
     .handle
     .members()

@@ -98,11 +98,11 @@ async fn main() {
   if std::env::var_os("LEGACY_TIMING").is_some() {
     use std::time::Duration;
     node_config = node_config
-      .with_anti_entropy_interval(Duration::from_millis(250))
-      .expect("nonzero interval")
+      .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
+      .expect("valid anti-entropy schedule")
       .with_session_liveness(
         Duration::from_secs(30),
-        Duration::from_secs(10),
+        "{*}-{*}-{*}T{*}:{*}:{0,10,20,30,40,50}Z",
         Duration::from_secs(30),
       )
       .expect("valid liveness")

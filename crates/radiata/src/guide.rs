@@ -987,7 +987,7 @@
 //! - **Background load** is the reconciliation plane ([chapter
 //!   3](#3-how-state-converges-the-reconciliation-contract)) riding the sync
 //!   tick (one second by default,
-//!   [`with_anti_entropy_interval`](crate::NodeConfig::with_anti_entropy_interval)):
+//!   [`with_anti_entropy_schedule`](crate::NodeConfig::with_anti_entropy_schedule)):
 //!   the tick's store scan is incremental — only lanes whose key spaces were
 //!   written since the last pass rescan, so a quiet node scans nothing — and a
 //!   change costs one coalesced summary hint per live session plus the changed

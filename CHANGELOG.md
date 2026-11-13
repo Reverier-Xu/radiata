@@ -55,17 +55,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reference backend (process-lifetime durability only), which doubles
   as the contract suite's oracle.
 - Trigger declarations as durable node-local rows:
-  `NodeHandle::triggers()` registers a time trigger (a cadence pattern
-  in a declared `Z`/fixed-offset frame — the core resolves no local
-  timezone) or an event trigger (a `SubscriptionPredicate` over the
-  live resource-change stream, evaluated with the same emit-side
-  predicate evaluation the watch subscriptions use), each targeting a
-  registered caller-owned task reconciler kind. Rows live in a
-  node-local metadata family no reconcile lane owns, so declarations
-  never replicate; time triggers keep a durable per-row watermark whose
-  missed windows coalesce to one run; event-trigger fires skip while
-  the target run is in flight. Each admitted run emits the additive
-  `TriggerFired` event.
+  `NodeHandle::triggers()` registers a time trigger (a `sched` schedule
+  expression in a declared `Z`/fixed-offset/IANA-zone frame — the core
+  refuses the device-local frame) or an event trigger (a
+  `SubscriptionPredicate` over the live resource-change stream,
+  evaluated with the same emit-side predicate evaluation the watch
+  subscriptions use), each targeting a registered caller-owned task
+  reconciler kind. Rows live in a node-local metadata family no
+  reconcile lane owns, so declarations never replicate. The runtime
+  `sched` task table is rebuilt from the rows on every incarnation; a
+  missed tick is skipped, never replayed, and event-trigger fires skip
+  while the target run is in flight. Each admitted run emits the
+  additive `TriggerFired` event.
 - Core sweeps, the checkpoint-gated tombstone collection, and the
   trigger evaluation pass run as core-owned controller tasks on the
   existing `CustomTaskSpec`/`TaskReconciler` machinery: their own
@@ -82,18 +83,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- `radiata-cadence`'s public interface was reshaped around readings
-  instead of hand-built field tuples: `Pattern` is now `Ticker` and the
-  firing rule is `Ticker::fires_at` (replacing the `r#match`/`matches`
-  pair, whose names collided with the reserved keyword), while
-  `FieldValues` is gone — the new `Cadence` trait reads caller-side
-  moments (`str`, `SystemTime` via `std-time`, `chrono::DateTime` via
-  `chrono`, `jiff::Timestamp`/`Zoned`/`civil::DateTime` via `jiff`) as
-  civil seconds in the ticker's declared frame, and `Civil` is the
-  frame-free civil second that `next_fire` returns (produced by the
-  crate, never hand-constructed). The trigger engine, the cadence fuzz
-  target, and the cadence work-item documents follow the new names;
-  the grammar, canonical forms, and firing semantics are unchanged.
+- Time-trigger scheduling moved to the external `sched` crate: the
+  workspace's `radiata-cadence` grammar crate is removed, and time
+  triggers are parsed, zone-bound, and driven by `sched`'s
+  runtime-agnostic `Trigger` table. Every expression is forwarded to
+  `sched` as written (`Z`, a fixed offset, an IANA zone, or the
+  device-local frame). Trigger rows are declaration-only (record
+  version 2): the durable per-row watermark and the coalesce-to-one
+  catchup are gone, so a window missed while the node was down is
+  skipped, not replayed. The workspace MSRV rises to 1.99.0 (`sched`'s
+  floor).
+- The runtime's own periodic workers now ride `sched` expressions too:
+  the recovery/sweep worker (`{0,10,20,30,40,50}` seconds — a ten-second
+  cadence), the degree-maintenance worker (`{0,30}` seconds), and the
+  anti-entropy sync driver (the configured expression, every second by
+  default). Trigger evaluation moved to its own one-second worker, so
+  the coarser recovery tick does not delay trigger registration or the
+  event-trigger cache. `NodeConfig::with_anti_entropy_schedule`,
+  `with_recovery_schedule`, and `with_degree_schedule` take `sched`
+  expressions directly, and `with_session_liveness` takes the keepalive
+  cadence as an expression; the session liveness observer pings at each
+  scheduled wall-clock instant. `sched` is upgraded to 0.1.1 (canonical
+  `Display`, registration-time first occurrence).
 - The Phase C deferral of per-row cleanup-policy labels on the
   reconcile wire is final for 0.1.0: the Phase D consumer turned out
   node-local — trigger rows live in a family no reconcile lane owns,
@@ -150,5 +161,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `NextHopView::remaining_hops` exposes the hop budget left to a policy.
 - Wire: the routed open frame's route element carries the remaining path
   (a pre-release format amendment); legacy direct frames are unchanged.
+
+### Removed
+
+- The `radiata-cadence` workspace crate, its `cadence_parse` fuzz
+  target, and its work-item document. Time-trigger scheduling now uses
+  the external `sched` crate.
 
 [Unreleased]: https://github.com/Reverier-Xu/radiata/commits/main

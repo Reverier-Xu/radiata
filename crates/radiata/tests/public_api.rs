@@ -38,7 +38,7 @@ use radiata::{
   extension::{Entropy, KeyProvider, Storage, StorageFactory, StoreScan, StoreSnapshot},
 };
 
-const SYNC_INTERVAL: Duration = Duration::from_millis(50);
+const SYNC_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
 
 // ---------------------------------------------------------------- values
 
@@ -583,7 +583,7 @@ fn stream_surface_is_externally_constructible() {
 #[test]
 fn config_and_registry_are_externally_constructible() {
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_millis(250))
+    .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
     .unwrap()
     .with_recovery_policy(
       RecoveryConfig::new(8, Duration::from_secs(1), Duration::from_secs(300)).unwrap(),
@@ -1363,7 +1363,7 @@ fn init_tracing() {
 
 async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<dyn KeyProvider>) -> Node {
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(SYNC_INTERVAL)
+    .with_anti_entropy_schedule(SYNC_SCHEDULE)
     .unwrap();
   // One shared echo protocol registration: the external consumer owns the
   // consumer and the protocol definition, owned by the core session

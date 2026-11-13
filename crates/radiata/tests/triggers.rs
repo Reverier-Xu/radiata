@@ -88,17 +88,16 @@ async fn start_node(extensions: ExtensionRegistry) -> NodeHandle {
 }
 
 /// The every-second UTC pattern: every wall-clock second matches, so
-/// each evaluation pass finds the watermark due (the windows between
-/// passes coalesce to one run — the count grows per pass, never per
-/// second).
+/// the `sched` table fires once per second (a tick that is already stale
+/// at dispatch is skipped, never replayed).
 const EVERY_SECOND: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
 
-/// A time trigger fires per its pattern through the runtime's own
-/// controller cadence (no manual pass), each fire is observable through
-/// the additive `TriggerFired` event, and the missed windows between
-/// evaluation passes coalesce to one run per pass.
+/// A time trigger fires per its `sched` schedule through the runtime's
+/// own dispatch engine (no manual pass), each fire is observable through
+/// the additive `TriggerFired` event, and a stale tick is skipped rather
+/// than replayed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_time_trigger_fires_per_its_pattern_and_coalesces_missed_windows() {
+async fn a_time_trigger_fires_per_its_schedule_and_skips_stale_ticks() {
   let runs = Arc::new(AtomicUsize::new(0));
   let handle = start_node(extensions_with(ProbeReconciler::counting(Arc::clone(
     &runs,
@@ -115,14 +114,14 @@ async fn a_time_trigger_fires_per_its_pattern_and_coalesces_missed_windows() {
     .await
     .expect("the durable registration lands");
 
-  // Two or more controller passes elapse; every pass fires the due
-  // trigger exactly once, so the run count tracks passes (about one per
-  // two-second tick), never wall-clock seconds.
+  // The schedule fires once per second through the sched table; wait
+  // for at least two runs, then hold for a beat and check the count
+  // tracks the elapsed wall clock rather than exploding.
   let started = Instant::now();
   while runs.load(Ordering::SeqCst) < 2 {
     assert!(
       started.elapsed() < Duration::from_secs(30),
-      "the time trigger never fired through the controller cadence"
+      "the time trigger never fired through the sched table"
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
   }
@@ -131,7 +130,7 @@ async fn a_time_trigger_fires_per_its_pattern_and_coalesces_missed_windows() {
   let fired_count = runs.load(Ordering::SeqCst);
   assert!(
     fired_count <= elapsed.as_secs() as usize + 2,
-    "missed windows must coalesce to one run per pass: {fired_count} runs in {elapsed:?}"
+    "the schedule fires per window, never in a burst: {fired_count} runs in {elapsed:?}"
   );
 
   // The fire is observable as the additive event kind, with the time

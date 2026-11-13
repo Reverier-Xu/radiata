@@ -167,7 +167,8 @@ impl NodeHandle {
   }
 
   /// The node's trigger declarations: durable node-local rows driven by
-  /// cadence patterns or subscription predicates (see [`Triggers`]).
+  /// `sched` schedule expressions or subscription predicates (see
+  /// [`Triggers`]).
   pub fn triggers(&self) -> Triggers {
     Triggers::new(&self.runtime, &self.extensions)
   }

@@ -19,7 +19,8 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys};
 
-const SYNC_INTERVAL: Duration = Duration::from_millis(50);
+const SYNC_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
+const SYNC_TICK: Duration = Duration::from_secs(1);
 
 struct Node {
   handle: NodeHandle,
@@ -29,7 +30,7 @@ struct Node {
 async fn start_node(seed: u64, storage: Arc<MemoryStorageFactory>) -> Node {
   let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(700_000 + seed * 1_000));
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(SYNC_INTERVAL)
+    .with_anti_entropy_schedule(SYNC_SCHEDULE)
     .unwrap();
   let handle = NodeBuilder::new(storage)
     .keys(keys)
@@ -341,7 +342,7 @@ async fn maintenance_preserves_labels_and_emits_only_the_remote_commit() {
     }
     _ => panic!("expected the peer-converged resource event"),
   }
-  tokio::time::sleep(SYNC_INTERVAL * 6).await;
+  tokio::time::sleep(SYNC_TICK * 6).await;
   assert!(matches!(
     member_events.try_recv().unwrap(),
     EventReceive::Empty | EventReceive::Closed
@@ -841,7 +842,7 @@ async fn concurrent_expected_puts_commit_exactly_one() {
   // A quiet anti-entropy cadence: no background maintenance write may
   // interleave with the two racing commits.
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_secs(3_600))
+    .with_anti_entropy_schedule("{*}-{*}-{*}T{0}:{0}:{0}Z")
     .unwrap();
   let handle = NodeBuilder::new(Arc::new(MemoryStorageFactory::new(
     common::required_capabilities(),

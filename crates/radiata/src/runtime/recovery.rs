@@ -13,10 +13,6 @@ use super::{
 };
 use crate::{Endpoint, Error, NodeId, Result};
 
-/// The recovery controller's observation period (unnamed literal kept
-/// every other period out of `NodeConfig`).
-pub(super) const RECOVERY_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Runs the recovery-observation worker: one long-lived task that owns
 /// the recovery cadence and, per tick, runs the recovery tick followed
 /// by the retention sweeps — the exact work the supervisor's
@@ -24,40 +20,39 @@ pub(super) const RECOVERY_TICK_PERIOD: std::time::Duration = std::time::Duration
 /// storage never parks control-plane reads and packet admission
 /// behind a tick.
 ///
-/// Overlap policy — SKIP, never queue: the worker is a single task and
-/// runs each tick inline in its own loop, and the timer's
-/// `MissedTickBehavior::Skip` drops every deadline that fires while a
-/// tick is still running. A tick is an observation of current state
-/// (session table, member table, retention deadlines), not an event to
-/// process, so a skipped tick loses nothing the next one would not
-/// recompute — while queueing or merging would only stack stale
-/// observations behind a slow store. Bounded accounting (audit item 4's
-/// lesson): exactly one task for the node's lifetime, aborted and
-/// awaited by the shutdown path — never one spawned task per tick.
-pub(super) async fn run_recovery_worker(state: Arc<TickState>) {
-  let mut shutdown = state.shutdown.clone();
-  let mut timer = tokio::time::interval(RECOVERY_TICK_PERIOD);
-  timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-  loop {
-    tokio::select! {
-      changed = shutdown.changed() => {
-        let _ = changed;
-        break;
-      }
-      _ = timer.tick() => {
-        // A failed tick (store outage, tombstone scan failure) must stay
-        // visible: silent drops would starve recovery diagnostics.
-        if let Err(error) = state.recovery_tick().await {
-          tracing::warn!(kind = ?error.kind(), "recovery tick failed");
-        }
-        state.trace_retention_sweep().await;
-        state.resource_removal_sweep().await;
-        state.receipt_retention_sweep().await;
-        state.collected_tombstone_sweep().await;
-        state.trigger_evaluation_sweep().await;
-      }
-    }
+/// The cadence is a `sched` expression (`{0,10,20,30,40,50}` seconds);
+/// the driver skips a stale tick and a tick whose previous body is
+/// still in flight, never queueing either. A tick is an observation of
+/// current state (session table, member table, retention deadlines), not
+/// an event to process, so a skipped tick loses nothing the next one
+/// would not recompute — while queueing or merging would only stack
+/// stale observations behind a slow store. Bounded accounting (audit
+/// item 4's lesson): exactly one task for the node's lifetime, aborted
+/// and awaited by the shutdown path — never one spawned task per tick.
+pub(super) async fn run_recovery_worker_with_schedule(state: Arc<TickState>, schedule: &str) {
+  let shutdown = state.shutdown.clone();
+  let body_state = Arc::clone(&state);
+  super::cadence::run(schedule, shutdown, move || {
+    let state = Arc::clone(&body_state);
+    async move { recovery_pass(&state).await }
+  })
+  .await;
+}
+
+/// One recovery pass: the recovery tick plus the retention sweeps. The
+/// trigger evaluation pass moved to its own one-second cadence (see
+/// `retention::run_trigger_evaluation_worker`), so a coarser recovery
+/// cadence does not delay trigger registration or the event cache.
+async fn recovery_pass(state: &TickState) {
+  // A failed tick (store outage, tombstone scan failure) must stay
+  // visible: silent drops would starve recovery diagnostics.
+  if let Err(error) = state.recovery_tick().await {
+    tracing::warn!(kind = ?error.kind(), "recovery tick failed");
   }
+  state.trace_retention_sweep().await;
+  state.resource_removal_sweep().await;
+  state.receipt_retention_sweep().await;
+  state.collected_tombstone_sweep().await;
 }
 
 /// The cleaned and left node sets behind the recovery exclusions and the
@@ -644,7 +639,7 @@ mod tests {
 
   use tokio::sync::watch;
 
-  use super::{DialPermit, RECOVERY_TICK_PERIOD, run_recovery_worker};
+  use super::{DialPermit, recovery_pass, run_recovery_worker_with_schedule};
   use crate::{
     BoxFuture, Endpoint, NodeConfig,
     membership::recovery::{RecoveryController, RecoveryPolicy},
@@ -806,12 +801,12 @@ mod tests {
 
   /// Boundedness of the derived recovery tick:
   /// while one tick's storage IO never resolves, NO further tick work
-  /// piles up behind it — after two more tick deadlines fire, exactly
+  /// piles up behind it — after two more schedule deadlines fire, exactly
   /// one gated snapshot has been entered. A spawn-per-tick or queued
   /// design would start one tick per deadline and grow the
-  /// counter; the single worker with `MissedTickBehavior::Skip` holds
-  /// the in-flight work at one tick.
-  #[tokio::test(start_paused = true)]
+  /// counter; the single worker (and sched's in-flight skip) holds the
+  /// work at one tick.
+  #[tokio::test]
   async fn recovery_worker_holds_one_tick_in_flight_under_a_stalled_store() {
     let reference = Arc::new(crate::storage::contract::ReferenceFactory::new(
       crate::storage::contract::required_capabilities(),
@@ -825,18 +820,12 @@ mod tests {
       inner: reference as Arc<dyn StorageFactory>,
       gate: Arc::clone(&gate),
     });
-    // A slow anti-entropy cadence keeps the sync driver (spawned by
-    // `Supervisor::new` with an immediate first tick) out of the armed
-    // window: its next cadence root is far past every advance below.
+    // An hourly anti-entropy cadence keeps the sync driver out of the
+    // armed window: its next round is far past every wait below.
     let config = NodeConfig::new()
-      .with_anti_entropy_interval(std::time::Duration::from_secs(3_600))
+      .with_anti_entropy_schedule("{*}-{*}-{*}T{0}:{0}:{0}Z")
       .unwrap();
     let (supervisor, _entropy, _sessions) = supervisor_over(factory, config).await;
-    // Let the driver's immediate first tick drain before arming, so the
-    // gate observes tick work only.
-    for _ in 0..16 {
-      tokio::task::yield_now().await;
-    }
     assert_eq!(
       gate.entered.load(std::sync::atomic::Ordering::Relaxed),
       0,
@@ -846,20 +835,25 @@ mod tests {
     let ticks = supervisor.tick_state().unwrap();
     let mut entries = gate.entries.subscribe();
     gate.hold.store(true, std::sync::atomic::Ordering::Relaxed);
-    let worker = tokio::spawn(run_recovery_worker(Arc::new(ticks)));
+    // A one-second cadence exercises the overlap policy without waiting
+    // for the production ten-second schedule.
+    let worker = tokio::spawn(run_recovery_worker_with_schedule(
+      Arc::new(ticks),
+      "{*}-{*}-{*}T{*}:{*}:{*}Z",
+    ));
 
-    // The worker's first interval tick fires immediately: await its
-    // entry into the gated snapshot (a watch value, so no wakeup is
-    // lost). The box is a hang guard, not a latency claim.
+    // The first scheduled tick reaches the gated snapshot (a watch
+    // value, so no wakeup is lost). The box is a hang guard, not a
+    // latency claim.
     tokio::time::timeout(std::time::Duration::from_secs(30), entries.changed())
       .await
       .expect("the first tick must reach the store")
       .unwrap();
     assert_eq!(*entries.borrow_and_update(), 1);
 
-    // Two more tick deadlines fire while the first tick is still
+    // Two more schedule deadlines pass while the first tick is still
     // parked on the store: no second tick may start.
-    tokio::time::advance(RECOVERY_TICK_PERIOD * 2 + std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
     assert_eq!(
       gate.entered.load(std::sync::atomic::Ordering::Relaxed),
       1,
@@ -872,8 +866,8 @@ mod tests {
   /// The identity-tombstone GC rides the recovery worker's retention
   /// sweeps, gated on the cleanup checkpoint: with no checkpoint the pass
   /// is a no-op (the collected tombstone stays), and once a checkpoint
-  /// makes the tombstone eligible the worker's tick collects it.
-  #[tokio::test(start_paused = true)]
+  /// makes the tombstone eligible the pass collects it.
+  #[tokio::test]
   async fn recovery_worker_collects_identity_tombstones_only_under_a_checkpoint() {
     use crate::identity::{
       cleanup::{
@@ -911,25 +905,16 @@ mod tests {
       "without a checkpoint the sweep must not collect"
     );
 
-    // A checkpoint makes the tombstone eligible: the worker's tick
+    // A checkpoint makes the tombstone eligible: the recovery pass
     // collects it.
     issue_checkpoint_ctx(&context, entropy.as_ref())
       .await
       .unwrap();
-    let worker = tokio::spawn(run_recovery_worker(Arc::new(ticks)));
-    let mut collected = false;
-    for _ in 0..400 {
-      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-      if !is_cleaned_ctx(store, &subject).await.unwrap() {
-        collected = true;
-        break;
-      }
-    }
+    recovery_pass(&ticks).await;
     assert!(
-      collected,
-      "the recovery worker's tick must collect an eligible tombstone"
+      !is_cleaned_ctx(store, &subject).await.unwrap(),
+      "the recovery pass must collect an eligible tombstone"
     );
-    worker.abort();
   }
 
   /// A silent peer that reports BOTH acceptance and close: it accepts
@@ -1453,6 +1438,8 @@ mod tests {
     ));
     let config = NodeConfig::new()
       .with_dial_deadline(std::time::Duration::from_secs(5))
+      .unwrap()
+      .with_recovery_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
       .unwrap()
       .with_endpoint_policy(crate::OutcomeWeightedPolicy::tag().unwrap())
       .with_recovery_policy(

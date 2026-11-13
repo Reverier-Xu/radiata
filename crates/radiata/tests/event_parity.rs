@@ -185,7 +185,7 @@ impl radiata::extension::KeyProvider for LeaveCapableKeys {
 /// Long enough that no background anti-entropy tick fires during the
 /// script: convergence is driven by the manual `sync()` round alone, so
 /// the event streams stay deterministic.
-const QUIET_INTERVAL: Duration = Duration::from_secs(600);
+const QUIET_SCHEDULE: &str = "{*}-{*}-{*}T{0}:{0}:{0}Z";
 const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(30);
 
 async fn start(seed: u64) -> NodeHandle {
@@ -196,7 +196,7 @@ async fn start(seed: u64) -> NodeHandle {
     .keys(keys)
     .config(
       NodeConfig::new()
-        .with_anti_entropy_interval(QUIET_INTERVAL)
+        .with_anti_entropy_schedule(QUIET_SCHEDULE)
         .unwrap(),
     )
     .start()
@@ -214,7 +214,7 @@ async fn start_leaver(seed: u64) -> NodeHandle {
     .keys(keys)
     .config(
       NodeConfig::new()
-        .with_anti_entropy_interval(QUIET_INTERVAL)
+        .with_anti_entropy_schedule(QUIET_SCHEDULE)
         .unwrap(),
     )
     .start()

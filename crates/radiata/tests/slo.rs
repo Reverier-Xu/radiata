@@ -12,7 +12,7 @@
 //! library already documents, never from a number tuned to one machine:
 //!
 //! - the anti-entropy tick ([`SYNC_TICK`], set through
-//!   `NodeConfig::with_anti_entropy_interval`) is the reconciliation plane's
+//!   `NodeConfig::with_anti_entropy_schedule`) is the reconciliation plane's
 //!   local-write debounce and the unit of the quiet detection cadence;
 //! - the quiet detection cadence ([`DETECTION_CADENCE_TICKS`], 32 ticks in
 //!   `src/sync_common.rs`) is the documented loss-recovery backstop that heals
@@ -36,7 +36,7 @@
 //! cluster, so it never learns the tombstone (by design).
 //!
 //! **Bound**: [`CONVERGENCE_BOUND`] = `DETECTION_CADENCE_TICKS ×
-//! SYNC_TICK + SEND_ACK_WAIT` (8.2 s at this harness's 100 ms tick).
+//! SYNC_TICK + SEND_ACK_WAIT` (37 s at this harness's 1 s tick).
 //!
 //! **Why the bound is defensible**: the revocation tombstone is one row
 //! in the revocation lane. Its commit notes the store namespace, so the
@@ -97,10 +97,10 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys};
 
-/// The anti-entropy tick every node in this harness runs. One tenth of
-/// the shipped default: the SLO bounds scale with the tick, so a faster
-/// tick keeps a full cadence period inside a bounded harness run.
-const SYNC_TICK: Duration = Duration::from_millis(100);
+/// The anti-entropy cadence every node in this harness runs: every
+/// second. The shipped default; the SLO bounds scale with the tick.
+const SYNC_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
+const SYNC_TICK: Duration = Duration::from_secs(1);
 
 /// The reconciliation plane's quiet detection cadence, in sync ticks
 /// (`DETECTION_CADENCE_TICKS` in `src/sync_common.rs`). Re-declared here
@@ -194,7 +194,7 @@ async fn start_node(seed: u64) -> Node {
   let storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(900_000 + seed * 1_000));
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(SYNC_TICK)
+    .with_anti_entropy_schedule(SYNC_SCHEDULE)
     .unwrap()
     .with_dial_deadline(DIAL_DEADLINE)
     .unwrap()

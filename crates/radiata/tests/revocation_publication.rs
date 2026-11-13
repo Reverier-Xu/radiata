@@ -28,7 +28,7 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys};
 
-const SYNC_INTERVAL: Duration = Duration::from_millis(50);
+const SYNC_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
 
 /// A `KeyProvider` wrapper whose next `sign` after `arm()` parks until
 /// `open()`: the deterministic "handshake completing while a revocation
@@ -145,7 +145,7 @@ struct Node {
 async fn start_node(keys: Arc<dyn KeyProvider>) -> Node {
   let storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(SYNC_INTERVAL)
+    .with_anti_entropy_schedule(SYNC_SCHEDULE)
     .unwrap();
   let handle = NodeBuilder::new(storage)
     .keys(keys)

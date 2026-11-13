@@ -4,39 +4,39 @@
 //! A trigger row is a node policy, not cluster state: it lives in the
 //! dedicated node-local trigger family (the reconcile plane owns no lane
 //! for its namespace, so the rows are never carried between nodes) and
-//! survives restarts. One row carries its source — a cadence
-//! [`radiata_cadence::Ticker`] text for a time trigger or a
-//! [`SubscriptionPredicate`] for an event trigger — and its target: the
-//! qualified tag of a registered caller-owned task reconciler. The row
-//! is spec-only: the trigger *policy* (catchup = coalesce-to-one,
-//! overlap = skip) is the engine's declared behavior, not per-row state,
-//! mirroring the cadence crate's spec/policy separation.
+//! survives restarts. One row carries its source — a `sched` schedule
+//! expression for a time trigger or a [`SubscriptionPredicate`] for an
+//! event trigger — and its target: the qualified tag of a registered
+//! caller-owned task reconciler. The row is spec-only: the trigger
+//! *policy* (overlap = skip, missed tick = skip, never replay) is the
+//! `sched` engine's declared behavior, not per-row state.
 //!
-//! Time triggers keep one durable watermark per row
-//! (`next_fire_seconds`): the evaluation pass fires every overdue row
-//! once — missed windows coalesce to one run — and advances the
-//! watermark past the current second, so a restart or a slow node never
-//! replays a window and never skips a due one. Event triggers are
-//! evaluated push-driven against the live change stream, reusing the
-//! W2-2 emit-side predicate evaluation (one matching path).
+//! The rows are the durable declarations; the `sched` task table is the
+//! runtime state, rebuilt from the rows on every incarnation. A time
+//! trigger's next window is computed from the current clock, so a node
+//! that was down across a window does not replay it — the same
+//! stale-tick policy the `sched` engine applies to a late dispatch. The
+//! evaluation pass keeps the table in step with the rows (registration,
+//! replacement, removal) and refreshes the event-trigger cache. Event
+//! triggers are evaluated push-driven against the live change stream,
+//! reusing the W2-2 emit-side predicate evaluation (one matching path).
 //!
-//! Patterns are expressed in the frame the pattern itself declares
-//! (`Z` or a fixed offset): the core resolves no local timezone, so a
-//! device-local pattern is refused at registration, fail-closed.
+//! Schedules name their frame explicitly (`Z`, a fixed offset, or an
+//! IANA zone): the core refuses a device-local pattern at registration,
+//! fail-closed, so fire times never depend on the host's timezone.
 
 use std::{
   collections::BTreeMap,
   sync::{Arc, Mutex},
-  time::{Duration, UNIX_EPOCH},
 };
 
 use minicbor::{Decode, Encode};
-use radiata_cadence::{Cadence, Civil, Offset, Ticker};
-use tokio::sync::mpsc;
+use sched::{Schedule, TaskId, Timestamp};
+use tokio::sync::{Notify, mpsc};
 
 use crate::{
-  Error, ProviderErrorContext, ProviderErrorKind, Result, StoreExpectation, StoreKey,
-  StoreNamespace, StoreOperation, StoreValue, SubscriptionPredicate,
+  Error, ProviderErrorContext, ProviderErrorKind, Result, StoreKey, StoreNamespace, StoreOperation,
+  StoreValue, SubscriptionPredicate,
   api::Entropy,
   extension_registry::ExtensionRegistry,
   protocol::{CborLimits, QualifiedTag, decode_canonical_strict, encode_canonical},
@@ -50,7 +50,10 @@ pub(crate) const TRIGGER_NAMESPACE: &str = "radiata.woooo.tech/metadata/v1/trigg
 
 /// The canonical body of one trigger row.
 pub(crate) const TRIGGER_SCHEMA: &str = "radiata.woooo.tech/schemas/v1/trigger";
-const TRIGGER_RECORD_VERSION: u16 = 1;
+/// Version 2 dropped the time-trigger watermark: the `sched` task table
+/// is the runtime state now, and the row is declaration-only. A version
+/// 1 row fails the schema check and is skipped with a warn (fail-closed).
+const TRIGGER_RECORD_VERSION: u16 = 2;
 /// One row is a handful of short strings; the bound matches the other
 /// flat record families.
 const TRIGGER_LIMITS: CborLimits = CborLimits::new(4, 64, 8 * 1024);
@@ -70,12 +73,13 @@ pub(crate) const TRIGGER_FIRE_QUEUE: usize = 64;
 /// UTF-8 store key, no grammar beyond the store key's own byte rules.
 const TRIGGER_NAME_MAX_BYTES: usize = 128;
 
-/// What fires a trigger: a cadence pattern against the wall clock, or a
-/// subscription predicate against the live change stream.
+/// What fires a trigger: a `sched` schedule expression against the wall
+/// clock, or a subscription predicate against the live change stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TriggerSource {
-  /// A cadence pattern in its declared frame (`Z` or fixed offset; the
-  /// device-local frame is refused at registration).
+  /// A `sched` schedule expression in its declared frame (`Z`, a fixed
+  /// offset, or an IANA zone; the device-local frame is refused at
+  /// registration).
   Time { pattern: String },
   /// A subscription predicate over resource changes.
   Event { predicate: SubscriptionPredicate },
@@ -100,25 +104,47 @@ pub(crate) struct EventTrigger {
 }
 
 /// The trigger engine's shared state: the event-trigger cache the
-/// evaluation pass refreshes and the bounded fire queue the dispatch
-/// engine drains. Both halves are available wherever the operation
-/// planes are; the default state has a closed fire queue (no engine —
-/// enqueued fires drop with a warn) and an empty cache.
-#[derive(Clone, Debug)]
+/// evaluation pass refreshes, the bounded fire queue the dispatch
+/// engine drains, and the `sched` task table that drives time triggers.
+/// All three halves are available wherever the operation planes are;
+/// the default state has a closed fire queue (no engine — enqueued
+/// fires drop with a warn) and an empty scheduler.
+#[derive(Clone)]
 pub(crate) struct TriggerState {
   event_rows: Arc<Mutex<BTreeMap<String, EventTrigger>>>,
   fires: Arc<mpsc::Sender<TriggerFire>>,
+  scheduler: Arc<Mutex<TriggerScheduler>>,
+  wake: Arc<Notify>,
+}
+
+/// The `sched` task table plus the declaration each task was registered
+/// from: the evaluation pass replaces a task when its declaration
+/// changes, and the dispatch engine drives the table's next-fire
+/// computation.
+#[derive(Default)]
+struct TriggerScheduler {
+  trigger: sched::Trigger,
+  registered: BTreeMap<String, RegisteredTime>,
+}
+
+/// One registered time-trigger task: the `sched` handle plus the
+/// declaration signature the registration was built from.
+struct RegisteredTime {
+  task: TaskId,
+  pattern: String,
+  target: QualifiedTag,
 }
 
 impl Default for TriggerState {
   fn default() -> Self {
     // The default fire queue is closed: with no dispatch engine, every
-    // enqueue fails and the caller's drop path (warn, watermark stays
-    // due) is the behavior.
+    // enqueue fails and the caller's drop path (warn) is the behavior.
     let (fires, _receiver) = mpsc::channel(TRIGGER_FIRE_QUEUE);
     Self {
       event_rows: Arc::new(Mutex::new(BTreeMap::new())),
       fires: Arc::new(fires),
+      scheduler: Arc::new(Mutex::new(TriggerScheduler::default())),
+      wake: Arc::new(Notify::new()),
     }
   }
 }
@@ -130,6 +156,8 @@ impl TriggerState {
     Self {
       event_rows: Arc::new(Mutex::new(BTreeMap::new())),
       fires: Arc::new(fires),
+      scheduler: Arc::new(Mutex::new(TriggerScheduler::default())),
+      wake: Arc::new(Notify::new()),
     }
   }
 
@@ -151,26 +179,57 @@ impl TriggerState {
   }
 
   /// Enqueues one fire for dispatch. `false` when the queue is full or
-  /// the engine is gone: the caller skips the advance (a time trigger's
-  /// watermark stays due, so the next pass re-fires — at-least-once,
-  /// coalesced per pass) or drops the event fire (the transient
-  /// stream's own contract).
+  /// the engine is gone: a time trigger's tick is dropped (the `sched`
+  /// table has already advanced — missed ticks are never replayed) and
+  /// an event fire follows the transient stream's own contract.
   pub(crate) fn try_enqueue_fire(&self, fire: TriggerFire) -> bool {
     self.fires.try_send(fire).is_ok()
+  }
+
+  /// The soonest pending time-trigger instant, if any. Computes each
+  /// registered task's next occurrence lazily; the returned instant may
+  /// already be in the past when the dispatch engine is late.
+  pub(crate) fn next_fire(&self, now: Timestamp) -> Option<Timestamp> {
+    self.with_scheduler(|scheduler| scheduler.trigger.next(now))
+  }
+
+  /// Fires the `sched` tick scheduled for `scheduled_at` and returns the
+  /// pending runs. Only the tick the engine waited for may fire; a stale
+  /// tick is skipped, never replayed.
+  pub(crate) fn fire_due(
+    &self, scheduled_at: Timestamp, started_at: Timestamp,
+  ) -> Vec<sched::TaskRun> {
+    self.with_scheduler(|scheduler| scheduler.trigger.fire_due(scheduled_at, started_at))
+  }
+
+  /// Resolves when the declaration set changed: the evaluation pass
+  /// notifies after every sync so the dispatch engine recomputes its
+  /// next instant instead of sleeping on a stale table.
+  pub(crate) async fn changed(&self) {
+    self.wake.notified().await;
+  }
+
+  /// Runs one closure over the scheduler table, recovering a poisoned
+  /// lock: a panicking callback must not wedge the trigger engine.
+  fn with_scheduler<R>(&self, f: impl FnOnce(&mut TriggerScheduler) -> R) -> R {
+    let mut scheduler = match self.scheduler.lock() {
+      Ok(guard) => guard,
+      Err(poisoned) => {
+        tracing::warn!("the trigger scheduler lock was poisoned; recovering");
+        poisoned.into_inner()
+      }
+    };
+    f(&mut scheduler)
   }
 }
 
 /// One stored trigger row: the caller-chosen name (the store key), the
-/// source, the target task kind, and the time-trigger watermark.
+/// source, and the target task kind.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TriggerRow {
   name: String,
   source: TriggerSource,
   target: QualifiedTag,
-  /// The time trigger's watermark: the next due fire as UNIX seconds in
-  /// the row's own frame. `u64::MAX` marks a pattern with no further
-  /// fire; event triggers never read it.
-  next_fire_seconds: u64,
 }
 
 /// The canonical wire body of one trigger row.
@@ -198,25 +257,16 @@ struct TriggerWire {
   selector: String,
   #[n(7)]
   target: String,
-  #[n(8)]
-  next_fire_seconds: u64,
 }
 
 impl TriggerRow {
-  /// Builds one row, validating the source and the watermark. Event
-  /// rows carry `next_fire_seconds` zero (never read).
-  pub(crate) fn new(
-    name: String, source: TriggerSource, target: QualifiedTag, next_fire_seconds: u64,
-  ) -> Result<Self> {
+  /// Builds one row, validating the name and the source shape.
+  pub(crate) fn new(name: String, source: TriggerSource, target: QualifiedTag) -> Result<Self> {
     Self::validate_name(&name)?;
-    if matches!(source, TriggerSource::Event { .. }) && next_fire_seconds != 0 {
-      return Err(Error::invalid_input("trigger watermark"));
-    }
     Ok(Self {
       name,
       source,
       target,
-      next_fire_seconds,
     })
   }
 
@@ -238,11 +288,6 @@ impl TriggerRow {
 
   pub(crate) const fn target(&self) -> &QualifiedTag {
     &self.target
-  }
-
-  /// The row's due watermark (time triggers only).
-  pub(crate) const fn next_fire_seconds(&self) -> u64 {
-    self.next_fire_seconds
   }
 
   /// The row's stored bytes: the canonical record body.
@@ -269,7 +314,6 @@ impl TriggerRow {
         domains,
         selector,
         target: self.target.as_str().to_owned(),
-        next_fire_seconds: self.next_fire_seconds,
       },
       TRIGGER_LIMITS,
     )
@@ -311,7 +355,6 @@ impl TriggerRow {
       name: wire.name,
       source,
       target: QualifiedTag::parse(&wire.target)?,
-      next_fire_seconds: wire.next_fire_seconds,
     })
   }
 }
@@ -341,29 +384,22 @@ pub(crate) fn validate_trigger_target(
   Ok(())
 }
 
-/// Builds one time-trigger row: the pattern must parse in a resolvable
-/// frame (the core resolves no local timezone — the pattern's frame
-/// must name its offset, so the fire times never depend on a timezone
-/// database the core does not carry), and the initial watermark is the
-/// first fire at or after the current second.
+/// Builds one time-trigger row: the schedule must parse and bind in a
+/// declared frame (the core resolves no device-local timezone — the
+/// pattern's frame must name its zone, so fire times never depend on
+/// the host's timezone). The row is declaration-only: the runtime's
+/// next window is computed from the clock when the `sched` table
+/// registers it.
 pub(crate) fn prepare_time_trigger(
   name: &str, pattern: &str, target: QualifiedTag,
 ) -> Result<TriggerRow> {
-  let ticker = Ticker::parse(pattern).map_err(|_| Error::invalid_input("trigger pattern"))?;
-  if ticker.offset() == Offset::Local {
-    // The core resolves no local timezone: the pattern's frame must
-    // name its offset (`Z` or fixed), so the trigger's fire times never
-    // depend on a timezone database the core does not carry.
-    return Err(Error::invalid_input("trigger pattern frame"));
-  }
-  let next_fire = next_fire_after(&ticker, crate::time::now_seconds())?;
+  validate_time_pattern(pattern)?;
   TriggerRow::new(
     name.to_owned(),
     TriggerSource::Time {
-      pattern: ticker.to_string(),
+      pattern: pattern.to_owned(),
     },
     target,
-    next_fire,
   )
 }
 
@@ -372,39 +408,40 @@ pub(crate) fn prepare_time_trigger(
 pub(crate) fn prepare_event_trigger(
   name: &str, predicate: SubscriptionPredicate, target: QualifiedTag,
 ) -> Result<TriggerRow> {
-  TriggerRow::new(
-    name.to_owned(),
-    TriggerSource::Event { predicate },
-    target,
-    0,
-  )
+  TriggerRow::new(name.to_owned(), TriggerSource::Event { predicate }, target)
 }
 
-/// The next due fire of the ticker at or after `start_seconds`
-/// (inclusive, UNIX seconds in the ticker's frame), or `u64::MAX` when
-/// the ticker can never fire again.
-fn next_fire_after(ticker: &Ticker, start_seconds: u64) -> Result<u64> {
-  let start = UNIX_EPOCH + Duration::from_secs(start_seconds);
-  let start = start
-    .to_civil(ticker.offset())
-    .map_err(|_| Error::invalid_input("trigger frame conversion"))?;
-  Ok(
-    ticker
-      .next_fire(&start)
-      .map(|values| fire_seconds(&values, ticker.offset()))
-      .unwrap_or(u64::MAX),
-  )
+/// Parses and binds one time-trigger schedule. The expression is
+/// forwarded to `sched` as written: `Z`, a fixed offset, an IANA zone,
+/// and the device-local frame all bind through the library's timezone
+/// resolution. The bind also proves an IANA name exists; the first
+/// lookup may read the timezone database, so callers on an async
+/// runtime run this through the blocking pool.
+fn validate_time_pattern(pattern: &str) -> Result<()> {
+  let schedule = Schedule::parse(pattern).map_err(|_| Error::invalid_input("trigger pattern"))?;
+  schedule
+    .bind()
+    .map(|_| ())
+    .map_err(|_| Error::invalid_input("trigger pattern frame"))
 }
 
-/// The UNIX-second reading of one civil-second set in `frame`. The
-/// conversion saturates at the epoch for pre-epoch civil times (the
-/// crate's own second-scale contract: liveness arithmetic, never stored
-/// absolute instants).
-fn fire_seconds(values: &Civil, frame: Offset) -> u64 {
-  values
-    .to_system_time(frame)
-    .map(crate::time::to_seconds)
-    .unwrap_or(0)
+/// The host wall clock as a `sched` instant. The crate's [`crate::time`]
+/// seam is the only clock authority; the conversion's failure is
+/// unreachable for a host reading and falls back to the epoch rather
+/// than panicking.
+pub(crate) fn timestamp_now() -> Timestamp {
+  Timestamp::from_millisecond(crate::time::now_millis()).unwrap_or(Timestamp::UNIX_EPOCH)
+}
+
+/// The wall-clock wait until `at`: zero when the instant is already due
+/// (the caller's `fire_due` skips a stale tick instead of replaying it).
+pub(crate) fn wait_until(now: Timestamp, at: Timestamp) -> std::time::Duration {
+  let nanos = at.as_nanosecond().saturating_sub(now.as_nanosecond());
+  if nanos <= 0 {
+    std::time::Duration::ZERO
+  } else {
+    std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+  }
 }
 
 /// The bounded re-drive budget for a registration or removal whose
@@ -420,12 +457,9 @@ const ROW_COMMIT_ATTEMPTS: usize = 4;
 ///
 /// Semantics: re-registering an existing name REPLACES its declaration
 /// (a documented overwrite — callers never need `remove` to change a
-/// declaration), with one monotonicity rule merged in at this write:
-/// a time-over-time replacement's watermark is the LATER of the existing
-/// and the new watermark, so a re-registration can never move a due
-/// window earlier and replay runs the old declaration already covered.
-/// A replacement across source kinds (time ↔ event) carries no watermark
-/// and overwrites outright.
+/// declaration). The row is declaration-only; the runtime `sched` table
+/// is rebuilt from it, so a replacement takes effect at the next
+/// evaluation pass with no watermark to carry across declarations.
 ///
 /// The write is an idempotent conditional put (identical bytes are a
 /// no-op) under the store's writer permit, and the commit verdict is
@@ -444,32 +478,18 @@ pub(crate) async fn put_trigger_row_ctx(
   for _ in 0..ROW_COMMIT_ATTEMPTS {
     let snapshot = store.snapshot().await?;
     let stored = snapshot.get(&namespace, &key).await?;
-    // The merged declaration: the caller's row, with a time-over-time
-    // replacement's watermark held at the later of the two. A corrupt
-    // stored row is hygiene, not a declaration: the registration
-    // overwrites it outright (the repair path).
-    let decoded = match stored
-      .as_ref()
-      .map(|value| TriggerRow::decode(value.as_bytes()))
-    {
-      Some(Ok(existing)) => Some(existing),
-      Some(Err(_)) => {
-        tracing::warn!(trigger = row.name(), "replacing an undecodable trigger row");
-        None
+    // A stored row that already equals the caller's declaration is the
+    // idempotent no-op. A corrupt stored row is hygiene, not a
+    // declaration: the registration overwrites it outright (the repair
+    // path).
+    if let Some(existing) = stored.as_ref() {
+      match TriggerRow::decode(existing.as_bytes()) {
+        Ok(decoded) if decoded == *row => return Ok(()),
+        Ok(_) => {}
+        Err(_) => tracing::warn!(trigger = row.name(), "replacing an undecodable trigger row"),
       }
-      None => None,
-    };
-    let effective = decoded
-      .as_ref()
-      .map(|existing| merge_watermark(existing.clone(), row.clone()))
-      .unwrap_or_else(|| row.clone());
-    if decoded.as_ref() == Some(&effective) {
-      // The merge was an identity: the stored declaration and watermark
-      // already equal the caller's intent (a same-declaration
-      // re-registration whose watermark did not advance).
-      return Ok(());
     }
-    let value = StoreValue::new(Arc::from(effective.encode()?));
+    let value = StoreValue::new(Arc::from(row.encode()?));
     let expected =
       crate::provider::snapshot_expectation(snapshot.as_ref(), &namespace, &key).await?;
     let revision = snapshot.revision().clone();
@@ -501,84 +521,6 @@ pub(crate) async fn put_trigger_row_ctx(
     }
   }
   Err(Error::conflict("trigger registration race"))
-}
-
-/// The watermark monotonicity rule of a declaration replacement: a
-/// time-over-time replacement keeps the later of the two watermarks;
-/// every other shape (a fresh name, an event row, a source-kind change)
-/// takes the new row outright.
-fn merge_watermark(existing: TriggerRow, replacement: TriggerRow) -> TriggerRow {
-  let merged = match (existing.source(), replacement.source()) {
-    (TriggerSource::Time { .. }, TriggerSource::Time { .. }) => replacement
-      .next_fire_seconds
-      .max(existing.next_fire_seconds),
-    _ => replacement.next_fire_seconds,
-  };
-  TriggerRow {
-    next_fire_seconds: merged,
-    ..replacement
-  }
-}
-
-/// Advances one time trigger's watermark past a pass's fire. The
-/// evaluation path's own write: unlike a registration replacement it
-/// never overwrites a declaration — if the row was re-declared (or
-/// removed) since the pass read it, the write is a no-op and the
-/// registration's own watermark governs. The watermark monotonicity is
-/// re-checked against the current row, and a lost race re-drives within
-/// [`ROW_COMMIT_ATTEMPTS`]; past the budget the typed conflict surfaces
-/// (the next pass re-fires — the fire contract stays at-least-once,
-/// never skips).
-pub(crate) async fn advance_trigger_watermark_ctx(
-  store: &MetadataStore, entropy: &dyn Entropy, observed: &TriggerRow, next_fire_seconds: u64,
-) -> Result<()> {
-  let namespace = namespace()?;
-  let key = trigger_key(observed.name());
-  let _permit = store.write_permit().await;
-  for _ in 0..ROW_COMMIT_ATTEMPTS {
-    let snapshot = store.snapshot().await?;
-    let Some(existing) = snapshot.get(&namespace, &key).await? else {
-      return Ok(());
-    };
-    let current = TriggerRow::decode(existing.as_bytes())?;
-    if current.source() != observed.source() || current.target() != observed.target() {
-      // The row was re-declared since the pass read it: the registration
-      // owns the declaration and its merged watermark now.
-      return Ok(());
-    }
-    if current.next_fire_seconds >= next_fire_seconds {
-      return Ok(());
-    }
-    let advanced = TriggerRow {
-      next_fire_seconds,
-      ..current
-    };
-    let value = StoreValue::new(Arc::from(advanced.encode()?));
-    let expected = StoreExpectation::Exact(existing.digest().clone());
-    let revision = snapshot.revision().clone();
-    drop(snapshot);
-    let transaction = store.prepare_core_verb_transaction(
-      crate::TransactionId::generate(entropy)?,
-      revision,
-      vec![StoreOperation::Put {
-        namespace: namespace.clone(),
-        key: key.clone(),
-        expected,
-        value,
-      }],
-    )?;
-    match store.commit(transaction).await? {
-      crate::CommitOutcome::Committed(_) => return Ok(()),
-      crate::CommitOutcome::Conflict | crate::CommitOutcome::Aborted => continue,
-      crate::CommitOutcome::Unknown { .. } => {
-        return Err(Error::provider(
-          ProviderErrorKind::CommitUnknown,
-          ProviderErrorContext::StorageCommit,
-        ));
-      }
-    }
-  }
-  Err(Error::conflict("trigger watermark advance race"))
 }
 
 /// Removes one trigger declaration by name. Idempotent: an absent name
@@ -656,18 +598,18 @@ pub(crate) async fn list_trigger_rows_ctx(store: &MetadataStore) -> Result<Vec<T
 }
 
 /// One evaluation pass over the durable trigger rows: refreshes the
-/// engine's event-trigger cache and, for every due time trigger, enqueues
-/// exactly one fire (missed windows coalesce to one run) and advances the
-/// row's watermark past the current second. The enqueue-before-advance
-/// order keeps a fire at-least-once across crashes: a crash between the
-/// two re-fires once on the next pass, never skips.
-pub(crate) async fn evaluate_pass(
-  store: &MetadataStore, entropy: &dyn Entropy, state: &TriggerState,
-) -> Result<()> {
+/// engine's event-trigger cache and synchronizes the `sched` task table
+/// with the stored time-trigger declarations. The rows are the durable
+/// declarations; the table is the runtime state, rebuilt from them on
+/// every incarnation, so a removed row leaves the table and a
+/// re-declared row replaces its task. A row's next window is computed
+/// from the current clock when the table registers it: a window missed
+/// while the node was down is not replayed (the `sched` stale-tick
+/// policy).
+pub(crate) async fn evaluate_pass(store: &MetadataStore, state: &TriggerState) -> Result<()> {
   let rows = list_trigger_rows_ctx(store).await?;
-  let now = crate::time::now_seconds();
   let mut event_rows = BTreeMap::new();
-  let mut advanced: Vec<(TriggerRow, u64)> = Vec::new();
+  let mut time_rows = Vec::new();
   for row in rows {
     match row.source() {
       TriggerSource::Event { predicate } => {
@@ -679,54 +621,162 @@ pub(crate) async fn evaluate_pass(
           },
         );
       }
-      TriggerSource::Time { pattern } => {
-        if row.next_fire_seconds() > now {
-          continue;
-        }
-        let Ok(ticker) = Ticker::parse(pattern) else {
-          tracing::warn!(
-            trigger = row.name(),
-            "trigger row skipped: unparsable pattern"
-          );
-          continue;
-        };
-        // Coalescing: one fire for every window at or before `now`, then
-        // the next window strictly after it.
-        if state.try_enqueue_fire(TriggerFire {
-          trigger: row.name().to_owned(),
-          source: crate::TriggerSourceKind::Time,
-          target: row.target().clone(),
-        }) {
-          let start = now.saturating_add(1);
-          let next_fire = next_fire_after(&ticker, start)?;
-          if next_fire != row.next_fire_seconds() {
-            advanced.push((row.clone(), next_fire));
-          }
-        } else {
-          tracing::warn!(
-            trigger = row.name(),
-            "trigger fire dropped: the dispatch queue is full"
-          );
-        }
-      }
+      TriggerSource::Time { .. } => time_rows.push(row),
     }
   }
   state.replace_event_rows(event_rows);
-  // The watermark advances land after the scan is released, each a
-  // drift-checked conditional put on the row's own read (never a
-  // declaration overwrite). A lost race re-drives bounded; a store
-  // failure leaves the watermark due: the next pass re-fires
-  // (at-least-once), never skips.
-  for (row, next_fire) in advanced {
-    if let Err(error) = advance_trigger_watermark_ctx(store, entropy, &row, next_fire).await {
-      tracing::warn!(kind = ?error.kind(), "trigger watermark advance failed");
-    }
-  }
+  state.sync_time_rows(time_rows).await;
   Ok(())
+}
+
+impl TriggerState {
+  /// Synchronizes the `sched` task table with the stored time-trigger
+  /// declarations. The change plan is computed under a short table lock,
+  /// the potentially blocking schedule validation runs on the blocking
+  /// pool, and the table mutations land under a second short lock.
+  async fn sync_time_rows(&self, rows: Vec<TriggerRow>) {
+    // The plan: which registered names left, and which rows are new or
+    // changed. Unchanged rows keep their task (and its pending window).
+    let (stale, changed) = {
+      let scheduler = match self.scheduler.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+          tracing::warn!("the trigger scheduler lock was poisoned; recovering");
+          poisoned.into_inner()
+        }
+      };
+      let names: std::collections::BTreeSet<String> =
+        rows.iter().map(|row| row.name().to_owned()).collect();
+      let stale: Vec<String> = scheduler
+        .registered
+        .keys()
+        .filter(|name| !names.contains(*name))
+        .cloned()
+        .collect();
+      let changed: Vec<TriggerRow> = rows
+        .into_iter()
+        .filter(|row| {
+          let TriggerSource::Time { pattern } = row.source() else {
+            return false;
+          };
+          !scheduler
+            .registered
+            .get(row.name())
+            .is_some_and(|entry| entry.pattern == *pattern && entry.target == *row.target())
+        })
+        .collect();
+      (stale, changed)
+    };
+    // Validate the changed schedules off the async worker: the first
+    // IANA lookup may read the timezone database.
+    let (valid, invalid) = if changed.is_empty() {
+      (Vec::new(), Vec::new())
+    } else {
+      match tokio::task::spawn_blocking(move || {
+        let mut valid = Vec::new();
+        let mut invalid = Vec::new();
+        for row in changed {
+          let TriggerSource::Time { pattern } = row.source() else {
+            continue;
+          };
+          match validate_time_pattern(pattern) {
+            Ok(()) => valid.push(row),
+            Err(error) => {
+              tracing::warn!(
+                trigger = row.name(),
+                kind = ?error.kind(),
+                "trigger row skipped: unparsable schedule"
+              );
+              invalid.push(row.name().to_owned());
+            }
+          }
+        }
+        (valid, invalid)
+      })
+      .await
+      {
+        Ok(plan) => plan,
+        Err(error) => {
+          tracing::warn!(%error, "the trigger schedule validation task failed");
+          return;
+        }
+      }
+    };
+    // Apply under the table lock: deregister the departed and invalid
+    // rows, then replace the changed ones. `register` binds the schedule
+    // again; the validation above warmed the timezone database cache, so
+    // the bind is a cache hit.
+    {
+      let mut scheduler = match self.scheduler.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+          tracing::warn!("the trigger scheduler lock was poisoned; recovering");
+          poisoned.into_inner()
+        }
+      };
+      for name in stale.into_iter().chain(invalid) {
+        if let Some(entry) = scheduler.registered.remove(&name) {
+          scheduler.trigger.deregister(entry.task);
+        }
+      }
+      for row in valid {
+        let TriggerSource::Time { pattern } = row.source() else {
+          continue;
+        };
+        if let Some(entry) = scheduler.registered.remove(row.name()) {
+          scheduler.trigger.deregister(entry.task);
+        }
+        let state = self.clone();
+        let name = row.name().to_owned();
+        let target = row.target().clone();
+        let callback = move |_scheduled_at: Timestamp| {
+          if !state.try_enqueue_fire(TriggerFire {
+            trigger: name.clone(),
+            source: crate::TriggerSourceKind::Time,
+            target: target.clone(),
+          }) {
+            tracing::warn!(
+              trigger = %name,
+              "trigger fire dropped: the dispatch queue is full"
+            );
+          }
+          async {}
+        };
+        match scheduler
+          .trigger
+          .register_at(timestamp_now(), pattern, callback)
+        {
+          Ok(task) => {
+            scheduler.registered.insert(
+              row.name().to_owned(),
+              RegisteredTime {
+                task,
+                pattern: pattern.clone(),
+                target: row.target().clone(),
+              },
+            );
+          }
+          Err(error) => {
+            tracing::warn!(
+              trigger = row.name(),
+              %error,
+              "trigger registration failed"
+            );
+          }
+        }
+      }
+    }
+    // The table may have gained or lost a task: wake the dispatch engine
+    // so it recomputes its next instant instead of sleeping on a stale
+    // one.
+    self.wake.notify_one();
+  }
 }
 
 #[cfg(test)]
 mod tests {
+  use std::time::Duration;
+
   use super::*;
   use crate::{
     extension_registry::ExtensionRegistry, identity::testing::SequenceEntropy,
@@ -831,7 +881,6 @@ mod tests {
         pattern: "{*}-{*}-{*}T00:00:00Z".to_owned(),
       },
       target(),
-      1_800_000_000,
     )
     .expect("row");
     assert_eq!(
@@ -848,7 +897,6 @@ mod tests {
       "on-change".to_owned(),
       TriggerSource::Event { predicate },
       target(),
-      0,
     )
     .expect("row");
     let decoded = TriggerRow::decode(&event.encode().expect("encode")).expect("decode");
@@ -872,8 +920,8 @@ mod tests {
     );
   }
 
-  /// Malformed rows fail closed: unknown source kinds, a watermark on an
-  /// event row, an empty or oversized name, and an unknown schema.
+  /// Malformed rows fail closed: an empty or oversized name is refused
+  /// before a row can be built.
   #[test]
   fn malformed_trigger_rows_fail_closed() {
     assert!(
@@ -883,7 +931,6 @@ mod tests {
           pattern: String::new()
         },
         target(),
-        0
       )
       .is_err()
     );
@@ -894,26 +941,14 @@ mod tests {
           pattern: String::new()
         },
         target(),
-        0
-      )
-      .is_err()
-    );
-    assert!(
-      TriggerRow::new(
-        "event".to_owned(),
-        TriggerSource::Event {
-          predicate: SubscriptionPredicate::new()
-        },
-        target(),
-        7
       )
       .is_err()
     );
   }
 
   /// Registration validates the whole declaration: an unparsable
-  /// pattern, a device-local frame, and an unregistered or builtin
-  /// target all fail typed, and nothing is persisted.
+  /// pattern and an unregistered or builtin target fail typed, and
+  /// nothing is persisted.
   #[tokio::test]
   async fn registration_validates_source_and_target() {
     let store = store().await;
@@ -921,7 +956,7 @@ mod tests {
     let mut extensions = registry();
     let registered = registered_target(&mut extensions);
 
-    for pattern in ["not-a-pattern", "not-a-pattern", "{*}-{*}-{*}T00:00:00"] {
+    for pattern in ["not-a-pattern"] {
       assert!(
         register_time_trigger_ctx(&store, &entropy, &extensions, "bad", pattern, target())
           .await
@@ -976,9 +1011,24 @@ mod tests {
     assert_eq!(list_trigger_rows_ctx(&store).await.expect("rows").len(), 1);
   }
 
-  /// A registered time trigger persists durably, re-registration
-  /// replaces the declaration without regressing the watermark, the
-  /// rows list in key order, and removal is idempotent by name.
+  /// Every frame is forwarded to `sched`: `Z`, a fixed offset, an IANA
+  /// zone, and the device-local default all bind.
+  #[test]
+  fn every_schedule_frame_binds() {
+    for pattern in [
+      "{*}-{*}-{*}T00:00:00Z",
+      "{*}-{*}-{*}T00:00:00+08:00",
+      "{*}-{*}-{*}T00:00:00[Asia/Shanghai]",
+      "{*}-{*}-{*}T00:00:00",
+    ] {
+      prepare_time_trigger("framed", pattern, target())
+        .unwrap_or_else(|error| panic!("pattern {pattern:?} must bind: {error}"));
+    }
+  }
+
+  /// A registered time trigger persists durably, the rows list in key
+  /// order, re-registration replaces the declaration outright, and
+  /// removal is idempotent by name.
   #[tokio::test]
   async fn trigger_rows_persist_list_and_remove() {
     let store = store().await;
@@ -998,74 +1048,10 @@ mod tests {
     .expect("register");
     let first = list_trigger_rows_ctx(&store).await.expect("rows");
     assert_eq!(first.len(), 1);
-    let watermark = first[0].next_fire_seconds();
-    assert!(
-      watermark > crate::time::now_seconds() - 1,
-      "the watermark starts due-never"
-    );
+    assert_eq!(first[0].name(), "alpha");
 
-    // Re-registering replaces the declaration (a documented overwrite);
-    // the watermark monotonicity rule keeps the later of the two
-    // watermarks, so a replacement never moves a due window earlier.
-    register_time_trigger_ctx(
-      &store,
-      &entropy,
-      &extensions,
-      "alpha",
-      "{*}-{*}-{*}T00:00:00Z",
-      registered,
-    )
-    .await
-    .expect("re-register");
-    let rows = list_trigger_rows_ctx(&store).await.expect("rows");
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].next_fire_seconds() >= watermark);
-
-    // Removal is by name and idempotent: both removals succeed.
-    remove_trigger_ctx(&store, &entropy, "alpha")
-      .await
-      .expect("remove");
-    remove_trigger_ctx(&store, &entropy, "alpha")
-      .await
-      .expect("remove again");
-    assert!(
-      list_trigger_rows_ctx(&store)
-        .await
-        .expect("rows")
-        .is_empty()
-    );
-  }
-
-  /// The registration replacement semantics: a re-registration under a
-  /// live name replaces the declaration (a different pattern takes
-  /// over), and the watermark monotonicity rule keeps the LATER of the
-  /// two watermarks — a re-registration whose fresh watermark would be
-  /// earlier never moves the due window back.
-  #[tokio::test]
-  async fn a_replacement_replaces_the_declaration_and_keeps_the_later_watermark() {
-    let store = store().await;
-    let entropy = entropy();
-    let mut extensions = registry();
-    let registered = registered_target(&mut extensions);
-
-    // The first declaration fires once a day at midnight UTC: its
-    // watermark is the next midnight, far past any re-registration's
-    // fresh watermark.
-    register_time_trigger_ctx(
-      &store,
-      &entropy,
-      &extensions,
-      "alpha",
-      "{*}-{*}-{*}T00:00:00Z",
-      registered.clone(),
-    )
-    .await
-    .expect("register");
-    let daily_watermark = list_trigger_rows_ctx(&store).await.expect("rows")[0].next_fire_seconds();
-
-    // The replacement declares the every-second pattern; its fresh
-    // watermark is the current second, but the stored watermark must
-    // stay at the daily window.
+    // Re-registering replaces the declaration (a documented overwrite):
+    // the new pattern takes over and there is no watermark to carry.
     register_time_trigger_ctx(
       &store,
       &entropy,
@@ -1082,19 +1068,28 @@ mod tests {
       panic!("the replacement's declaration must take over");
     };
     assert_eq!(pattern, EVERY_TEST_SECOND, "the declaration is replaced");
-    assert_eq!(
-      rows[0].next_fire_seconds(),
-      daily_watermark,
-      "the watermark never moves earlier"
+
+    // Removal is by name and idempotent: both removals succeed.
+    remove_trigger_ctx(&store, &entropy, "alpha")
+      .await
+      .expect("remove");
+    remove_trigger_ctx(&store, &entropy, "alpha")
+      .await
+      .expect("remove again");
+    assert!(
+      list_trigger_rows_ctx(&store)
+        .await
+        .expect("rows")
+        .is_empty()
     );
   }
 
-  /// The evaluation path's watermark advance: it moves the watermark
-  /// forward, is a no-op when the watermark is already at or past the
-  /// target, and never overwrites a declaration that was re-declared
-  /// since the pass read the row.
+  /// The evaluation pass rebuilds the `sched` table from the durable
+  /// rows: a registered time trigger has a pending window, firing it
+  /// enqueues the declared fire, and removing the row leaves the table
+  /// empty.
   #[tokio::test]
-  async fn the_watermark_advance_never_clobbers_a_redeclaration() {
+  async fn the_sched_table_follows_the_rows() {
     let store = store().await;
     let entropy = entropy();
     let mut extensions = registry();
@@ -1104,122 +1099,35 @@ mod tests {
       &store,
       &entropy,
       &extensions,
-      "alpha",
-      "{*}-{*}-{*}T00:00:00Z",
-      registered.clone(),
+      "every-second",
+      EVERY_TEST_SECOND,
+      registered,
     )
     .await
     .expect("register");
-    let observed = list_trigger_rows_ctx(&store).await.expect("rows").remove(0);
-
-    // A forward advance lands.
-    let target = observed.next_fire_seconds() + 1_000;
-    advance_trigger_watermark_ctx(&store, &entropy, &observed, target)
-      .await
-      .expect("advance");
-    assert_eq!(
-      list_trigger_rows_ctx(&store).await.expect("rows")[0].next_fire_seconds(),
-      target
-    );
-
-    // A backward or equal advance is a no-op.
-    advance_trigger_watermark_ctx(&store, &entropy, &observed, observed.next_fire_seconds())
-      .await
-      .expect("no-op advance");
-    assert_eq!(
-      list_trigger_rows_ctx(&store).await.expect("rows")[0].next_fire_seconds(),
-      target
-    );
-
-    // A re-declared row (different pattern) is left alone: the
-    // registration's own merged watermark governs.
-    let replacement =
-      prepare_time_trigger("alpha", EVERY_TEST_SECOND, registered).expect("replacement row");
-    put_trigger_row_ctx(&store, &entropy, &replacement)
-      .await
-      .expect("replace");
-    advance_trigger_watermark_ctx(&store, &entropy, &observed, target + 1_000)
-      .await
-      .expect("drift-checked advance");
-    let rows = list_trigger_rows_ctx(&store).await.expect("rows");
-    let TriggerSource::Time { pattern } = rows[0].source() else {
-      panic!("the replacement's declaration must stand");
-    };
-    assert_eq!(pattern, EVERY_TEST_SECOND);
-    assert_eq!(
-      rows[0].next_fire_seconds(),
-      target,
-      "the stale pass must not advance the replaced row"
-    );
-  }
-
-  /// The pass coalesces missed windows: a time trigger whose watermark
-  /// is hours overdue fires exactly once, and its watermark advances
-  /// past the current second (to the pattern's next window), so the next
-  /// pass does not fire it again.
-  #[tokio::test]
-  async fn a_missed_window_coalesces_to_one_run() {
-    let store = store().await;
-    let entropy = entropy();
-
-    // A daily-at-midnight trigger whose watermark was never advanced:
-    // due now, whatever the clock reads.
-    let overdue = TriggerRow::new(
-      "daily".to_owned(),
-      TriggerSource::Time {
-        pattern: "{*}-{*}-{*}T00:00:00Z".to_owned(),
-      },
-      target(),
-      0,
-    )
-    .expect("row");
-    put_trigger_row_ctx(&store, &entropy, &overdue)
-      .await
-      .expect("persist");
-
-    let (fires, _rx) = mpsc::channel(TRIGGER_FIRE_QUEUE);
+    let (fires, mut rx) = mpsc::channel(TRIGGER_FIRE_QUEUE);
     let state = TriggerState::new(fires);
-    evaluate_pass(&store, &entropy, &state).await.expect("pass");
+    evaluate_pass(&store, &state).await.expect("pass");
 
-    let rows = list_trigger_rows_ctx(&store).await.expect("rows");
-    assert_eq!(rows.len(), 1);
-    let advanced = rows[0].next_fire_seconds();
-    assert!(
-      advanced > crate::time::now_seconds() + 60,
-      "the watermark must advance past today's window: {advanced}"
-    );
+    let now = timestamp_now();
+    let next = state.next_fire(now).expect("a pending window");
+    // The dispatch round starts at the window it waited for (the engine
+    // captures the dispatch start after sleeping); the callback enqueues
+    // synchronously and returns an empty future.
+    drop(state.fire_due(next, next));
+    let fire = rx.try_recv().expect("the fire is enqueued");
+    assert_eq!(fire.trigger, "every-second");
+    assert_eq!(fire.source, crate::TriggerSourceKind::Time);
+    assert_eq!(fire.target, target());
 
-    // The next pass finds nothing due.
-    evaluate_pass(&store, &entropy, &state).await.expect("pass");
-    let rows = list_trigger_rows_ctx(&store).await.expect("rows");
-    assert_eq!(rows[0].next_fire_seconds(), advanced);
-  }
-
-  /// A full dispatch queue drops the fire and leaves the watermark due:
-  /// the next pass re-fires (at-least-once), never skips.
-  #[tokio::test]
-  async fn a_dropped_fire_leaves_the_watermark_due() {
-    let store = store().await;
-    let entropy = entropy();
-    let overdue = TriggerRow::new(
-      "daily".to_owned(),
-      TriggerSource::Time {
-        pattern: "{*}-{*}-{*}T00:00:00Z".to_owned(),
-      },
-      target(),
-      0,
-    )
-    .expect("row");
-    put_trigger_row_ctx(&store, &entropy, &overdue)
+    remove_trigger_ctx(&store, &entropy, "every-second")
       .await
-      .expect("persist");
-
-    // A state whose fire queue is closed: every enqueue fails.
-    let state = TriggerState::default();
-    evaluate_pass(&store, &entropy, &state).await.expect("pass");
-
-    let rows = list_trigger_rows_ctx(&store).await.expect("rows");
-    assert_eq!(rows[0].next_fire_seconds(), 0, "the watermark stays due");
+      .expect("remove");
+    evaluate_pass(&store, &state).await.expect("pass");
+    assert!(
+      state.next_fire(timestamp_now()).is_none(),
+      "the removed declaration leaves the sched table"
+    );
   }
 
   /// The event-trigger cache refresh: the pass loads every event row
@@ -1246,13 +1154,13 @@ mod tests {
     .expect("register");
     let (fires, _rx) = mpsc::channel(TRIGGER_FIRE_QUEUE);
     let state = TriggerState::new(fires);
-    evaluate_pass(&store, &entropy, &state).await.expect("pass");
+    evaluate_pass(&store, &state).await.expect("pass");
     assert_eq!(state.event_rows().len(), 1);
 
     remove_trigger_ctx(&store, &entropy, "on-change")
       .await
       .expect("remove");
-    evaluate_pass(&store, &entropy, &state).await.expect("pass");
+    evaluate_pass(&store, &state).await.expect("pass");
     assert!(state.event_rows().is_empty());
   }
 }

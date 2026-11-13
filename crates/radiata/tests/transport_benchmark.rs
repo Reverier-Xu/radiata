@@ -96,7 +96,7 @@ async fn start_node(seed: u64, sink: Arc<Sink>) -> (NodeHandle, Endpoint) {
   let keys: Arc<dyn radiata::extension::KeyProvider> =
     Arc::new(ScriptedKeys::full_at(1_500_000 + seed * 1_000));
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_millis(500))
+    .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
     .unwrap();
   let mut extensions = radiata::ExtensionRegistry::new();
   extensions

@@ -105,7 +105,7 @@ async fn start_node(seed: u64) -> Node {
     )
     .unwrap();
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_millis(50))
+    .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
     .unwrap();
   let handle = NodeBuilder::new(factory)
     .keys(keys)

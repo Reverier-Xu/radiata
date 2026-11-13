@@ -1,4 +1,5 @@
 mod anti_entropy;
+mod cadence;
 mod degree;
 mod dial;
 mod lifecycle;

@@ -17,7 +17,7 @@ mod common;
 
 use common::{MemoryStorageFactory, ScriptedKeys};
 
-const SYNC_INTERVAL: Duration = Duration::from_millis(50);
+const SYNC_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
 
 struct Node {
   handle: NodeHandle,
@@ -39,7 +39,7 @@ async fn start_node(seed: u64) -> Node {
   let storage = Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(900_000 + seed * 1_000));
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(SYNC_INTERVAL)
+    .with_anti_entropy_schedule(SYNC_SCHEDULE)
     .unwrap();
   let handle = NodeBuilder::new(storage.clone())
     .keys(keys)

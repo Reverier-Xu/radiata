@@ -121,7 +121,7 @@ fn core_config_accepts_nonzero_values_above_the_default_maxima() {
   let feature = FeatureTag::parse("example.com/features/work").unwrap();
 
   NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_nanos(1))
+    .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
     .unwrap()
     .with_recovery_policy(recovery)
     .unwrap()
@@ -145,7 +145,7 @@ fn core_config_rejects_only_invalid_foundation_relationships() {
   assert!(RecoveryConfig::new(1, Duration::from_secs(2), Duration::from_secs(1)).is_err());
   assert!(
     NodeConfig::new()
-      .with_anti_entropy_interval(Duration::ZERO)
+      .with_anti_entropy_schedule("not-a-schedule")
       .is_err()
   );
   assert!(NodeConfig::new().with_session_queue_limits(0, 1).is_err());

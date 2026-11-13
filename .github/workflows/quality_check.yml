@@ -8,7 +8,7 @@
 #     validated".
 #   * Actions are referenced by major version (`@v7`, `@v2`) or, for
 #     `dtolnay/rust-toolchain`, by the toolchain name its ref encodes
-#     (`@nightly`, `@stable`, `@1.98.0`). Major tags are mutable, so this
+#     (`@nightly`, `@stable`, `@1.99.0`). Major tags are mutable, so this
 #     trades immutability for readability and for bumps that arrive as a
 #     reviewable one-line diff; a compromised upstream tag is the accepted
 #     risk. Pin to a commit SHA instead if that trade ever stops being
@@ -108,12 +108,12 @@ jobs:
         uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
 
       - name: verify MSRV
-        run: test "$(rustc +1.98.0 --version --verbose | awk '$1 == "release:" { print $2 }')" = "1.98.0"
+        run: test "$(rustc +1.99.0 --version --verbose | awk '$1 == "release:" { print $2 }')" = "1.99.0"
 
       - name: record start
         id: start
@@ -122,15 +122,15 @@ jobs:
 
       - name: cargo check
         id: check
-        run: cargo +1.98.0 check --workspace --all-targets --all-features --locked
+        run: cargo +1.99.0 check --workspace --all-targets --all-features --locked
 
       - name: cargo clippy
         id: clippy
-        run: cargo +1.98.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo +1.99.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
         id: test
-        run: cargo +1.98.0 test --workspace --all-features --locked
+        run: cargo +1.99.0 test --workspace --all-features --locked
 
       - name: quality attestation
         if: always()
@@ -267,7 +267,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.99.0
 
       # The starvation gate replays the transport-chaos incidents on a
       # single core: the lanes compile unpinned, then execute under
@@ -278,7 +278,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target
-          cargo +1.98.0 test --locked --no-run \
+          cargo +1.99.0 test --locked --no-run \
             --test transport_chaos --test membership_sync \
             --message-format=json > target/starvation-build.json
           jq -r 'select(.executable != null and ((.target.kind // []) | index("test"))) | .executable' \
@@ -354,7 +354,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
 
@@ -365,22 +365,22 @@ jobs:
 
       - name: cargo check
         id: check
-        run: cargo +1.98.0 check --workspace --all-targets --all-features --locked
+        run: cargo +1.99.0 check --workspace --all-targets --all-features --locked
 
       - name: cargo clippy
         id: clippy
-        run: cargo +1.98.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo +1.99.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
         id: test
-        run: cargo +1.98.0 test --workspace --all-features --locked
+        run: cargo +1.99.0 test --workspace --all-features --locked
 
       - name: native feature checks
         id: native_checks
         shell: bash
         run: |
-          cargo +1.98.0 check --locked --no-default-features
-          cargo +1.98.0 check --locked --no-default-features --features redb
+          cargo +1.99.0 check --locked --no-default-features
+          cargo +1.99.0 check --locked --no-default-features --features redb
 
       - name: install cargo-hack
         uses: taiki-e/install-action@v2
@@ -389,11 +389,11 @@ jobs:
 
       - name: native feature powerset check
         id: powerset
-        run: cargo +1.98.0 hack check --feature-powerset --depth 1 --locked
+        run: cargo +1.99.0 hack check --feature-powerset --depth 1 --locked
 
       - name: fixed simulator gate
         id: simulator
-        run: cargo +1.98.0 test --locked --lib simulation::network::tests::simulation_network_fault_matrix_gate -- --ignored --exact
+        run: cargo +1.99.0 test --locked --lib simulation::network::tests::simulation_network_fault_matrix_gate -- --ignored --exact
 
       - name: quality attestation
         if: always()
@@ -449,7 +449,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
 
@@ -460,22 +460,22 @@ jobs:
 
       - name: cargo check
         id: check
-        run: cargo +1.98.0 check --workspace --all-targets --all-features --locked
+        run: cargo +1.99.0 check --workspace --all-targets --all-features --locked
 
       - name: cargo clippy
         id: clippy
-        run: cargo +1.98.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo +1.99.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
         id: test
-        run: cargo +1.98.0 test --workspace --all-features --locked
+        run: cargo +1.99.0 test --workspace --all-features --locked
 
       - name: native feature checks
         id: native_checks
         shell: bash
         run: |
-          cargo +1.98.0 check --locked --no-default-features
-          cargo +1.98.0 check --locked --no-default-features --features redb
+          cargo +1.99.0 check --locked --no-default-features
+          cargo +1.99.0 check --locked --no-default-features --features redb
 
       - name: install cargo-hack
         uses: taiki-e/install-action@v2
@@ -484,11 +484,11 @@ jobs:
 
       - name: native feature powerset check
         id: powerset
-        run: cargo +1.98.0 hack check --feature-powerset --depth 1 --locked
+        run: cargo +1.99.0 hack check --feature-powerset --depth 1 --locked
 
       - name: fixed simulator gate
         id: simulator
-        run: cargo +1.98.0 test --locked --lib simulation::network::tests::simulation_network_fault_matrix_gate -- --ignored --exact
+        run: cargo +1.99.0 test --locked --lib simulation::network::tests::simulation_network_fault_matrix_gate -- --ignored --exact
 
       - name: quality attestation
         if: always()
@@ -564,7 +564,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: record start
         id: start
@@ -574,7 +574,7 @@ jobs:
       - name: cargo test
         id: test
         shell: bash
-        run: cargo +1.98.0 test --locked ${{ matrix.flags }}
+        run: cargo +1.99.0 test --locked ${{ matrix.flags }}
 
       - name: quality attestation
         if: always()
@@ -622,7 +622,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: install cargo-hack
         uses: taiki-e/install-action@v2
@@ -633,10 +633,10 @@ jobs:
         run: test "$(cargo hack --version)" = "cargo-hack 0.6.45"
 
       - name: feature powerset check
-        run: cargo +1.98.0 hack check --feature-powerset --depth 1 --locked
+        run: cargo +1.99.0 hack check --feature-powerset --depth 1 --locked
 
       - name: each-feature check
-        run: cargo +1.98.0 hack check --each-feature --locked
+        run: cargo +1.99.0 hack check --each-feature --locked
 
   features-test:
     name: features / test (${{ matrix.name }})
@@ -661,10 +661,10 @@ jobs:
         uses: actions/checkout@v7
 
       - name: install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: cargo test
-        run: cargo +1.98.0 test --locked ${{ matrix.flags }}
+        run: cargo +1.99.0 test --locked ${{ matrix.flags }}
 
   container:
     name: container

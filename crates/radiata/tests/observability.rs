@@ -65,7 +65,7 @@ async fn start_node(seed: u64) -> Node {
   let factory: Arc<dyn radiata::extension::StorageFactory> =
     Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let config = NodeConfig::new()
-    .with_anti_entropy_interval(Duration::from_millis(50))
+    .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
     .unwrap();
   let handle = NodeBuilder::new(factory)
     .keys(keys)
@@ -254,7 +254,7 @@ async fn credential_secrets_never_enter_the_emitted_log_stream() {
   let factory = radiata::adapters::json_store(storage_marker.clone());
   let mut issuer = {
     let config = NodeConfig::new()
-      .with_anti_entropy_interval(Duration::from_millis(50))
+      .with_anti_entropy_schedule("{*}-{*}-{*}T{*}:{*}:{*}Z")
       .unwrap();
     let handle = NodeBuilder::new(factory)
       .keys(keys)

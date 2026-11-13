@@ -11,7 +11,7 @@ passes the five gates.
 ## Goal
 
 Time and event triggers become declarative, durable, node-local rows;
-`radiata-cadence` drives time triggers and the W2-2
+`sched` schedule expressions drive time triggers and the W2-2
 `SubscriptionPredicate` drives event triggers; core sweeps/checkpoints
 run as core-owned controller tasks on the same machinery; operation
 events are generated from the unified change stream. Also: re-examine
@@ -21,9 +21,10 @@ wire) with a real consumer in hand.
 ## Why
 
 Trigger semantics are currently implicit (hardcoded runtime loops);
-cadence has no consumer; the task machinery runs user tasks but not the
-core's own periodic work, so core sweeps sit outside the observability,
-coalescing, and shutdown-drain discipline everything else gets.
+the schedule grammar has no consumer; the task machinery runs user
+tasks but not the core's own periodic work, so core sweeps sit outside
+the observability, coalescing, and shutdown-drain discipline everything
+else gets.
 Node-local rows give triggers durability and introspection without
 replication (triggers are node policy, not cluster state).
 
@@ -39,30 +40,33 @@ replication (triggers are node policy, not cluster state).
   controller task).
 - `src/node/predicate.rs` — `SubscriptionPredicate` (domains + label
   selector; documented Phase D trigger seam).
-- `cadence/` — `radiata-cadence` crate: `Pattern::parse/next_fire`,
-  optional time-lib interop features (`std-time` gives unix-second
-  conversion without new deps for the core's use).
+- `sched` — the schedule-pattern crate: `Schedule::parse`/`bind` and
+  `BoundSchedule::next_after`, plus the runtime-agnostic `Trigger` task
+  table the dispatch engine drives. The crate carries the timezone
+  database (jiff) and the stale-tick/overlap policies.
 - Phase C deferral: policy labels are declaration-driven (auto-stamp at
   seal); per-row label carriage on the reconcile wire was deferred here.
 
 ## Design commitments
 
 1. **Trigger declarations as node-local rows.** A trigger row carries:
-   its `TriggerSource` (cadence `Pattern` text | event predicate), the
-   target (a core-owned operation or a registered task spec reference),
-   and policy fields (catchup = coalesce-to-one, overlap = skip — spec/
-   policy separation per the cadence work item). Node-local family in
-   the catalog (`node_local`), never replicated. Durable across
-   restarts.
-2. **Time triggers.** A core controller evaluates due triggers via
-   `Ticker::next_fire` against the wall-clock seam; missed windows
-   coalesce to one run (catchup policy). Uses the `std-time` feature's
-   `Cadence` conversions — no new dependency,
-   no local-timezone resolution (operators express triggers in the
-   frame the pattern declares).
+   its `TriggerSource` (`sched` schedule text | event predicate) and the
+   target (a core-owned operation or a registered task spec reference).
+   The runtime policy is the `sched` engine's: overlap = skip, missed
+   tick = skip (never replay) — spec/policy separation. Node-local
+   family in the catalog (`node_local`), never replicated. Durable
+   across restarts; the `sched` table is rebuilt from the rows on every
+   incarnation.
+2. **Time triggers.** The dispatch engine drives the shared `sched`
+   table against the wall clock: `next` → sleep → `fire_due` → spawn
+   the callback run. A row's next window is computed from the current
+   clock when the table registers it, so a window missed while the node
+   was down is skipped, not replayed. Expressions are forwarded to
+   `sched` as written (`Z`, a fixed offset, an IANA zone, or the
+   device-local frame).
 3. **Event triggers.** Predicate-driven: the unified change stream
-   feeds the predicate; a match enqueues the target per the policy
-   (coalesce/skip). Reuses the W2-2 emit-side evaluation — no second
+   feeds the predicate; a match enqueues the target per the overlap
+   policy (skip). Reuses the W2-2 emit-side evaluation — no second
    matching path.
 4. **Core sweeps/checkpoints become controller tasks.** The retention
    loop's sweep/checkpoint work moves onto `CustomTaskSpec` machinery as
@@ -70,7 +74,11 @@ replication (triggers are node policy, not cluster state).
    runs, separate dial budget (controllers never consume the user dial
    budget), drain-on-shutdown honored via the policy declaration.
    Outcome equivalence: the same engine, same gate, invoked through the
-   task machine — swept/retained sets identical to Phase C.
+   task machine — swept/retained sets identical to Phase C. The
+   recovery/sweep, degree-maintenance, and anti-entropy cadences are
+   `sched` expressions too (the recovery tick is the ten-second enum
+   `{0,10,20,30,40,50}`; trigger evaluation keeps its own one-second
+   worker so the coarser recovery tick does not delay it).
 5. **Operation events from the unified change stream.** Operation/task
    lifecycle events derive from the change stream rather than ad-hoc
    emission sites where the stream already carries the fact. Event
@@ -94,9 +102,9 @@ replication (triggers are node policy, not cluster state).
 ## Acceptance criteria
 
 1. Five gates green.
-2. A time trigger fires per its cadence pattern in a runtime scenario
-   test; a missed window coalesces to one run; an event trigger fires on
-   a predicate match and coalesces/skips per policy.
+2. A time trigger fires per its `sched` schedule in a runtime scenario
+   test; a stale tick is skipped; an event trigger fires on a predicate
+   match and skips overlaps per policy.
 3. Sweep/checkpoint outcomes identical to Phase C (existing suites
    unmodified); controller runs appear as bounded, observable task
    records; shutdown drains them.

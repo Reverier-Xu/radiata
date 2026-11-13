@@ -122,7 +122,7 @@ async fn main() {
       radiata::NodeConfig::new()
         .with_session_liveness(
           Duration::from_secs(30),
-          Duration::from_secs(5),
+          "{*}-{*}-{*}T{*}:{*}:{0,5,10,15,20,25,30,35,40,45,50,55}Z",
           Duration::from_secs(15),
         )
         .expect("liveness policy")

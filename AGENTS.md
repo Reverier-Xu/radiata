@@ -8,11 +8,12 @@
 
 - `crates/radiata/`: the library crate (`src/lib.rs` entry point and
   public API, `tests/` integration suites).
-- `crates/cadence/`: the schedule-pattern grammar crate
-  (`radiata-cadence`).
 - `crates/test-support/`: shared test-support crate.
 - `Cargo.toml`: virtual workspace manifest (all packages under
-  `crates/`).
+  `crates/`). Scheduling uses the external `sched` crate (schedule
+  parsing, zone binding, and the runtime-agnostic trigger table) for
+  both the user time triggers and the runtime's internal cadences; the
+  crate is not vendored in this workspace.
 - `rustfmt.toml`: nightly Rust formatting rules.
 - `taplo.toml`: TOML formatting rules.
 - `.github/workflows/quality_check.yml`: required CI quality gates.

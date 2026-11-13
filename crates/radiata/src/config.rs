@@ -1,6 +1,24 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use crate::{Error, FeatureTag, Result};
+
+/// The default anti-entropy cadence: every second. One fixed per-node
+/// cost paid N-wide every tick; fast deployments may tighten the
+/// expression, slower ones may spread it out.
+pub(crate) const DEFAULT_ANTI_ENTROPY_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
+
+/// The default session keepalive cadence: seconds 0, 20, and 40 of every
+/// minute — one ping every twenty seconds.
+pub(crate) const DEFAULT_KEEPALIVE_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{0,20,40}Z";
+
+/// The default recovery-observation cadence: seconds 0, 10, 20, 30, 40,
+/// and 50 of every minute — one tick every ten seconds. Recovery is an
+/// observation of current state, not a deadline-bearing service.
+pub(crate) const DEFAULT_RECOVERY_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{0,10,20,30,40,50}Z";
+
+/// The default degree-maintenance cadence: seconds 0 and 30 of every
+/// minute — one tick every thirty seconds.
+pub(crate) const DEFAULT_DEGREE_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{0,30}Z";
 
 /// The zero-refusal contract for every configured bound: a zero value
 /// is a caller mistake, not a "disable" spelling, so every setter fails
@@ -42,7 +60,9 @@ impl ZeroCheck for Duration {
 /// a start without rebuilding it.
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
-  anti_entropy_interval: Duration,
+  anti_entropy_schedule: String,
+  recovery_schedule: String,
+  degree_schedule: String,
   recovery: RecoveryConfig,
   session_queue_messages: usize,
   // The summed encoded-byte budget of one session's outbound frame
@@ -67,9 +87,10 @@ pub struct NodeConfig {
   // A session with no authenticated traffic or owned in-flight work for
   // this long closes on host wall time. Zero disables.
   session_idle_timeout: Duration,
-  // The keepalive interval and the deadline after which a peer missing a
-  // keepalive result is closed. Zero disables keepalive.
-  keepalive_interval: Duration,
+  // The keepalive ping cadence as a bound `sched` schedule, and the
+  // deadline after which a peer missing a keepalive result is closed.
+  // `None` disables keepalive.
+  keepalive_schedule: Option<Arc<sched::BoundSchedule>>,
   keepalive_timeout: Duration,
   trace_metadata_limits: TraceMetadataLimits,
   route_policy: Option<crate::QualifiedTag>,
@@ -116,12 +137,47 @@ impl NodeConfig {
     Self::default()
   }
 
-  /// Sets the anti-entropy tick interval. The tick's cost scales with
-  /// the member table (N × interval per round cluster-wide); a cluster
-  /// keeping one interval keeps its load predictable (nonzero).
-  pub fn with_anti_entropy_interval(mut self, value: Duration) -> Result<Self> {
-    value.zero_checked("anti-entropy interval")?;
-    self.anti_entropy_interval = value;
+  /// Sets the anti-entropy cadence as a `sched` expression. The
+  /// expression is forwarded to `sched` as written (its frame resolves
+  /// through the library's timezone handling); the canonical form is
+  /// stored. The tick's cost scales with the member table (N × cadence
+  /// per round cluster-wide), so a cluster keeping one cadence keeps its
+  /// load predictable.
+  pub fn with_anti_entropy_schedule(mut self, expression: &str) -> Result<Self> {
+    let schedule = sched::Schedule::parse(expression)
+      .map_err(|_| Error::invalid_input("anti-entropy schedule"))?;
+    schedule
+      .bind()
+      .map_err(|_| Error::invalid_input("anti-entropy schedule"))?;
+    self.anti_entropy_schedule = schedule.to_string();
+    Ok(self)
+  }
+
+  /// Sets the recovery-observation cadence as a `sched` expression. The
+  /// expression is forwarded to `sched` as written; the canonical form
+  /// is stored. The recovery plane's dials and backoff ride this
+  /// observation cadence.
+  pub fn with_recovery_schedule(mut self, expression: &str) -> Result<Self> {
+    let schedule =
+      sched::Schedule::parse(expression).map_err(|_| Error::invalid_input("recovery schedule"))?;
+    schedule
+      .bind()
+      .map_err(|_| Error::invalid_input("recovery schedule"))?;
+    self.recovery_schedule = schedule.to_string();
+    Ok(self)
+  }
+
+  /// Sets the degree-maintenance cadence as a `sched` expression. The
+  /// expression is forwarded to `sched` as written; the canonical form
+  /// is stored. The connection-degree plane dials its deficit batches on
+  /// this cadence.
+  pub fn with_degree_schedule(mut self, expression: &str) -> Result<Self> {
+    let schedule =
+      sched::Schedule::parse(expression).map_err(|_| Error::invalid_input("degree schedule"))?;
+    schedule
+      .bind()
+      .map_err(|_| Error::invalid_input("degree schedule"))?;
+    self.degree_schedule = schedule.to_string();
     Ok(self)
   }
 
@@ -146,12 +202,11 @@ impl NodeConfig {
   }
 
   /// Sets the session liveness policy. A session with no authenticated
-  /// traffic or owned in-flight work for `idle_timeout` closes, and a peer
-  /// missing a keepalive result for `keepalive_timeout` closes. All three
-  /// values zero disable the policy; otherwise `idle_timeout` or
-  /// `keepalive_interval` must be nonzero, and a configured keepalive
-  /// requires `keepalive_interval > 0` with
-  /// `keepalive_timeout > keepalive_interval`. These deadlines are
+  /// traffic or owned in-flight work for `idle_timeout` closes, and a
+  /// peer missing a keepalive result for `keepalive_timeout` closes. An
+  /// empty `keepalive_schedule` disables keepalive; otherwise the
+  /// expression is a `sched` cadence (forwarded as written) and
+  /// `keepalive_timeout` must be nonzero. These deadlines are
   /// peer-visible: keep them uniform across a cluster, or the tighter
   /// side closes sessions the looser side still holds alive.
   ///
@@ -161,28 +216,33 @@ impl NodeConfig {
   /// to zero and would close every session on the observer's first tick;
   /// a fractional value (1500 ms) would silently become a different
   /// deadline. Both are rejected here instead of misbehaving later.
+  /// A keepalive cadence sparser than `keepalive_timeout` is the
+  /// caller's contract: it closes a silent peer before the next ping,
+  /// so keep the expression's gap inside the timeout.
   pub fn with_session_liveness(
-    mut self, idle_timeout: Duration, keepalive_interval: Duration, keepalive_timeout: Duration,
+    mut self, idle_timeout: Duration, keepalive_schedule: &str, keepalive_timeout: Duration,
   ) -> Result<Self> {
-    // A configured keepalive is always the ordered pair interval <
-    // timeout: an interval without a deadline, a deadline without an
-    // interval, or a deadline inside the interval would silently disable
-    // or immediately fire the peer-missed close.
-    let keepalive_configured = !keepalive_interval.is_zero() || !keepalive_timeout.is_zero();
-    if keepalive_configured
-      && (keepalive_interval.is_zero()
-        || keepalive_timeout.is_zero()
-        || keepalive_timeout <= keepalive_interval)
-    {
-      return Err(Error::invalid_input("session liveness policy"));
-    }
-    for value in [idle_timeout, keepalive_interval, keepalive_timeout] {
+    for value in [idle_timeout, keepalive_timeout] {
       if value.subsec_nanos() != 0 {
         return Err(Error::invalid_input("session liveness policy"));
       }
     }
+    let keepalive = if keepalive_schedule.is_empty() {
+      if !keepalive_timeout.is_zero() {
+        return Err(Error::invalid_input("session liveness policy"));
+      }
+      None
+    } else {
+      keepalive_timeout.zero_checked("session liveness policy")?;
+      let schedule = sched::Schedule::parse(keepalive_schedule)
+        .map_err(|_| Error::invalid_input("session liveness policy"))?;
+      let bound = schedule
+        .bind()
+        .map_err(|_| Error::invalid_input("session liveness policy"))?;
+      Some(Arc::new(bound))
+    };
     self.session_idle_timeout = idle_timeout;
-    self.keepalive_interval = keepalive_interval;
+    self.keepalive_schedule = keepalive;
     self.keepalive_timeout = keepalive_timeout;
     Ok(self)
   }
@@ -427,15 +487,27 @@ impl NodeConfig {
     self.resource_removal_cap
   }
 
-  /// The anti-entropy tick interval (consumed by the membership sync
-  /// driver; nonzero by construction).
-  pub(crate) const fn anti_entropy_interval(&self) -> Duration {
-    self.anti_entropy_interval
+  /// The anti-entropy cadence expression (consumed by the membership
+  /// sync driver).
+  pub(crate) fn anti_entropy_schedule(&self) -> &str {
+    &self.anti_entropy_schedule
   }
 
   /// The recovery policy (consumed by the recovery controller).
   pub(crate) const fn recovery(&self) -> RecoveryConfig {
     self.recovery
+  }
+
+  /// The recovery-observation cadence expression (consumed by the
+  /// recovery worker).
+  pub(crate) fn recovery_schedule(&self) -> &str {
+    &self.recovery_schedule
+  }
+
+  /// The degree-maintenance cadence expression (consumed by the
+  /// maintenance worker).
+  pub(crate) fn degree_schedule(&self) -> &str {
+    &self.degree_schedule
   }
 
   pub(crate) const fn session_queue_messages(&self) -> usize {
@@ -453,9 +525,9 @@ impl NodeConfig {
     self.session_idle_timeout
   }
 
-  /// The keepalive interval (zero disables).
-  pub(crate) const fn keepalive_interval(&self) -> Duration {
-    self.keepalive_interval
+  /// The bound keepalive cadence, if keepalive is enabled.
+  pub(crate) fn keepalive_schedule(&self) -> Option<Arc<sched::BoundSchedule>> {
+    self.keepalive_schedule.clone()
   }
 
   /// The keepalive result deadline.
@@ -541,6 +613,16 @@ impl NodeConfig {
   }
 }
 
+/// The default keepalive schedule, bound once. The expression is a
+/// constant; a parse/bind failure (impossible for this literal) disables
+/// keepalive rather than panicking.
+fn default_keepalive_schedule() -> Option<Arc<sched::BoundSchedule>> {
+  sched::Schedule::parse(DEFAULT_KEEPALIVE_SCHEDULE)
+    .ok()
+    .and_then(|schedule| schedule.bind().ok())
+    .map(Arc::new)
+}
+
 impl Default for NodeConfig {
   fn default() -> Self {
     Self {
@@ -548,8 +630,10 @@ impl Default for NodeConfig {
       // per-node cost paid N-wide every tick, and 64 nodes × 4 ticks/s
       // saturated a two-vcpu runner until the data plane's relay acks
       // starved. Convergence at one tick/s stays far inside the sync
-      // SLOs; fast deployments may tighten it.
-      anti_entropy_interval: Duration::from_secs(1),
+      // SLOs; fast deployments may tighten the expression.
+      anti_entropy_schedule: DEFAULT_ANTI_ENTROPY_SCHEDULE.to_owned(),
+      recovery_schedule: DEFAULT_RECOVERY_SCHEDULE.to_owned(),
+      degree_schedule: DEFAULT_DEGREE_SCHEDULE.to_owned(),
       dial_deadline: Duration::from_secs(10),
       // 30 s, not 10 s: the deadline covers the join-mode admission
       // commit, and on slow flash one commit costs hundreds of
@@ -576,7 +660,7 @@ impl Default for NodeConfig {
       // deep-sleeping peer skip several pings without its sessions
       // being torn down by the faster side of a mixed cluster.
       session_idle_timeout: Duration::from_secs(90),
-      keepalive_interval: Duration::from_secs(20),
+      keepalive_schedule: default_keepalive_schedule(),
       keepalive_timeout: Duration::from_secs(60),
       trace_metadata_limits: TraceMetadataLimits::default(),
       route_policy: None,
@@ -845,28 +929,39 @@ mod tests {
   use super::{NodeConfig, RecoveryConfig};
   use crate::ErrorKind;
 
+  /// A whole-minute cadence expression for the tests: every `step`
+  /// seconds at the matching second values.
+  fn every_seconds(step: u64) -> String {
+    let values = (0..60)
+      .step_by(step as usize)
+      .map(|second| format!("{second:02}"))
+      .collect::<Vec<_>>()
+      .join(",");
+    format!("{{*}}-{{*}}-{{*}}T{{*}}:{{*}}:{{{values}}}Z")
+  }
+
   /// The liveness setter stores every accepted policy shape: fully
-  /// disabled, idle-only, keepalive-only, and the idle plus ordered
-  /// keepalive pair.
+  /// disabled, idle-only, keepalive-only, and the idle plus keepalive
+  /// schedule pair.
   #[test]
   fn session_liveness_accepts_disabled_and_valid_policies() {
-    // All-zero explicitly disables the policy.
+    // An empty keepalive expression with a zero timeout disables the
+    // policy.
     let disabled = NodeConfig::new()
-      .with_session_liveness(Duration::ZERO, Duration::ZERO, Duration::ZERO)
+      .with_session_liveness(Duration::ZERO, "", Duration::ZERO)
       .unwrap();
     assert!(disabled.session_idle_timeout().is_zero());
-    assert!(disabled.keepalive_interval().is_zero());
+    assert!(disabled.keepalive_schedule().is_none());
     assert!(disabled.keepalive_timeout().is_zero());
 
     // The default policy is enabled: a silently dead peer must be
     // detected within a bounded window, not TCP's own retransmit
-    // timeouts, so the defaults satisfy the keepalive ordering invariant
-    // and stay nonzero. The values are the slow-device-safe liveness
-    // contract (90 s idle, 20 s ping, 60 s timeout — see
+    // timeouts. The values are the slow-device-safe liveness contract
+    // (90 s idle, every-20-s ping, 60 s timeout — see
     // `liveness_defaults_are_the_slow_device_calibration`).
     let default = NodeConfig::new();
     assert_eq!(default.session_idle_timeout(), Duration::from_secs(90));
-    assert_eq!(default.keepalive_interval(), Duration::from_secs(20));
+    assert!(default.keepalive_schedule().is_some());
     assert_eq!(default.keepalive_timeout(), Duration::from_secs(60));
     assert_ne!(
       disabled.session_idle_timeout(),
@@ -874,32 +969,28 @@ mod tests {
     );
 
     let idle_only = NodeConfig::new()
-      .with_session_liveness(Duration::from_secs(30), Duration::ZERO, Duration::ZERO)
+      .with_session_liveness(Duration::from_secs(30), "", Duration::ZERO)
       .unwrap();
     assert_eq!(idle_only.session_idle_timeout(), Duration::from_secs(30));
-    assert!(idle_only.keepalive_interval().is_zero());
+    assert!(idle_only.keepalive_schedule().is_none());
     assert!(idle_only.keepalive_timeout().is_zero());
 
     let keepalive_only = NodeConfig::new()
-      .with_session_liveness(
-        Duration::ZERO,
-        Duration::from_secs(5),
-        Duration::from_secs(15),
-      )
+      .with_session_liveness(Duration::ZERO, &every_seconds(5), Duration::from_secs(15))
       .unwrap();
     assert!(keepalive_only.session_idle_timeout().is_zero());
-    assert_eq!(keepalive_only.keepalive_interval(), Duration::from_secs(5));
+    assert!(keepalive_only.keepalive_schedule().is_some());
     assert_eq!(keepalive_only.keepalive_timeout(), Duration::from_secs(15));
 
     let both = NodeConfig::new()
       .with_session_liveness(
         Duration::from_secs(30),
-        Duration::from_secs(5),
+        &every_seconds(5),
         Duration::from_secs(15),
       )
       .unwrap();
     assert_eq!(both.session_idle_timeout(), Duration::from_secs(30));
-    assert_eq!(both.keepalive_interval(), Duration::from_secs(5));
+    assert!(both.keepalive_schedule().is_some());
     assert_eq!(both.keepalive_timeout(), Duration::from_secs(15));
   }
 
@@ -916,25 +1007,37 @@ mod tests {
       Duration::from_nanos(1),
     ] {
       let error = NodeConfig::new()
-        .with_session_liveness(value, Duration::ZERO, Duration::ZERO)
+        .with_session_liveness(value, "", Duration::ZERO)
         .unwrap_err();
       assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
-    // The keepalive pair is validated the same way: a fractional
-    // interval would truncate and change the meaning of the ordering
-    // invariant the setter enforces.
+    // The keepalive timeout is validated the same way: a fractional
+    // deadline would truncate and change the meaning of the liveness
+    // contract.
     let error = NodeConfig::new()
       .with_session_liveness(
         Duration::ZERO,
+        &every_seconds(5),
         Duration::from_millis(1_500),
-        Duration::from_secs(15),
       )
       .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    // A configured keepalive requires a timeout, and an unparsable
+    // expression is refused at construction.
+    assert!(
+      NodeConfig::new()
+        .with_session_liveness(Duration::ZERO, &every_seconds(5), Duration::ZERO)
+        .is_err()
+    );
+    assert!(
+      NodeConfig::new()
+        .with_session_liveness(Duration::ZERO, "not-a-schedule", Duration::from_secs(15))
+        .is_err()
+    );
     // The smallest whole-second policy stays valid.
     assert!(
       NodeConfig::new()
-        .with_session_liveness(Duration::from_secs(1), Duration::ZERO, Duration::ZERO)
+        .with_session_liveness(Duration::from_secs(1), "", Duration::ZERO)
         .is_ok()
     );
   }
@@ -1045,7 +1148,10 @@ mod tests {
     // 64 nodes x 4 anti-entropy ticks/s starve a two-vcpu
     // runner's data plane; one tick/s keeps the O(N x interval) load
     // bounded while converging far inside the sync SLOs.
-    assert_eq!(config.anti_entropy_interval(), Duration::from_secs(1));
+    assert_eq!(
+      config.anti_entropy_schedule(),
+      super::DEFAULT_ANTI_ENTROPY_SCHEDULE
+    );
     // Deadline half: slow-flash admission commits push
     // concurrent join tails past a 10 s deadline into persistent
     // join failure, so the default covers the slowest supported device.
@@ -1054,7 +1160,7 @@ mod tests {
     // keepalive timeout closes them, and a 90 s idle tolerates a slow
     // scheduling environment without tearing down live sessions.
     assert_eq!(config.session_idle_timeout(), Duration::from_secs(90));
-    assert_eq!(config.keepalive_interval(), Duration::from_secs(20));
+    assert!(config.keepalive_schedule().is_some());
     assert_eq!(config.keepalive_timeout(), Duration::from_secs(60));
     // The recovery plane's own defaults (fan-out sixteen,
     // two-second initial backoff) are asserted in the recovery
@@ -1080,32 +1186,24 @@ mod tests {
     assert_eq!(derived.connection_degree(), 0);
   }
 
-  /// A deadline without either driver, a keepalive without a deadline,
-  /// and a deadline inside the interval are all invalid input.
+  /// A keepalive schedule without a deadline, a deadline without a
+  /// schedule, and an unparsable expression are all invalid input.
   #[test]
   fn session_liveness_rejects_broken_policies() {
-    let broken = [
-      (Duration::ZERO, Duration::ZERO, Duration::from_secs(15)),
+    let every_five = every_seconds(5);
+    for (idle_timeout, keepalive_schedule, keepalive_timeout) in [
+      (Duration::ZERO, "", Duration::from_secs(15)),
+      (Duration::from_secs(30), "", Duration::from_secs(15)),
+      (Duration::ZERO, every_five.as_str(), Duration::ZERO),
+      (Duration::from_secs(30), every_five.as_str(), Duration::ZERO),
       (
         Duration::from_secs(30),
-        Duration::ZERO,
+        "not-a-schedule",
         Duration::from_secs(15),
       ),
-      (Duration::ZERO, Duration::from_secs(5), Duration::ZERO),
-      (
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-        Duration::from_secs(5),
-      ),
-      (
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-        Duration::from_secs(4),
-      ),
-    ];
-    for (idle_timeout, keepalive_interval, keepalive_timeout) in broken {
+    ] {
       let error = NodeConfig::new()
-        .with_session_liveness(idle_timeout, keepalive_interval, keepalive_timeout)
+        .with_session_liveness(idle_timeout, keepalive_schedule, keepalive_timeout)
         .unwrap_err();
       assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }

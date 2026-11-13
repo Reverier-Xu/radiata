@@ -69,7 +69,7 @@ async fn start(factory: Arc<dyn StorageFactory>, keys: Arc<ScriptedKeys>) -> Nod
 /// spacing holds).
 fn quiet_driver_config() -> NodeConfig {
   NodeConfig::new()
-    .with_anti_entropy_interval(std::time::Duration::from_secs(3_600))
+    .with_anti_entropy_schedule("{*}-{*}-{*}T{0}:{0}:{0}Z")
     .unwrap()
 }
 
