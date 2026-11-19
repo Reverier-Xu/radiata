@@ -164,12 +164,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `redb` is upgraded to 5.0. The on-disk file format is unchanged
   (version 3 in both), and the metadata store's tables encode nothing
   the release's `Option` re-encoding touches — every key and value is a
-  byte slice — so existing stores open and read exactly as before. The
-  adapter follows the two API changes that reached it: the digest
-  sidecar read uses `get_owned`, whose guard holds the read transaction
-  itself, and the prefix scan iterates `range_owned`, whose iterator
-  keeps the transaction alive across the scan that outlives the table
-  handle.
+  byte slice — so existing stores open and read exactly as before. Three
+  API changes reached the adapter: the digest sidecar read uses
+  `get_owned`, whose guard holds the read transaction itself; the prefix
+  scan iterates `range_owned`, whose iterator keeps the transaction
+  alive across the scan that outlives the table handle; and
+  `DatabaseError::LockProtocolMismatch` — the new check for a file held
+  under the previous byte-range-locking protocol — classifies as
+  `StorageLocked` like every other lock outcome, instead of falling into
+  the I/O catch-all.
 
 ### Removed
 

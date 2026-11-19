@@ -1363,7 +1363,13 @@ fn commit_blocking(database: &Database, transaction: StoreTransaction) -> Result
 
 fn map_database_error(error: redb::DatabaseError, context: ProviderErrorContext) -> Error {
   match error {
-    redb::DatabaseError::DatabaseAlreadyOpen => {
+    // A second handle in this process and a handle from another process
+    // holding the file are the same outcome for the caller: the store is
+    // locked. `LockProtocolMismatch` is redb 5.0's byte-range-locking
+    // generation check (a redb 4.3/4.4 read-only handle, or a 4.2-or-
+    // earlier writer, holds the file under the old protocol), so it is
+    // a lock, not an I/O fault.
+    redb::DatabaseError::DatabaseAlreadyOpen | redb::DatabaseError::LockProtocolMismatch => {
       Error::provider(ProviderErrorKind::StorageLocked, context)
     }
     redb::DatabaseError::UpgradeRequired(_) => {
@@ -1783,5 +1789,20 @@ mod followup_tests {
     drop(factory.open(StoreRequirements::metadata()).await.unwrap());
     let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
     assert_eq!(mode, 0o600);
+  }
+
+  /// redb 5.0's locking generation check is a lock, not an I/O fault: a
+  /// handle from a redb that speaks the previous locking protocol — here
+  /// synthesized as the variant itself, since the cross-version file it
+  /// describes cannot be produced from one redb build — classifies as
+  /// `StorageLocked` through the same mapping a second in-process handle
+  /// takes.
+  #[test]
+  fn lock_protocol_mismatch_is_a_locked_store() {
+    let error = super::map_database_error(
+      redb::DatabaseError::LockProtocolMismatch,
+      crate::ProviderErrorContext::StorageOpen,
+    );
+    assert_eq!(error.kind(), ErrorKind::StorageLocked);
   }
 }
