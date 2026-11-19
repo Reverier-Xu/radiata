@@ -731,11 +731,14 @@ impl StoreSnapshot for RedbSnapshot {
       };
       // Reads trust the persisted digest: the commit path wrote both
       // sides in one atomic transaction, so a missing row is corruption.
+      // The guards are the owned variants: they keep the read transaction
+      // alive on their own, so the table handle does not have to outlive
+      // the statement that opened it.
       let persisted = self
         .transaction
         .open_table(DIGESTS_TABLE)
         .map_err(|error| map_table_error(error, ProviderErrorContext::StorageSnapshot))?
-        .get(&*composite)
+        .get_owned(&*composite)
         .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageSnapshot))?
         .ok_or_else(|| super::super::storage_corrupt(ProviderErrorContext::StorageSnapshot))?;
       let digest_bytes: [u8; VALUE_DIGEST_BYTES] = persisted
@@ -788,10 +791,10 @@ impl StoreSnapshot for RedbSnapshot {
         Some(_) => std::ops::Bound::Included(prefix_bound.as_slice()),
       };
       let range = entries
-        .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+        .range_owned((lower, std::ops::Bound::Unbounded))
         .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageScan))?;
       let digest_range = digests
-        .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+        .range_owned((lower, std::ops::Bound::Unbounded))
         .map_err(|error| map_storage_error(error, ProviderErrorContext::StorageScan))?;
       Ok(Box::new(RedbScan {
         range,
@@ -805,10 +808,12 @@ impl StoreSnapshot for RedbSnapshot {
 }
 
 struct RedbScan {
-  range: redb::Range<'static, &'static [u8], &'static [u8]>,
+  // Owned ranges: the scan outlives the `open_table` call it was built
+  // from and keeps the read transaction alive until it is dropped.
+  range: redb::OwnedRange<&'static [u8], &'static [u8]>,
   // The digest sidecar iterates in lockstep: both tables carry the same
   // composite keys, written and removed in the same transactions.
-  digest_range: redb::Range<'static, &'static [u8], &'static [u8]>,
+  digest_range: redb::OwnedRange<&'static [u8], &'static [u8]>,
   namespace: StoreNamespace,
   prefix: Vec<u8>,
   base_len: usize,
