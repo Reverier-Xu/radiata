@@ -161,6 +161,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `NextHopView::remaining_hops` exposes the hop budget left to a policy.
 - Wire: the routed open frame's route element carries the remaining path
   (a pre-release format amendment); legacy direct frames are unchanged.
+- `redb` is upgraded to 5.0. The on-disk file format is unchanged
+  (version 3 in both), and the metadata store's tables encode nothing
+  the release's `Option` re-encoding touches — every key and value is a
+  byte slice — so existing stores open and read exactly as before. The
+  adapter follows the two API changes that reached it: the digest
+  sidecar read uses `get_owned`, whose guard holds the read transaction
+  itself, and the prefix scan iterates `range_owned`, whose iterator
+  keeps the transaction alive across the scan that outlives the table
+  handle.
 
 ### Removed
 
