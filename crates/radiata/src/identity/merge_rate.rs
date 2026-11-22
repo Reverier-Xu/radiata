@@ -375,7 +375,7 @@ mod tests {
   }
 
   /// The default limits derive from the reference cluster scale: the
-  /// join pool keeps today's strict per-source budget, and the member
+  /// join pool holds the strict per-source budget, and the member
   /// pool admits a whole same-site cluster reconnecting at once (a
   /// same-site reconnect burst) instead of starving it.
   #[test]

@@ -20,23 +20,20 @@
 //! candidate set before use, so a custom policy — buggy, hostile, or
 //! merely confused — can never make the node dial an endpoint the member's
 //! descriptor did not publish. With no dialable ordering left the dial is
-//! skipped and the member stays a candidate for a later tick, exactly like
-//! the pre-seem rotation's empty-endpoint skip.
+//! skipped and the member stays a candidate for a later tick.
 //!
 //! # Per-member rotation handle
 //!
-//! [`EndpointSelector`] owns the per-member dial serials the three dial
-//! loops previously hand-copied (recovery fan-out, degree deficit batch,
-//! bridge probe): each dial of a member advances that member's own serial,
+//! [`EndpointSelector`] owns the per-member dial serials shared by the
+//! three dial planes (recovery fan-out, degree deficit batch, bridge
+//! probe): each dial of a member advances that member's own serial,
 //! wrapping per member, and the dial lands on the serial's position in the
 //! policy-ordered candidates. Per-member serials decouple member selection
 //! from endpoint rotation — the failover liveness contract pinned by the
 //! recovery suite's exhaustive sweep test — and one shared serial map
-//! keeps the two runtime dial planes rotating a member's endpoints
-//! together, exactly as before the seam existed. Under the default
-//! [`PublishedOrderPolicy`] the ordering is the identity over the
-//! published list, so every dial outcome is bit-identical to the
-//! hand-copied rotation.
+//! keeps the runtime dial planes rotating a member's endpoints together.
+//! Under the default [`PublishedOrderPolicy`] the ordering is the identity
+//! over the published list.
 
 use std::{fmt, sync::Arc};
 
@@ -95,13 +92,12 @@ fn builtin_tag(
     .map_err(|_| Error::internal("built-in endpoint-selection policy tag"))
 }
 
-/// The default built-in: today's published-order rotation. The ordering
-/// is the identity over the candidate list, so the selector's per-member
-/// serial lands each dial on `(serial − 1) mod len` — byte-identical to
-/// the rotation the recovery and degree dial loops hand-copied before the
-/// seam existed. Registered under [`Self::TAG`] by the default pass and
-/// resolved as the effective policy whenever the node configures no
-/// preference list and no explicit policy tag.
+/// The default built-in: the published-order rotation. The ordering is the
+/// identity over the candidate list, so the selector's per-member serial
+/// lands each dial on `(serial − 1) mod len`. Registered under
+/// [`Self::TAG`] by the default pass and resolved as the effective policy
+/// whenever the node configures no preference list and no explicit policy
+/// tag.
 #[derive(Debug, Default)]
 pub struct PublishedOrderPolicy;
 
@@ -371,8 +367,8 @@ impl EndpointSelector {
   /// Drops the rotation serials of members that no longer satisfy
   /// `keep`: a serial for a member that left the member table is dead
   /// rotation phase. The recovery tick retains the live member universe
-  /// through this each tick (the same bounded-state rule the hand-copied
-  /// map followed).
+  /// through this each tick, keeping the serial map bounded by the live
+  /// member universe.
   pub(crate) fn retain_members(&self, keep: impl Fn(&NodeId) -> bool) {
     if let Ok(mut serials) = self.serials.lock() {
       serials.retain(|member, _| keep(member));
@@ -407,9 +403,9 @@ mod tests {
     }
   }
 
-  /// The default policy is today's rotation: the first dial of a member
-  /// lands on its first published endpoint, every further dial advances
-  /// that member's own serial, and the rotation wraps per member —
+  /// The default policy rotates published endpoints: the first dial of a
+  /// member lands on its first published endpoint, every further dial
+  /// advances that member's own serial, and the rotation wraps per member —
   /// independent of every other member's cursor.
   #[test]
   fn published_order_rotates_per_member_and_wraps() {

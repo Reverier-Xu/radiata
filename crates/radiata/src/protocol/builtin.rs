@@ -63,8 +63,8 @@
 //! - Test-only tags under the built-in domain (`protocols/test-echo`,
 //!   `metadata/engine-test`, …) are fixtures, not built-in contracts; they are
 //!   out of the inventory by design.
-//! - `limits/data-body-bytes` was retired with the pre-0.1.0 limit-negotiation
-//!   removal and survives only as a decoder-rejection fixture.
+//! - `limits/data-body-bytes` exists only as a decoder-rejection fixture: an
+//!   offer wire carrying a limits entry fails decode.
 
 use super::tag::{
   CATEGORY_CRYPTO, CATEGORY_EVENTS, CATEGORY_FEATURES, CATEGORY_LABELS, CATEGORY_METADATA,

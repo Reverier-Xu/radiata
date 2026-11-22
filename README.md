@@ -2,14 +2,16 @@
 
 A Rust library crate providing authenticated peer-to-peer connectivity, opaque packet streams, and
 convergent core metadata for group applications: identity bindings, credential-authorized cluster
-composition, membership and resource convergence, and a routed data plane — all over TLS 1.3.
+composition, membership and resource convergence, and a routed data plane. The transport is the
+endpoint's scheme: direct TLS 1.3, WebSocket over TLS 1.3, plaintext TCP, or a caller-registered
+medium.
 
 radiata is a deterministic relay-node runtime, not an application. It owns the wire: transport
 security, session admission, anti-entropy, storage durability, and route authorization. Your
 application owns the semantics that ride on top — the crate never interprets payload bytes.
 
-> **Status:** pre-release (`0.0.x`), unpublished on crates.io. The public surface is being
-> finalized for `0.1.0`; the authoritative API reference is the crate's rustdoc (`cargo doc`).
+> **Status:** pre-release (`0.0.x`), unpublished on crates.io; the authoritative API reference is
+> the crate's rustdoc (`cargo doc`).
 
 ## Features
 
@@ -122,11 +124,12 @@ cannot corrupt message boundaries; the medium contributes no confidentiality by 
 
 ## Security and trust model
 
-radiata defends the **wire**, not the members. Transport-path security is unconditional: TLS 1.3
-with exporter binding, handshake transcripts, merge credentials, and signature verification against
-retained identity bindings. What the crate deliberately does not defend against is a member that is
-hostile despite being properly admitted. The peer-trust model asks the deployment for three
-guarantees:
+radiata defends the **wire**, not the members. Every session authenticates through its handshake
+transcript, merge credentials, and signature verification against retained identity bindings;
+TLS-class endpoints (`tls://`, `wss://`) carry TLS 1.3 with exporter binding, and a
+plaintext-class endpoint leaves channel confidentiality to the operator and the medium. What the
+crate deliberately does not defend against is a member that is hostile despite being properly
+admitted. The peer-trust model asks the deployment for three guarantees:
 
 1. **Only trusted nodes are merged.** A malicious full member is indistinguishable from a
    man-in-the-middle on the path; Sybil growth, collusion, and hostile metadata are the
@@ -179,12 +182,10 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
 
-Source-level invariants live in `tests/static_invariants.rs` (metadata
-namespace single-sourcing, feature gating, excised-vocabulary residue, the
-single-writer removal caller, the compatibility family inventory) and run in
-the ordinary test lane. The public ABI freeze is `tests/public_abi.rs`, an
-`#[ignore]`d test the dedicated CI `abi` job runs against the approved
-rendering with `cargo-public-api`. Only tool-dependent and long-running
+Source-level invariants run as ordinary unit tests next to the code they pin (the built-in tag
+inventory's owner-source scan, the pending-store namespace and singleton-key exactness). The
+public ABI freeze is `tests/public_abi.rs`, an `#[ignore]`d test the dedicated CI `abi` job runs
+against the approved rendering with `cargo-public-api`. Only tool-dependent and long-running
 lanes stay as scripts: `scripts/verify-soak.sh`,
 `scripts/verify-evidence-validator.sh`, `scripts/verify-decoder-fuzz.sh`,
 `scripts/verify-state-fuzz.sh`, `scripts/verify-simulation-artifacts.sh`, and

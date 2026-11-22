@@ -1,12 +1,12 @@
 //! Event subscription predicates: one declarative filter over resource
 //! changes, shared by the live [`crate::ResourceChanged`] watch, the
-//! durable `watch_resources` replay push-down, and — as the embeddable
-//! primitive only, not implemented here — the Phase D trigger
-//! declarations.
+//! durable `watch_resources` replay push-down, and the event-trigger
+//! declarations registered through
+//! [`NodeHandle::triggers`](crate::NodeHandle::triggers).
 //!
 //! A predicate is self-contained value state: an optional resource-domain
-//! set and an optional label [`Selector`] reusing the existing selector
-//! grammar and parser. Evaluation is cheap by construction: the domain
+//! set and an optional label [`Selector`] reusing the selector grammar
+//! and parser. Evaluation is cheap by construction: the domain
 //! check (set membership over the event's resource-name domain) runs
 //! first, and the selector (bounded conjunction over the record's label
 //! space) only when the domain matched.
@@ -30,11 +30,11 @@ use crate::{
 /// absent options match every event, exactly like a watch opened without
 /// a predicate.
 ///
-/// This is the predicate primitive the Phase D trigger declarations will
-/// embed: it is `Clone`, self-contained (no borrowed runtime state), and
-/// its evaluation depends only on the event's resource name and the
-/// committed record's labels, so a stored trigger declaration can carry
-/// one and evaluate it without any runtime handle.
+/// The event-trigger declarations embed this type: it is `Clone`,
+/// self-contained (no borrowed runtime state), and its evaluation depends
+/// only on the event's resource name and the committed record's labels, so
+/// a stored trigger declaration carries one and evaluates it without any
+/// runtime handle.
 ///
 /// Matching is conjunctive: every present option must hold. A resource
 /// domain is the canonical lowercase prefix of the resource name's tag;

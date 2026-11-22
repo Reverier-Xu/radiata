@@ -165,8 +165,8 @@ struct RowEnvelopeWire {
 /// The wire form of one row version: a type-disjoint union — the CAS
 /// revision is a byte string, the descriptor register's record revision
 /// an unsigned integer, and the resource register's writer-timestamp
-/// tuple a four-element array — so the three families' rows keep their
-/// exact Phase A element shapes and the variants cannot be confused.
+/// tuple a four-element array — so the three families' rows keep distinct
+/// element shapes and the variants cannot be confused.
 enum RowVersionWire {
   Revision(ByteVec),
   RecordRevision(u64),

@@ -1,6 +1,6 @@
 [package]
 authors      = { workspace = true }
-description  = "Deterministic relay node runtime with identity, membership, storage, and TLS transport primitives."
+description  = "Deterministic relay node runtime with identity, membership, storage, and pluggable transport primitives."
 edition      = { workspace = true }
 license      = { workspace = true }
 name         = "radiata"

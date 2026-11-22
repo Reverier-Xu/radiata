@@ -11,8 +11,9 @@
 
 //! The crate root of the radiata runtime: a deterministic relay node
 //! library with identity, membership, resource metadata, storage, and a
-//! routed TLS 1.3 packet data plane. The facade exposes deterministic
-//! foundation values, provider boundaries, and the node lifecycle through
+//! routed packet data plane over pluggable transports. The facade exposes
+//! deterministic foundation values, provider boundaries, and the node
+//! lifecycle through this crate root and the [`extension`] module; every
 //! this crate root and the [`extension`] module; every implementation
 //! module remains private except the task-oriented [`guide`].
 

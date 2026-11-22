@@ -613,7 +613,7 @@
 //!
 //! A protocol is one wire contract: a [`ProtocolTag`](crate::ProtocolTag)
 //! plus the [`PacketConsumer`](crate::PacketConsumer) that receives its
-//! streams. `accept` runs once per admitted stream, after TLS-level
+//! streams. `accept` runs once per admitted stream, after the session's
 //! authentication and admission control — everything inside is
 //! application meaning. Failing `accept` rejects that delivery; origin
 //! failures are caller errors, raised through

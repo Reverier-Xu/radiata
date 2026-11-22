@@ -1,28 +1,12 @@
 //! Differing feature surfaces across one negotiation.
 //!
 //! An external consumer drives two nodes through the public facade: one
-//! offers a feature surface without the current-only extension feature,
-//! the other offers it. Both initiator roles must negotiate the
-//! identical signed intersection, packets and core metadata must stay
+//! offers the full feature surface with the extension feature, the other
+//! the narrower surface without it. Both initiator roles must negotiate
+//! the identical signed intersection, packets and core metadata must stay
 //! interoperable across the pair, incompatible required features must be
 //! refused without a weaker retry, and the pair-scoped selection must
 //! disappear with the session.
-//!
-//! **What this lane does not prove.** Both nodes are the *current*
-//! binary; only their offered feature sets differ. This is therefore
-//! evidence about negotiation and data-plane interop across differing
-//! offers, never evidence that two *releases* interoperate on the wire.
-//! The distinction matters because the `0.1.0` feature-limit negotiation
-//! removal was a deliberate pre-release wire break: a pre-`0.1.0` binary
-//! cannot handshake with a current one, and no fixture built from the
-//! current registry can stand in for that. The frozen bytes that make a
-//! future cross-release claim checkable live in the compatibility
-//! manifest (`feature-offer-initiator-v1`), which pins the exact offer
-//! encoding a later release must keep accepting.
-//!
-//! A real cross-release lane needs a genuinely old binary or a frozen
-//! transcript replayed against the current decoder; this file is neither,
-//! and its assertions must not be read as such.
 
 use std::{sync::Arc, time::Duration};
 
@@ -37,8 +21,8 @@ mod common;
 use common::{MemoryStorageFactory, ScriptedKeys};
 
 const SYNC_SCHEDULE: &str = "{*}-{*}-{*}T{*}:{*}:{*}Z";
-const CURRENT_FEATURE: &str = "testing.example/features/mixed-current";
-const PRIOR_FEATURE: &str = "testing.example/features/mixed-prior";
+const EXTENSION_FEATURE: &str = "testing.example/features/extension";
+const UNOFFERED_FEATURE: &str = "testing.example/features/unoffered";
 const ECHO_PROTOCOL: &str = "example.org/protocols/mixed-echo";
 const ECHO_OWNING_FEATURE: &str = "radiata.woooo.tech/features/data-messages";
 
@@ -90,21 +74,20 @@ fn echo_body(
   futures_util::stream::iter(items)
 }
 
-/// `current` nodes register the current-only feature; `prior` nodes offer
-/// the narrower surface without it. Both register the echo protocol so the
-/// pair can exchange packets. The flag selects an *offer*, not a binary:
-/// both sides run this build (see the module doc).
-async fn start_node(seed: u64, current: bool) -> Node {
+/// Full-surface nodes register the extension feature; narrow-surface
+/// nodes offer the narrower surface without it. Both register the echo
+/// protocol so the pair can exchange packets.
+async fn start_node(seed: u64, full_surface: bool) -> Node {
   let keys: Arc<dyn KeyProvider> = Arc::new(ScriptedKeys::full_at(2_400_000 + seed * 1_000));
   let factory: Arc<dyn radiata::extension::StorageFactory> =
     Arc::new(MemoryStorageFactory::new(common::required_capabilities()));
   let collector = Arc::new(Collector::default());
   let mut extensions = radiata::ExtensionRegistry::new();
-  if current {
+  if full_surface {
     extensions
       .register_feature(
         FeatureDefinition::new(
-          FeatureTag::parse(CURRENT_FEATURE).unwrap(),
+          FeatureTag::parse(EXTENSION_FEATURE).unwrap(),
           radiata::Digest::from_bytes([0xC1; 32]),
         )
         .unwrap(),
@@ -197,10 +180,10 @@ impl Node {
   }
 }
 
-/// Establishes the mixed pair: `issuer` runs the listener and the
-/// credential issuer; `member` joins as the initiator. Returns the
+/// Establishes the differing-surface pair: `issuer` runs the listener and
+/// the credential issuer; `member` joins as the initiator. Returns the
 /// member's node id.
-async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeId {
+async fn join_differing_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeId {
   issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
   issuer.listen().await;
   let issued = issuer
@@ -239,7 +222,7 @@ async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeI
         ))
         .await;
       }
-      Err(error) => panic!("mixed join failed persistently: {error:?}"),
+      Err(error) => panic!("pair join failed persistently: {error:?}"),
     }
   }
   member.listen().await;
@@ -247,8 +230,8 @@ async fn join_mixed_pair(issuer: &mut Node, member: &mut Node) -> radiata::NodeI
 }
 
 /// Joins a third, silent member and keeps one live session to BOTH
-/// sides of the differing-offer pair (see the retirement phase in
-/// `prior_initiator_interops_with_current_responder` for why the torn
+/// sides of the differing-surface pair (see the retirement phase in
+/// `narrow_initiator_interops_with_full_responder` for why the torn
 /// pair must never fully isolate). Returns the bystander node with its
 /// id resolved.
 async fn join_bystander(issuer: &Node, member: &Node) -> Node {
@@ -463,16 +446,16 @@ async fn assert_packet_interop(issuer: &Node, member: &Node) {
 /// the identical intersection, exchange packets and metadata, and the
 /// session-scoped selection is replaced and retired with the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prior_initiator_interops_with_current_responder() {
+async fn narrow_initiator_interops_with_full_responder() {
   let mut issuer = start_node(1, true).await;
   let mut member = start_node(2, false).await;
-  let member_id = join_mixed_pair(&mut issuer, &mut member).await;
+  let member_id = join_differing_pair(&mut issuer, &mut member).await;
 
   assert_identical_pair_scoped_selection(&issuer, &member).await;
   assert_metadata_interop(&issuer, &member).await;
 
-  // Core-metadata interop: a resource written through the prior node's
-  // facade converges to the current node by ordinary repair.
+  // Core-metadata interop: a resource written through the narrow-surface
+  // node's facade converges to the full-surface node by ordinary repair.
   let name = ResourceName::parse("radiata.woooo.tech/resources/mixed-e2e").unwrap();
   member
     .handle
@@ -493,7 +476,7 @@ async fn prior_initiator_interops_with_current_responder() {
       _ => {
         assert!(
           std::time::Instant::now() < deadline,
-          "resource metadata never converged across the mixed pair"
+          "resource metadata never converged across the pair"
         );
         tokio::time::sleep(POLL).await;
       }
@@ -647,16 +630,16 @@ async fn prior_initiator_interops_with_current_responder() {
 /// identical intersection in the opposite role with packet and trust
 /// interoperability.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn current_initiator_interops_with_prior_responder() {
+async fn full_initiator_interops_with_narrow_responder() {
   let mut issuer = start_node(3, false).await;
   let mut member = start_node(4, true).await;
-  let member_id = join_mixed_pair(&mut issuer, &mut member).await;
+  let member_id = join_differing_pair(&mut issuer, &mut member).await;
 
   assert_identical_pair_scoped_selection(&issuer, &member).await;
   assert_metadata_interop(&issuer, &member).await;
   assert_packet_interop(&issuer, &member).await;
 
-  // The issuer (prior surface) still resolves the member's paged view.
+  // The issuer (narrow surface) still resolves the member's paged view.
   // The member's post-listen descriptor (now carrying its endpoint)
   // converges to the issuer through the anti-entropy ticks, so the
   // observation is poll-bounded like every other probe: a loaded runner
@@ -674,7 +657,7 @@ async fn current_initiator_interops_with_prior_responder() {
     }
     assert!(
       std::time::Instant::now() < deadline,
-      "the prior responder pages the current member"
+      "the narrow responder pages the full member"
     );
     tokio::time::sleep(POLL).await;
   }
@@ -688,12 +671,12 @@ async fn current_initiator_interops_with_prior_responder() {
 /// survives the refusal on either side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incompatible_required_features_are_refused_in_both_roles() {
-  // Current initiator requires the current-only feature; the prior
-  // responder never published it.
+  // The full-surface initiator requires the extension feature; the
+  // narrow responder never published it.
   let mut issuer = start_node(5, false).await;
   issuer.id = Some(issuer.handle.local_node().await.unwrap().node_id().clone());
   issuer.listen().await;
-  let joiner = start_node_requiring(6, CURRENT_FEATURE, true).await;
+  let joiner = start_node_requiring(6, EXTENSION_FEATURE, true).await;
   let issued = issuer
     .handle
     .credentials()
@@ -730,17 +713,17 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
     }
     assert!(
       std::time::Instant::now() < deadline,
-      "a session survived the current-initiator refusal"
+      "a session survived the full-initiator refusal"
     );
     tokio::time::sleep(POLL).await;
   }
   issuer.handle.shutdown().await.unwrap();
 
-  // Prior initiator requires a prior-only feature; the current responder
-  // has never published it.
-  let mut prior_issuer = start_node(7, false).await;
-  prior_issuer.id = Some(
-    prior_issuer
+  // The narrow initiator requires the unoffered feature; the full
+  // responder has never published it.
+  let mut narrow_issuer = start_node(7, false).await;
+  narrow_issuer.id = Some(
+    narrow_issuer
       .handle
       .local_node()
       .await
@@ -748,9 +731,9 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
       .node_id()
       .clone(),
   );
-  prior_issuer.listen().await;
-  let prior_joiner = start_node_requiring(8, PRIOR_FEATURE, true).await;
-  let issued = prior_issuer
+  narrow_issuer.listen().await;
+  let narrow_joiner = start_node_requiring(8, UNOFFERED_FEATURE, true).await;
+  let issued = narrow_issuer
     .handle
     .credentials()
     .rotate()
@@ -759,10 +742,10 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
     .wait()
     .await
     .unwrap();
-  let error = prior_joiner
+  let error = narrow_joiner
     .handle
     .join(
-      prior_issuer.endpoint().clone(),
+      narrow_issuer.endpoint().clone(),
       radiata::MergeCredential::parse(issued.credential().expose_secret()).unwrap(),
     )
     .await
@@ -774,7 +757,7 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
   let deadline = std::time::Instant::now() + Duration::from_secs(10);
   loop {
     let empty = matches!(
-      prior_issuer
+      narrow_issuer
         .handle
         .sessions()
         .list(PageSpec::first(8).unwrap())
@@ -786,10 +769,10 @@ async fn incompatible_required_features_are_refused_in_both_roles() {
     }
     assert!(
       std::time::Instant::now() < deadline,
-      "a session survived the prior-initiator refusal"
+      "a session survived the narrow-initiator refusal"
     );
     tokio::time::sleep(POLL).await;
   }
-  prior_joiner.handle.shutdown().await.unwrap();
-  prior_issuer.handle.shutdown().await.unwrap();
+  narrow_joiner.handle.shutdown().await.unwrap();
+  narrow_issuer.handle.shutdown().await.unwrap();
 }

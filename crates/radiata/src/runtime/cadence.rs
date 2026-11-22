@@ -6,9 +6,9 @@
 //! expression to `sched` as written; no interval conversion happens in
 //! radiata.
 //!
-//! The worker body runs inline in the driver loop (the old interval
-//! workers' shape): a slow pass delays the next tick, and a tick that is
-//! already stale at dispatch time is skipped, never replayed — the same
+//! The worker body runs inline in the driver loop: a slow pass delays the
+//! next tick, and a tick that is already stale at dispatch time is
+//! skipped, never replayed — the same
 //! policy the user time triggers get. The first pass is the next
 //! scheduled tick, never an extra startup run.
 
