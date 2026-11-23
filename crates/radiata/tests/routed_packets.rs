@@ -191,7 +191,15 @@ async fn start_node(
       consumer,
     )
     .unwrap();
-  let mut config = NodeConfig::new();
+  // The degree plane is quieted, matching the sparse-topology and
+  // membership suites: the derived target for four members is three, so
+  // an unquieted maintenance tick (wall-clock anchored at :00/:30)
+  // dials the chain's degree deficits back toward a mesh mid-settle on
+  // a slow runner and the exact edge-set assertions never converge.
+  // Every edge this file reasons about is dialed or cut explicitly, and
+  // the five-minute bridge-probe bracket sits far outside the test
+  // bound.
+  let mut config = NodeConfig::new().with_connection_degree(1);
   if let Some(table) = policy_table {
     registry
       .register_next_hop(

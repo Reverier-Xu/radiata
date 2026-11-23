@@ -639,6 +639,20 @@ async fn reads_and_packets_flow_while_a_retention_sweep_wedges_on_slow_storage()
   })
   .await
   .expect("the arming packet must be delivered");
+  // Observe the durable record as soon as it terminalizes instead of
+  // after a fixed sleep: the retention deadline is 1s and the sweep
+  // tick is wall-clock anchored, so on a slow runner the next tick can
+  // land between the record's expiry and a fixed-delay read, committing
+  // the removal before the test ever observes the record. Watching the
+  // counter first, then sleeping out the deadline, arms the sweep
+  // deterministically on any runner.
+  tokio::time::timeout(Duration::from_secs(10), async {
+    while trace_records(&probe.metrics().await.unwrap()) < 1 {
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+  })
+  .await
+  .expect("the arming packet must leave a durable trace record");
   tokio::time::sleep(Duration::from_millis(1_500)).await;
   // The probe has no listener, so its local descriptor is published
   // lazily by the FIRST member read (the maintenance tick deliberately
@@ -651,11 +665,6 @@ async fn reads_and_packets_flow_while_a_retention_sweep_wedges_on_slow_storage()
     .await
     .unwrap();
   assert!(!warmed.items().is_empty());
-  let armed = trace_records(&probe.metrics().await.unwrap());
-  assert!(
-    armed >= 1,
-    "the arming packet must leave a durable trace record"
-  );
   slow.set_commit_delay(COMMIT_DELAY);
 
   // The observation window spans more than one tick period (2s) plus

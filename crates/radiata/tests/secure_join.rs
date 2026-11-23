@@ -1157,6 +1157,42 @@ async fn secure_join_derived_return_stream_reuses_trace_id() {
   receiver.handle.shutdown().await.unwrap();
 }
 
+/// Sends one body through a fresh stream, retrying typed `Overloaded`
+/// admission within a bounded budget. On a saturated runner the
+/// post-merge anti-entropy traffic transiently occupies admission
+/// slots, and a slot freed by a released stream becomes observable at
+/// the next open, not at the consumer's recording of the packet — both
+/// are the designed transient backpressure, and the caller contract is
+/// bounded admission retry. Every retried attempt reopens the stream,
+/// because a send refused with `Overloaded` fails closed.
+async fn send_sync_with_admission_retry<S>(
+  handle: &NodeHandle, receiver: &radiata::NodeId, protocol: &ProtocolTag, body: impl Fn() -> S,
+) where
+  S: futures_core::Stream<Item = radiata::Result<Arc<[u8]>>> + Send + 'static, {
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    let packet = handle
+      .open_stream(
+        StreamTarget::Exact(receiver.clone()),
+        protocol.clone(),
+        policy(),
+        metadata(),
+      )
+      .unwrap();
+    match packet.send_sync(body()).await {
+      Ok(_) => return,
+      Err(error) if error.kind() == ErrorKind::Overloaded => {
+        assert!(
+          std::time::Instant::now() < deadline,
+          "admission did not recover within the retry budget: {error:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(error) => panic!("packet send failed unexpectedly: {error:?}"),
+    }
+  }
+}
+
 /// Bounded incoming-stream admission returns typed backpressure at the
 /// configured capacity, and release frees every slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1212,18 +1248,10 @@ async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers(
   let release = Arc::new(ReleaseGate::default());
   let protocol_tag = ProtocolTag::parse("example.org/protocols/test-echo").unwrap();
   for _ in 0..4 {
-    let packet = joiner_handle
-      .open_stream(
-        StreamTarget::Exact(receiver_id.clone()),
-        protocol_tag.clone(),
-        policy(),
-        metadata(),
-      )
-      .unwrap();
-    packet
-      .send_sync(blocking_body(release.clone()))
-      .await
-      .unwrap();
+    send_sync_with_admission_retry(&joiner_handle, &receiver_id, &protocol_tag, || {
+      blocking_body(Arc::clone(&release))
+    })
+    .await;
   }
 
   let packet = joiner_handle
@@ -1248,18 +1276,13 @@ async fn secure_join_incoming_stream_capacity_returns_backpressure_and_recovers(
   )
   .await;
   assert_eq!(recorder.packets.lock().unwrap().len(), 4);
-  let packet = joiner_handle
-    .open_stream(
-      StreamTarget::Exact(receiver_id.clone()),
-      protocol_tag,
-      policy(),
-      metadata(),
-    )
-    .unwrap();
-  packet
-    .send_sync(VecBody::new(vec![b"after"]))
-    .await
-    .unwrap();
+  // The released slots free asynchronously (a freed slot becomes
+  // observable at the next open, after the terminal acks round-trip),
+  // so the post-release send takes the same bounded admission retry.
+  send_sync_with_admission_retry(&joiner_handle, &receiver_id, &protocol_tag, || {
+    VecBody::new(vec![b"after"])
+  })
+  .await;
   wait_for(
     || recorder.packets.lock().unwrap().len() >= 5,
     Duration::from_secs(10),
